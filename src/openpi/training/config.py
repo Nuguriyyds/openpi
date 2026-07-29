@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.agilex_policy as agilex_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -451,6 +452,44 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAGILEXDataConfig(DataConfigFactory):
+
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_top": "observation.image.top",
+                            "cam_left_wrist": "observation.image.left_wrist",
+                            "cam_right_wrist": "observation.image.right_wrist",
+                        },
+                        "state": "observation.state.joint",
+                        "gripper_position": "observation.gripper_position",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
+        data_transforms = _transforms.Group(
+            inputs=[agilex_policy.AgileXInputs()],
+            outputs=[agilex_policy.AgileXOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
