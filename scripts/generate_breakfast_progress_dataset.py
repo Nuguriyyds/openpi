@@ -302,19 +302,24 @@ def _progress_stats(length: int) -> dict[str, list[float | int]]:
 
 
 def _rewrite_parquet(episode: Episode, output_path: Path, compression: str) -> None:
-    import pyarrow as pa  # noqa: PLC0415
-    import pyarrow.parquet as pq  # noqa: PLC0415
+    from datasets import Dataset  # noqa: PLC0415
+    from datasets import Sequence  # noqa: PLC0415
+    from datasets import Value  # noqa: PLC0415
 
-    parquet = pq.ParquetFile(episode.parquet_path)
-    table = parquet.read(use_threads=False)
-    if table.num_rows != episode.length:
-        raise ValueError(f"{episode.parquet_path} changed: rows={table.num_rows}, expected={episode.length}")
-    if "progress" in table.column_names:
+    dataset = Dataset.from_parquet(str(episode.parquet_path))
+    if dataset.num_rows != episode.length:
+        raise ValueError(
+            f"{episode.parquet_path} changed: rows={dataset.num_rows}, expected={episode.length}"
+        )
+    if "progress" in dataset.column_names:
         raise ValueError(f"{episode.parquet_path} already contains progress")
-    values = pa.array(_progress(episode.length), type=pa.float32())
-    progress_column = pa.FixedSizeListArray.from_arrays(values, 1)
+    dataset = dataset.add_column(
+        "progress",
+        _progress(episode.length).reshape(-1, 1).tolist(),
+        feature=Sequence(feature=Value("float32"), length=1),
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table.append_column("progress", progress_column), output_path, compression=compression)
+    dataset.to_parquet(str(output_path), compression=compression)
 
 
 def build_dataset(
@@ -382,9 +387,8 @@ def build_dataset(
                 )
                 _copy_file(source_video, output_video)
 
-        # PyArrow can segfault when several native Parquet readers run concurrently
-        # in the server environment. Keep generation sequential and disable
-        # PyArrow's internal reader threads in _rewrite_parquet.
+        # Keep generation sequential to bound memory while copying the full dataset.
+        # The Hugging Face Dataset path matches the proven pick-place writer.
         for position, episode in enumerate(episodes, start=1):
             build_one(episode)
             if position % 100 == 0 or position == len(episodes):
