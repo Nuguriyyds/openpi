@@ -305,7 +305,8 @@ def _rewrite_parquet(episode: Episode, output_path: Path, compression: str) -> N
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    table = pq.read_table(episode.parquet_path)
+    parquet = pq.ParquetFile(episode.parquet_path)
+    table = parquet.read(use_threads=False)
     if table.num_rows != episode.length:
         raise ValueError(f"{episode.parquet_path} changed: rows={table.num_rows}, expected={episode.length}")
     if "progress" in table.column_names:
@@ -324,7 +325,6 @@ def build_dataset(
     source_stats: list[dict[str, Any]],
     *,
     compression: str,
-    workers: int,
 ) -> None:
     source_root = source_root.resolve()
     output_root = output_root.resolve()
@@ -382,10 +382,13 @@ def build_dataset(
                 )
                 _copy_file(source_video, output_video)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            for position, _ in enumerate(executor.map(build_one, episodes), start=1):
-                if position % 100 == 0 or position == len(episodes):
-                    LOGGER.info("Generated episodes: %s/%s", position, len(episodes))
+        # PyArrow can segfault when several native Parquet readers run concurrently
+        # in the server environment. Keep generation sequential and disable
+        # PyArrow's internal reader threads in _rewrite_parquet.
+        for position, episode in enumerate(episodes, start=1):
+            build_one(episode)
+            if position % 100 == 0 or position == len(episodes):
+                LOGGER.info("Generated episodes: %s/%s", position, len(episodes))
         staging_root.rename(output_root)
     except Exception:
         LOGGER.error("Generation failed; partial output kept at: %s", staging_root)
@@ -453,7 +456,6 @@ def main() -> int:
             episodes,
             source_stats,
             compression=args.compression,
-            workers=args.workers,
         )
         summary["result"] = "dataset_created"
         LOGGER.info("Created breakfast progress dataset: %s", args.output_root)
