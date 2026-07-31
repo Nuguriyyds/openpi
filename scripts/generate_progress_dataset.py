@@ -980,8 +980,6 @@ def _trim_video(
         "0",
         "-pix_fmt",
         "yuv420p",
-        "-movflags",
-        "+faststart",
         str(destination),
     ]
     try:
@@ -1132,7 +1130,7 @@ def build_dataset(
                 "idle_frames": "removed from both ends",
                 "interpolation": "numpy.linspace(low, high, num=stage_frames, endpoint=True)",
                 "final_return_endpoint_clamped_count": sum(plan.final_endpoint_clamped for plan in plans),
-                "video_mode": "frame-accurate ffmpeg trim; H.264 libx264 QP 0 re-encode",
+                "video_mode": "frame-accurate ffmpeg trim; H.264 libx264 QP 0 re-encode without faststart",
                 "video_frame_probe": probe_videos,
                 "compression": compression,
             },
