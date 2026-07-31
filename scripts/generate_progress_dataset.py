@@ -1,4 +1,4 @@
-"""Build a full-trajectory LeRobot dataset with FurnitureVLA progress labels.
+"""Build an idle-trimmed LeRobot dataset with FurnitureVLA progress labels.
 
 The annotation files use source episode indices in their filenames. This script
 only touches the annotated source episodes; it does not scan or rewrite the full
@@ -18,7 +18,7 @@ Examples:
     uv run scripts/generate_progress_dataset.py \
         --annotation-dir /path/to/split
 
-    # Build an independent new dataset. Selected videos are copied.
+    # Build an independent new dataset. Parquet rows and videos are cropped to the four stages.
     uv run scripts/generate_progress_dataset.py \
         --annotation-dir /path/to/split \
         --write
@@ -41,7 +41,6 @@ import logging
 import math
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 from typing import Any
@@ -115,6 +114,10 @@ class EpisodePlan:
     source_episode_index: int
     annotation_file: str
     length: int
+    source_length: int
+    source_start_frame: int
+    source_end_frame: int
+    final_endpoint_clamped: bool
     global_index_start: int
     source_parquet: Path
     source_videos: tuple[tuple[str, Path], ...]
@@ -496,6 +499,9 @@ def _annotation_audit_rows(
             "status": "valid",
             "annotation_end_frame": annotation.annotation_end_frame,
             "expected_closed_source_rows": annotation.annotation_end_frame + 1,
+            "annotated_training_start_frame": annotation.stages[0].start,
+            "annotated_training_end_frame": annotation.stages[-1].end,
+            "training_interval": "closed [extend.start_frame, return.end_frame]",
             "stages": [asdict(interval) for interval in annotation.stages],
             "idle": [asdict(interval) for interval in annotation.idle],
             "warnings": warnings_by_file.get(annotation.annotation_file, []),
@@ -516,36 +522,57 @@ def _annotation_audit_rows(
     return sorted(rows, key=lambda row: (row["source_episode_index"] is None, row["source_episode_index"] or -1))
 
 
-def make_progress(annotation: Annotation, episode_length: int) -> np.ndarray:
-    expected_length = annotation.annotation_end_frame + 1
-    if episode_length != expected_length:
+def make_progress(
+    annotation: Annotation,
+    source_length: int,
+) -> tuple[np.ndarray, int, int, bool]:
+    expected_source_length = annotation.annotation_end_frame + 1
+    source_row_delta = source_length - expected_source_length
+    if source_row_delta not in (0, -1):
         raise ValueError(
             f"closed annotation ends at frame index {annotation.annotation_end_frame}, so expected "
-            f"{expected_length} source rows, got {episode_length}"
+            f"{expected_source_length} source rows; only an exact match or one missing final row is supported, "
+            f"got {source_length}"
         )
-    progress = np.full((episode_length,), np.nan, dtype=np.float32)
-    for interval in annotation.idle:
-        value = 0.0 if interval.name == "idle_start" else 1.0
-        progress[interval.start : interval.end + 1] = value
+
+    crop_start = annotation.stages[0].start
+    annotated_crop_end = annotation.stages[-1].end
+    final_endpoint_clamped = annotated_crop_end == source_length
+    crop_end = min(annotated_crop_end, source_length - 1)
+    if crop_start < 0 or crop_start >= source_length:
+        raise ValueError(f"extend starts outside source rows: start={crop_start}, source_rows={source_length}")
+    if annotated_crop_end > source_length:
+        raise ValueError(
+            f"return ends beyond the supported one-row clamp: end={annotated_crop_end}, source_rows={source_length}"
+        )
+    if crop_end < crop_start:
+        raise ValueError(f"empty training crop: [{crop_start}, {crop_end}]")
+
+    progress = np.full((crop_end - crop_start + 1,), np.nan, dtype=np.float32)
     for interval in annotation.stages:
+        effective_end = min(interval.end, crop_end)
+        local_start = interval.start - crop_start
+        local_end = effective_end - crop_start
+        if local_end < local_start:
+            raise ValueError(f"stage {interval.name} has no source frames after cropping")
         low, high = STAGE_PROGRESS[interval.name]
-        progress[interval.start : interval.end + 1] = np.linspace(
+        progress[local_start : local_end + 1] = np.linspace(
             low,
             high,
-            num=interval.length,
+            num=local_end - local_start + 1,
             endpoint=True,
             dtype=np.float32,
         )
+
     if np.isnan(progress).any():
         missing = np.flatnonzero(np.isnan(progress))
-        raise ValueError(f"progress has {missing.size} unlabeled frames; first missing frame={missing[0]}")
+        raise ValueError(f"progress has {missing.size} unlabeled frames; first local frame={missing[0]}")
     if np.any(np.diff(progress) < -1e-7):
         first = int(np.flatnonzero(np.diff(progress) < -1e-7)[0])
-        raise ValueError(f"progress is not monotonic at frames {first}->{first + 1}")
+        raise ValueError(f"progress is not monotonic at local frames {first}->{first + 1}")
     if not np.isclose(progress[0], 0.0) or not np.isclose(progress[-1], 1.0):
         raise ValueError(f"progress endpoints must be 0 and 1, got {progress[0]} and {progress[-1]}")
-    return progress
-
+    return progress, crop_start, crop_end, final_endpoint_clamped
 
 def _format_episode_path(pattern: str, episode_index: int, chunk_size: int, video_key: str | None = None) -> Path:
     values = {
@@ -620,6 +647,15 @@ def _validate_source_episode(
         "source_parquet_rows": None,
         "source_rows_minus_expected_closed_rows": None,
         "row_relation": "unavailable",
+        "annotated_training_start_frame": annotation.stages[0].start,
+        "annotated_training_end_frame": annotation.stages[-1].end,
+        "effective_training_start_frame": None,
+        "effective_training_end_frame": None,
+        "training_rows": None,
+        "initial_idle_frames_removed": None,
+        "trailing_idle_frames_removed": None,
+        "final_return_endpoint_clamped": False,
+        "adjustments": [],
         "missing_columns": [],
         "missing_videos": [],
         "status": "error",
@@ -634,31 +670,35 @@ def _validate_source_episode(
         import pyarrow.parquet as pq  # noqa: PLC0415 - keep annotation-only mode lightweight.
 
         parquet_file = pq.ParquetFile(parquet_path)
-        episode_length = parquet_file.metadata.num_rows
+        source_length = parquet_file.metadata.num_rows
         columns = set(parquet_file.schema_arrow.names)
     except Exception as error:
         errors.append(f"Cannot read {parquet_path}: {error}")
         audit["errors"] = errors
         return None, errors, audit
 
-    row_delta = episode_length - expected_rows
+    row_delta = source_length - expected_rows
     if row_delta == 0:
         row_relation = "matches_closed_annotation"
     elif row_delta == -1:
         row_relation = "source_one_row_short_of_closed_annotation"
     else:
         row_relation = "other_row_count_mismatch"
+        errors.append(
+            f"closed annotation expects {expected_rows} source rows, got {source_length}; "
+            "only an exact match or one missing final row is supported"
+        )
     audit.update(
         {
-            "source_parquet_rows": episode_length,
+            "source_parquet_rows": source_length,
             "source_rows_minus_expected_closed_rows": row_delta,
             "row_relation": row_relation,
         }
     )
 
     metadata_length = source_episode.get("length")
-    if metadata_length != episode_length:
-        errors.append(f"Source metadata length={metadata_length}, Parquet rows={episode_length}")
+    if metadata_length != source_length:
+        errors.append(f"Source metadata length={metadata_length}, Parquet rows={source_length}")
     required_columns = {
         "actions",
         "timestamp",
@@ -675,10 +715,26 @@ def _validate_source_episode(
         errors.append("Source Parquet already contains a progress column")
 
     try:
-        progress = make_progress(annotation, episode_length)
+        progress, crop_start, crop_end, final_endpoint_clamped = make_progress(annotation, source_length)
     except ValueError as error:
         errors.append(str(error))
         progress = None
+        crop_start = None
+        crop_end = None
+        final_endpoint_clamped = False
+    if progress is not None and crop_start is not None and crop_end is not None:
+        audit.update(
+            {
+                "effective_training_start_frame": crop_start,
+                "effective_training_end_frame": crop_end,
+                "training_rows": int(progress.shape[0]),
+                "initial_idle_frames_removed": crop_start,
+                "trailing_idle_frames_removed": source_length - crop_end - 1,
+                "final_return_endpoint_clamped": final_endpoint_clamped,
+            }
+        )
+        if final_endpoint_clamped:
+            audit["adjustments"].append("clamp_return_end_to_last_source_frame")
 
     video_paths: list[tuple[str, Path]] = []
     missing_videos: list[str] = []
@@ -693,22 +749,25 @@ def _validate_source_episode(
             missing_videos.append(str(video_path))
             errors.append(f"Missing source video: {video_path}")
         elif probe_videos:
-            probe_error = _probe_video(video_path, episode_length, int(source_info["fps"]), ffprobe_bin)
+            probe_error = _probe_video(video_path, source_length, int(source_info["fps"]), ffprobe_bin)
             if probe_error is not None:
                 errors.append(probe_error)
     audit["missing_videos"] = missing_videos
     audit["errors"] = errors
 
-    if errors or progress is None:
+    if errors or progress is None or crop_start is None or crop_end is None:
         return None, errors, audit
     audit["status"] = "valid"
     return {
         "source_parquet": parquet_path,
         "source_videos": tuple(video_paths),
-        "length": episode_length,
+        "source_length": source_length,
+        "source_start_frame": crop_start,
+        "source_end_frame": crop_end,
+        "length": int(progress.shape[0]),
+        "final_endpoint_clamped": final_endpoint_clamped,
         "progress": progress,
     }, [], audit
-
 
 def validate_source(
     annotations: list[Annotation],
@@ -792,7 +851,10 @@ def validate_source(
                 source_episode_index=annotation.source_episode_index,
                 annotation_file=annotation.annotation_file,
                 length=result["length"],
-
+                source_length=result["source_length"],
+                source_start_frame=result["source_start_frame"],
+                source_end_frame=result["source_end_frame"],
+                final_endpoint_clamped=result["final_endpoint_clamped"],
                 global_index_start=global_index_start,
                 source_parquet=result["source_parquet"],
                 source_videos=result["source_videos"],
@@ -803,37 +865,60 @@ def validate_source(
     return source_info, stats, plans, source_errors, source_audits
 
 
-def _scalar_stats(values: np.ndarray) -> dict[str, list[float | int]]:
-    values = np.asarray(values, dtype=np.float64)
+def _array_stats(values: Any) -> dict[str, list[float | int]]:
+    array = np.asarray(values)
+    if array.ndim == 0:
+        array = array.reshape(1)
+    if not np.issubdtype(array.dtype, np.number):
+        raise TypeError(f"Cannot compute numeric statistics for dtype={array.dtype}")
     return {
-        "min": [float(values.min())],
-        "max": [float(values.max())],
-        "mean": [float(values.mean())],
-        "std": [float(values.std())],
-        "count": [int(values.shape[0])],
+        "min": np.atleast_1d(np.min(array, axis=0)).astype(np.float64).tolist(),
+        "max": np.atleast_1d(np.max(array, axis=0)).astype(np.float64).tolist(),
+        "mean": np.atleast_1d(np.mean(array, axis=0)).astype(np.float64).tolist(),
+        "std": np.atleast_1d(np.std(array, axis=0)).astype(np.float64).tolist(),
+        "count": [int(array.shape[0])],
     }
 
 
-def _output_episode_stats(plan: EpisodePlan, source_stats_row: dict[str, Any]) -> dict[str, Any]:
-    stats = copy.deepcopy(source_stats_row["stats"])
-    length = plan.length
-    stats["progress"] = _scalar_stats(plan.progress)
-    stats["episode_index"] = _scalar_stats(np.full((length,), plan.output_episode_index))
-    stats["index"] = _scalar_stats(np.arange(plan.global_index_start, plan.global_index_start + length))
-    stats["task_index"] = _scalar_stats(np.zeros((length,)))
+def _output_episode_stats(
+    plan: EpisodePlan,
+    dataset: Any,
+    source_stats_row: dict[str, Any],
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {}
+    for key, source_feature_stats in source_stats_row["stats"].items():
+        if key in dataset.column_names:
+            stats[key] = _array_stats(dataset[key])
+        else:
+            stats[key] = copy.deepcopy(source_feature_stats)
+    stats["progress"] = _array_stats(plan.progress.reshape(-1, 1))
     return {"episode_index": plan.output_episode_index, "stats": stats}
 
 
-def _rewrite_parquet(plan: EpisodePlan, output_path: Path, compression: str) -> None:
+def _rewrite_parquet(
+    plan: EpisodePlan,
+    output_path: Path,
+    compression: str,
+    source_stats_row: dict[str, Any],
+) -> dict[str, Any]:
     from datasets import Dataset  # noqa: PLC0415 - only required when writing Parquet.
     from datasets import Sequence  # noqa: PLC0415 - only required when writing Parquet.
     from datasets import Value  # noqa: PLC0415 - only required when writing Parquet.
 
     dataset = Dataset.from_parquet(str(plan.source_parquet))
+    if dataset.num_rows != plan.source_length:
+        raise ValueError(
+            f"{plan.source_parquet} changed during generation: expected {plan.source_length} source rows, "
+            f"got {dataset.num_rows}"
+        )
+    dataset = dataset.select(range(plan.source_start_frame, plan.source_end_frame + 1))
     if dataset.num_rows != plan.length:
-        raise ValueError(f"{plan.source_parquet} changed during generation: expected {plan.length} rows")
+        raise ValueError(f"cropped Parquet has {dataset.num_rows} rows, expected {plan.length}")
 
+    frame_index = np.arange(plan.length, dtype=np.int64)
     replacement_columns = {
+        "timestamp": frame_index.astype(np.float32) / EXPECTED_FPS,
+        "frame_index": frame_index,
         "episode_index": np.full((plan.length,), plan.output_episode_index, dtype=np.int64),
         "index": np.arange(
             plan.global_index_start,
@@ -846,24 +931,67 @@ def _rewrite_parquet(plan: EpisodePlan, output_path: Path, compression: str) -> 
     dataset = dataset.remove_columns(list(replacement_columns))
     for key, values in replacement_columns.items():
         dataset = dataset.add_column(key, values, feature=original_features[key])
-    progress_values = plan.progress.reshape(-1, 1).tolist()
     dataset = dataset.add_column(
         "progress",
-        progress_values,
+        plan.progress.reshape(-1, 1).tolist(),
         feature=Sequence(feature=Value("float32"), length=1),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_parquet(str(output_path), compression=compression)
+    return _output_episode_stats(plan, dataset, source_stats_row)
 
 
-def _copy_video(source: Path, destination: Path) -> None:
+def _trim_video(
+    source: Path,
+    destination: Path,
+    *,
+    start_frame: int,
+    end_frame: int,
+    ffmpeg_bin: str,
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with source.open("rb") as source_file, destination.open("xb") as destination_file:
-        shutil.copyfileobj(source_file, destination_file, length=16 * 1024 * 1024)
-    if destination.stat().st_size != source.stat().st_size:
-        raise OSError(f"Copied video size mismatch: {source} -> {destination}")
-
+    frame_count = end_frame - start_frame + 1
+    video_filter = (
+        f"trim=start_frame={start_frame}:end_frame={end_frame + 1},"
+        "setpts=PTS-STARTPTS"
+    )
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-n",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-vf",
+        video_filter,
+        "-frames:v",
+        str(frame_count),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-qp",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(destination),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        stderr = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else ""
+        detail = f": {stderr}" if stderr else ""
+        raise RuntimeError(f"ffmpeg failed for {source}{detail}") from error
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise OSError(f"ffmpeg did not create a valid output file: {destination}")
 
 def _build_output_info(source_info: dict[str, Any], plans: list[EpisodePlan]) -> dict[str, Any]:
     info = copy.deepcopy(source_info)
@@ -905,6 +1033,8 @@ def build_dataset(
     *,
     compression: str,
     probe_videos: bool,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
 ) -> None:
     output_root = output_root.resolve()
     source_root = source_root.resolve()
@@ -929,7 +1059,12 @@ def build_dataset(
             destination_parquet = staging_root / _destination_path(
                 output_info, "data_path", plan.output_episode_index
             )
-            _rewrite_parquet(plan, destination_parquet, compression)
+            output_stats = _rewrite_parquet(
+                plan,
+                destination_parquet,
+                compression,
+                source_stats[plan.source_episode_index],
+            )
             for video_key, source_video in plan.source_videos:
                 destination_video = staging_root / _destination_path(
                     output_info,
@@ -937,7 +1072,17 @@ def build_dataset(
                     plan.output_episode_index,
                     video_key,
                 )
-                _copy_video(source_video, destination_video)
+                _trim_video(
+                    source_video,
+                    destination_video,
+                    start_frame=plan.source_start_frame,
+                    end_frame=plan.source_end_frame,
+                    ffmpeg_bin=ffmpeg_bin,
+                )
+                if probe_videos:
+                    probe_error = _probe_video(destination_video, plan.length, EXPECTED_FPS, ffprobe_bin)
+                    if probe_error is not None:
+                        raise ValueError(probe_error)
 
             episodes_rows.append(
                 {
@@ -946,14 +1091,16 @@ def build_dataset(
                     "length": plan.length,
                 }
             )
-            stats_rows.append(_output_episode_stats(plan, source_stats[plan.source_episode_index]))
+            stats_rows.append(output_stats)
             mapping_rows.append(
                 {
                     "episode_index": plan.output_episode_index,
                     "source_episode_index": plan.source_episode_index,
                     "annotation_file": plan.annotation_file,
+                    "source_start_frame": plan.source_start_frame,
+                    "source_end_frame": plan.source_end_frame,
                     "length": plan.length,
-
+                    "final_return_endpoint_clamped": plan.final_endpoint_clamped,
                 }
             )
             if position % 100 == 0 or position == len(plans):
@@ -981,11 +1128,11 @@ def build_dataset(
                 "task": TASK,
                 "stage_progress": {key: list(value) for key, value in STAGE_PROGRESS.items()},
                 "stage_intervals": "closed [start_frame, end_frame]",
-
+                "training_crop": "closed [extend.start_frame, return.end_frame]",
+                "idle_frames": "removed from both ends",
                 "interpolation": "numpy.linspace(low, high, num=stage_frames, endpoint=True)",
-                "initial_idle_progress": 0.0,
-                "trailing_idle_progress": 1.0,
-                "video_mode": "copy",
+                "final_return_endpoint_clamped_count": sum(plan.final_endpoint_clamped for plan in plans),
+                "video_mode": "frame-accurate ffmpeg trim; H.264 libx264 QP 0 re-encode",
                 "video_frame_probe": probe_videos,
                 "compression": compression,
             },
@@ -1048,6 +1195,7 @@ def _parse_args() -> argparse.Namespace:
         help="Use ffprobe to count every selected camera video's frames. This is much slower.",
     )
     parser.add_argument("--ffprobe-bin", default="ffprobe")
+    parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     parser.add_argument(
         "--log-dir",
         type=Path,
@@ -1140,16 +1288,23 @@ def main() -> int:
             "source_error_count": len(source_errors),
             "source_row_relation_counts": row_relation_counts,
             "source_status_counts": source_status_counts,
+            "source_frame_count": sum(plan.source_length for plan in plans),
             "output_frame_count": sum(plan.length for plan in plans),
+            "initial_idle_frames_removed": sum(plan.source_start_frame for plan in plans),
+            "trailing_idle_frames_removed": sum(
+                plan.source_length - plan.source_end_frame - 1 for plan in plans
+            ),
+            "final_return_endpoint_clamped_count": sum(plan.final_endpoint_clamped for plan in plans),
             "video_frame_probe": args.probe_videos,
         }
     )
     LOGGER.info(
-        "Source: checked=%s valid=%s errors=%s row_relations=%s",
+        "Source: checked=%s valid=%s errors=%s row_relations=%s clamped_return_end=%s",
         len(source_audits),
         len(plans),
         len(source_errors),
         row_relation_counts,
+        sum(plan.final_endpoint_clamped for plan in plans),
     )
 
     if source_errors:
@@ -1177,6 +1332,8 @@ def main() -> int:
             warnings,
             compression=args.compression,
             probe_videos=args.probe_videos,
+            ffmpeg_bin=args.ffmpeg_bin,
+            ffprobe_bin=args.ffprobe_bin,
         )
     except Exception as error:
         summary["generation_error"] = str(error)
