@@ -77,7 +77,7 @@ class FrameInterval:
 
     @property
     def length(self) -> int:
-        return self.end - self.start
+        return self.end - self.start + 1
 
 
 @dataclass(frozen=True)
@@ -245,14 +245,14 @@ def _parse_annotation(path: Path) -> tuple[Annotation | None, ExcludedAnnotation
         for name, start, end in zip(STAGES, stage_starts, stage_ends, strict=True)
     )
     for index, interval in enumerate(stages):
-        if interval.start < 0 or interval.end <= interval.start:
+        if interval.start < 0 or interval.end < interval.start:
             return (
                 None,
                 ExcludedAnnotation(
                     path.name,
                     filename_index,
                     "invalid_stage_interval",
-                    f"{interval.name}=[{interval.start},{interval.end})",
+                    f"{interval.name}=[{interval.start},{interval.end}]",
                 ),
                 warnings,
             )
@@ -342,15 +342,11 @@ def _parse_annotation(path: Path) -> tuple[Annotation | None, ExcludedAnnotation
                     path.name,
                     filename_index,
                     "invalid_idle_interval",
-                    f"idle[{index}]=[{start},{end})",
+                    f"idle[{index}]=[{start},{end}]",
                 ),
                 warnings,
             )
-        if end == start:
-            warnings.append(
-                WarningRecord(path.name, filename_index, "zero_length_idle", f"idle[{index}]=[{start},{end}) ignored")
-            )
-            continue
+
         if idle_end_times[index] <= idle_start_times[index]:
             return (
                 None,
@@ -387,7 +383,7 @@ def _parse_annotation(path: Path) -> tuple[Annotation | None, ExcludedAnnotation
                     path.name,
                     filename_index,
                     "unexpected_idle_position",
-                    f"idle[{index}]=[{start},{end})",
+                    f"idle[{index}]=[{start},{end}]",
                 ),
                 warnings,
             )
@@ -459,17 +455,19 @@ def load_annotations(annotation_dir: Path) -> tuple[list[Annotation], list[Exclu
 
 
 def make_progress(annotation: Annotation, episode_length: int) -> np.ndarray:
-    if annotation.annotation_end_frame != episode_length:
+    expected_length = annotation.annotation_end_frame + 1
+    if episode_length != expected_length:
         raise ValueError(
-            f"annotation ends at frame {annotation.annotation_end_frame}, source episode has {episode_length} rows"
+            f"closed annotation ends at frame index {annotation.annotation_end_frame}, so expected "
+            f"{expected_length} source rows, got {episode_length}"
         )
     progress = np.full((episode_length,), np.nan, dtype=np.float32)
     for interval in annotation.idle:
         value = 0.0 if interval.name == "idle_start" else 1.0
-        progress[interval.start : interval.end] = value
+        progress[interval.start : interval.end + 1] = value
     for interval in annotation.stages:
         low, high = STAGE_PROGRESS[interval.name]
-        progress[interval.start : interval.end] = np.linspace(
+        progress[interval.start : interval.end + 1] = np.linspace(
             low,
             high,
             num=interval.length,
@@ -605,6 +603,7 @@ def _validate_source_episode(
         "source_parquet": parquet_path,
         "source_videos": tuple(video_paths),
         "length": episode_length,
+
         "progress": progress,
     }, []
 
@@ -679,6 +678,7 @@ def validate_source(
                 source_episode_index=annotation.source_episode_index,
                 annotation_file=annotation.annotation_file,
                 length=result["length"],
+
                 global_index_start=global_index_start,
                 source_parquet=result["source_parquet"],
                 source_videos=result["source_videos"],
@@ -839,6 +839,7 @@ def build_dataset(
                     "source_episode_index": plan.source_episode_index,
                     "annotation_file": plan.annotation_file,
                     "length": plan.length,
+
                 }
             )
             if position % 100 == 0 or position == len(plans):
@@ -862,9 +863,11 @@ def build_dataset(
                 "excluded_annotation_count": len(excluded),
                 "output_episode_count": len(plans),
                 "output_frame_count": sum(plan.length for plan in plans),
+
                 "task": TASK,
                 "stage_progress": {key: list(value) for key, value in STAGE_PROGRESS.items()},
-                "stage_intervals": "half-open [start_frame, end_frame)",
+                "stage_intervals": "closed [start_frame, end_frame]",
+
                 "interpolation": "numpy.linspace(low, high, num=stage_frames, endpoint=True)",
                 "initial_idle_progress": 0.0,
                 "trailing_idle_progress": 1.0,
@@ -993,6 +996,7 @@ def main() -> int:
             "source_error_count": len(source_errors),
             "source_errors": source_errors,
             "output_frame_count": sum(plan.length for plan in plans),
+
             "video_frame_probe": args.probe_videos,
         }
     )
