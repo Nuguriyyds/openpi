@@ -38,7 +38,9 @@ echo "Expected subset: 1,500 train episodes; 20 held-out test episodes."
 
 # Norm stats do not need a GPU. Keeping GPUs hidden prevents this process from
 # reserving memory immediately before the training process starts.
-CUDA_VISIBLE_DEVICES="" uv run scripts/compute_norm_stats.py \
+CUDA_VISIBLE_DEVICES="" \
+JAX_PLATFORMS=cpu \
+uv run scripts/compute_norm_stats.py \
     --config-name "${CONFIG_NAME}"
 
 if [[ ! -s "${NORM_STATS_PATH}" ]]; then
