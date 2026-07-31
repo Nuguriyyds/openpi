@@ -41,8 +41,10 @@ import logging
 import math
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -53,6 +55,7 @@ DEFAULT_SOURCE_ROOT = Path(
 DEFAULT_ANNOTATION_DIR = Path("/mnt/data/dataset/ei/huggingface/modanqing/split/split")
 DEFAULT_OUTPUT_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/split/progress/full_trajectories_progress")
 DEFAULT_LOG_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/split/progress/logs")
+DEFAULT_VIDEO_TEMP_DIR = Path("/tmp")
 
 LOGGER = logging.getLogger("progress_dataset")
 
@@ -949,47 +952,60 @@ def _trim_video(
     start_frame: int,
     end_frame: int,
     ffmpeg_bin: str,
+    video_temp_dir: Path,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    video_temp_dir.mkdir(parents=True, exist_ok=True)
     frame_count = end_frame - start_frame + 1
     video_filter = (
         f"trim=start_frame={start_frame}:end_frame={end_frame + 1},"
         "setpts=PTS-STARTPTS"
     )
-    command = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-n",
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
-        "-vf",
-        video_filter,
-        "-frames:v",
-        str(frame_count),
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-qp",
-        "0",
-        "-pix_fmt",
-        "yuv420p",
-        str(destination),
-    ]
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    except (OSError, subprocess.CalledProcessError) as error:
-        stderr = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else ""
-        detail = f": {stderr}" if stderr else ""
-        raise RuntimeError(f"ffmpeg failed for {source}{detail}") from error
-    if not destination.is_file() or destination.stat().st_size == 0:
-        raise OSError(f"ffmpeg did not create a valid output file: {destination}")
+
+    # MP4 muxing seeks back while writing the trailer. Some mounted filesystems
+    # reject that operation, so encode one video at a time on local disk and
+    # then perform a sequential byte copy to the mounted output dataset.
+    with tempfile.TemporaryDirectory(prefix="progress-video-", dir=video_temp_dir) as temporary_directory:
+        temporary_output = Path(temporary_directory) / destination.name
+        command = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-n",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-vf",
+            video_filter,
+            "-frames:v",
+            str(frame_count),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            str(temporary_output),
+        ]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            stderr = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else ""
+            detail = f": {stderr}" if stderr else ""
+            raise RuntimeError(f"ffmpeg failed for {source}{detail}") from error
+        if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
+            raise OSError(f"ffmpeg did not create a valid local output file: {temporary_output}")
+
+        with temporary_output.open("rb") as source_file, destination.open("xb") as destination_file:
+            shutil.copyfileobj(source_file, destination_file, length=16 * 1024 * 1024)
+        if destination.stat().st_size != temporary_output.stat().st_size:
+            raise OSError(f"Copied video size mismatch: {temporary_output} -> {destination}")
 
 def _build_output_info(source_info: dict[str, Any], plans: list[EpisodePlan]) -> dict[str, Any]:
     info = copy.deepcopy(source_info)
@@ -1033,6 +1049,7 @@ def build_dataset(
     probe_videos: bool,
     ffmpeg_bin: str,
     ffprobe_bin: str,
+    video_temp_dir: Path,
 ) -> None:
     output_root = output_root.resolve()
     source_root = source_root.resolve()
@@ -1076,6 +1093,7 @@ def build_dataset(
                     start_frame=plan.source_start_frame,
                     end_frame=plan.source_end_frame,
                     ffmpeg_bin=ffmpeg_bin,
+                    video_temp_dir=video_temp_dir,
                 )
                 if probe_videos:
                     probe_error = _probe_video(destination_video, plan.length, EXPECTED_FPS, ffprobe_bin)
@@ -1130,7 +1148,8 @@ def build_dataset(
                 "idle_frames": "removed from both ends",
                 "interpolation": "numpy.linspace(low, high, num=stage_frames, endpoint=True)",
                 "final_return_endpoint_clamped_count": sum(plan.final_endpoint_clamped for plan in plans),
-                "video_mode": "frame-accurate ffmpeg trim; H.264 libx264 QP 0 re-encode without faststart",
+                "video_mode": "encode to local temporary storage, then byte-copy to mounted output",
+                "video_temp_dir": str(video_temp_dir),
                 "video_frame_probe": probe_videos,
                 "compression": compression,
             },
@@ -1194,6 +1213,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ffprobe-bin", default="ffprobe")
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
+    parser.add_argument(
+        "--video-temp-dir",
+        type=Path,
+        default=DEFAULT_VIDEO_TEMP_DIR,
+        help="Local filesystem used for MP4 encoding before copying to the mounted output.",
+    )
     parser.add_argument(
         "--log-dir",
         type=Path,
@@ -1332,6 +1357,7 @@ def main() -> int:
             probe_videos=args.probe_videos,
             ffmpeg_bin=args.ffmpeg_bin,
             ffprobe_bin=args.ffprobe_bin,
+            video_temp_dir=args.video_temp_dir,
         )
     except Exception as error:
         summary["generation_error"] = str(error)
