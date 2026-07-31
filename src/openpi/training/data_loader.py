@@ -138,8 +138,19 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    episodes = None if data_config.episode_indices is None else list(data_config.episode_indices)
+    if episodes is not None:
+        if not episodes:
+            raise ValueError("Episode subset must not be empty.")
+        if len(episodes) != len(set(episodes)):
+            raise ValueError("Episode subset contains duplicate indices.")
+        if any(isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in episodes):
+            raise ValueError("Episode subset must contain non-negative integer indices.")
+        logging.info("Loading LeRobot episode subset: %s episodes", len(episodes))
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=episodes,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

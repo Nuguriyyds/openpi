@@ -24,6 +24,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.breakfast_progress_split as breakfast_progress_split
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -91,6 +92,10 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Optional LeRobot episode subset. If provided, only these episodes are loaded. This same
+    # subset is used by normalization-stat computation and training.
+    episode_indices: Sequence[int] | None = dataclasses.field(default=None, repr=False)
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -645,7 +650,10 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_dim=15, action_horizon=50),
         data=LeRobotAGILEXProgressDataConfig(
             repo_id="wyt/agilex_make_breakfast_380_subtask_furniturevla_progress",
-            base_config=DataConfig(prompt_from_task=True),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_indices=breakfast_progress_split.TRAIN_EPISODE_INDICES,
+            ),
         ),
         weight_loader=weight_loaders.FurnitureVLAWeightLoader("/mnt/data/models/openpi/openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
