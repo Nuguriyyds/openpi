@@ -638,6 +638,35 @@ class TrainConfig:
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
+    # Training config for breakfast subtasks progress
+    #
+    TrainConfig(
+        name="pi05_agilex_breakfast_progress",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=15, action_horizon=50),
+        data=LeRobotAGILEXProgressDataConfig(
+            repo_id="wyt/agilex_make_breakfast_380_subtask_furniturevla_progress",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.FurnitureVLAWeightLoader("/mnt/data/models/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=40_000,
+            decay_lr=2.5e-6,
+        ),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=4,
+        log_interval=100,
+        save_interval=10000,
+        keep_period=10000,
+        fsdp_devices=2,
+        assets_base_dir="/mnt/data/models/openpi/assets",
+        checkpoint_base_dir="/mnt/data/models/openpi/checkpoints",
+    ),
+    #
     # Inference Aloha configs.
     #
     TrainConfig(
@@ -1009,6 +1038,38 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
+    # #
+    # # FurnitureVLA-style local progress fine-tuning for the four breakfast subtasks.
+    # #
+    # TrainConfig(
+    #     name="pi05_agilex_breakfast_progress",
+    #     project_name="furniturevla",
+    #     model=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         action_dim=15,
+    #         action_horizon=50,
+    #     ),
+    #     data=LeRobotAGILEXProgressDataConfig(
+    #         repo_id="wyt/agilex_make_breakfast_380_subtask_furniturevla_progress",
+    #         base_config=DataConfig(prompt_from_task=True),
+    #     ),
+    #     weight_loader=weight_loaders.FurnitureVLAWeightLoader(
+    #         "gs://openpi-assets/checkpoints/pi05_base/params"
+    #     ),
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=1_000,
+    #         peak_lr=2.5e-5,
+    #         decay_steps=40_000,
+    #         decay_lr=2.5e-6,
+    #     ),
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     batch_size=64,
+    #     num_workers=8,
+    #     num_train_steps=40_000,
+    #     log_interval=100,
+    #     save_interval=1_000,
+    #     keep_period=5_000,
+    # ),
     #
     # Debugging configs.
     #
