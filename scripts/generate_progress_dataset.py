@@ -37,6 +37,7 @@ from datetime import datetime
 from fractions import Fraction
 from itertools import pairwise
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -52,6 +53,9 @@ DEFAULT_SOURCE_ROOT = Path(
 )
 DEFAULT_ANNOTATION_DIR = Path("/mnt/data/dataset/ei/huggingface/modanqing/split/split")
 DEFAULT_OUTPUT_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/split/progress/full_trajectories_progress")
+DEFAULT_LOG_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/split/progress/logs")
+
+LOGGER = logging.getLogger("progress_dataset")
 
 EXPECTED_ANNOTATION_COUNT = 3399
 EXPECTED_VALID_EPISODE_COUNT = 3337
@@ -156,6 +160,29 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             file.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
             file.write("\n")
+
+
+def _setup_run_logging(log_root: Path) -> Path:
+    run_name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
+    run_dir = log_root.resolve() / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    LOGGER.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler = logging.FileHandler(run_dir / "run.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+    LOGGER.addHandler(stream_handler)
+    return run_dir
+
+
+def _persist_summary(summary: dict[str, Any], run_dir: Path, report_path: Path | None) -> None:
+    _write_json(run_dir / "summary.json", summary)
+    if report_path is not None:
+        _write_json(report_path, summary)
 
 
 def _parse_int_list(value: Any, expected_length: int, field: str) -> list[int]:
@@ -454,6 +481,41 @@ def load_annotations(annotation_dir: Path) -> tuple[list[Annotation], list[Exclu
     return annotations, excluded, warnings
 
 
+def _annotation_audit_rows(
+    annotations: list[Annotation],
+    excluded: list[ExcludedAnnotation],
+    warnings: list[WarningRecord],
+) -> list[dict[str, Any]]:
+    warnings_by_file: dict[str, list[dict[str, Any]]] = {}
+    for warning in warnings:
+        warnings_by_file.setdefault(warning.annotation_file, []).append(asdict(warning))
+    rows = [
+        {
+            "annotation_file": annotation.annotation_file,
+            "source_episode_index": annotation.source_episode_index,
+            "status": "valid",
+            "annotation_end_frame": annotation.annotation_end_frame,
+            "expected_closed_source_rows": annotation.annotation_end_frame + 1,
+            "stages": [asdict(interval) for interval in annotation.stages],
+            "idle": [asdict(interval) for interval in annotation.idle],
+            "warnings": warnings_by_file.get(annotation.annotation_file, []),
+        }
+        for annotation in annotations
+    ]
+    rows.extend(
+        {
+            "annotation_file": item.annotation_file,
+            "source_episode_index": item.source_episode_index,
+            "status": "excluded",
+            "reason": item.reason,
+            "detail": item.detail,
+            "warnings": warnings_by_file.get(item.annotation_file, []),
+        }
+        for item in excluded
+    )
+    return sorted(rows, key=lambda row: (row["source_episode_index"] is None, row["source_episode_index"] or -1))
+
+
 def make_progress(annotation: Annotation, episode_length: int) -> np.ndarray:
     expected_length = annotation.annotation_end_frame + 1
     if episode_length != expected_length:
@@ -541,14 +603,32 @@ def _validate_source_episode(
     *,
     probe_videos: bool,
     ffprobe_bin: str,
-) -> tuple[dict[str, Any] | None, list[str]]:
+) -> tuple[dict[str, Any] | None, list[str], dict[str, Any]]:
     del source_stats  # Presence is validated by the caller; values are used during writing.
     errors: list[str] = []
     chunk_size = int(source_info["chunks_size"])
     source_index = annotation.source_episode_index
+    expected_rows = annotation.annotation_end_frame + 1
     parquet_path = source_root / _format_episode_path(source_info["data_path"], source_index, chunk_size)
+    audit: dict[str, Any] = {
+        "annotation_file": annotation.annotation_file,
+        "source_episode_index": source_index,
+        "annotation_end_frame": annotation.annotation_end_frame,
+        "expected_closed_source_rows": expected_rows,
+        "source_parquet": str(parquet_path),
+        "source_metadata_rows": source_episode.get("length"),
+        "source_parquet_rows": None,
+        "source_rows_minus_expected_closed_rows": None,
+        "row_relation": "unavailable",
+        "missing_columns": [],
+        "missing_videos": [],
+        "status": "error",
+        "errors": [],
+    }
     if not parquet_path.is_file():
-        return None, [f"Missing source Parquet: {parquet_path}"]
+        errors.append(f"Missing source Parquet: {parquet_path}")
+        audit["errors"] = errors
+        return None, errors, audit
 
     try:
         import pyarrow.parquet as pq  # noqa: PLC0415 - keep annotation-only mode lightweight.
@@ -557,7 +637,24 @@ def _validate_source_episode(
         episode_length = parquet_file.metadata.num_rows
         columns = set(parquet_file.schema_arrow.names)
     except Exception as error:
-        return None, [f"Cannot read {parquet_path}: {error}"]
+        errors.append(f"Cannot read {parquet_path}: {error}")
+        audit["errors"] = errors
+        return None, errors, audit
+
+    row_delta = episode_length - expected_rows
+    if row_delta == 0:
+        row_relation = "matches_closed_annotation"
+    elif row_delta == -1:
+        row_relation = "source_one_row_short_of_closed_annotation"
+    else:
+        row_relation = "other_row_count_mismatch"
+    audit.update(
+        {
+            "source_parquet_rows": episode_length,
+            "source_rows_minus_expected_closed_rows": row_delta,
+            "row_relation": row_relation,
+        }
+    )
 
     metadata_length = source_episode.get("length")
     if metadata_length != episode_length:
@@ -571,6 +668,7 @@ def _validate_source_episode(
         "task_index",
     }
     missing_columns = sorted(required_columns - columns)
+    audit["missing_columns"] = missing_columns
     if missing_columns:
         errors.append(f"Source Parquet is missing columns: {missing_columns}")
     if "progress" in columns:
@@ -583,6 +681,7 @@ def _validate_source_episode(
         progress = None
 
     video_paths: list[tuple[str, Path]] = []
+    missing_videos: list[str] = []
     video_keys = [key for key, feature in source_info["features"].items() if feature["dtype"] == "video"]
     for video_key in video_keys:
         relative_path = _format_episode_path(
@@ -591,21 +690,24 @@ def _validate_source_episode(
         video_path = source_root / relative_path
         video_paths.append((video_key, video_path))
         if not video_path.is_file():
+            missing_videos.append(str(video_path))
             errors.append(f"Missing source video: {video_path}")
         elif probe_videos:
             probe_error = _probe_video(video_path, episode_length, int(source_info["fps"]), ffprobe_bin)
             if probe_error is not None:
                 errors.append(probe_error)
+    audit["missing_videos"] = missing_videos
+    audit["errors"] = errors
 
     if errors or progress is None:
-        return None, errors
+        return None, errors, audit
+    audit["status"] = "valid"
     return {
         "source_parquet": parquet_path,
         "source_videos": tuple(video_paths),
         "length": episode_length,
-
         "progress": progress,
-    }, []
+    }, [], audit
 
 
 def validate_source(
@@ -615,7 +717,13 @@ def validate_source(
     workers: int,
     probe_videos: bool,
     ffprobe_bin: str,
-) -> tuple[dict[str, Any], dict[int, dict[str, Any]], list[EpisodePlan], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any],
+    dict[int, dict[str, Any]],
+    list[EpisodePlan],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     info_path = source_root / "meta" / "info.json"
     if not info_path.is_file():
         raise FileNotFoundError(f"Missing source metadata: {info_path}")
@@ -640,8 +748,10 @@ def validate_source(
             f"Source episodes_stats.jsonl is missing {len(missing_stats)} selected episodes: {missing_stats[:20]}"
         )
 
-    def validate_one(annotation: Annotation) -> tuple[Annotation, dict[str, Any] | None, list[str]]:
-        result, errors = _validate_source_episode(
+    def validate_one(
+        annotation: Annotation,
+    ) -> tuple[Annotation, dict[str, Any] | None, list[str], dict[str, Any]]:
+        result, errors, audit = _validate_source_episode(
             annotation,
             source_root,
             source_info,
@@ -650,12 +760,16 @@ def validate_source(
             probe_videos=probe_videos,
             ffprobe_bin=ffprobe_bin,
         )
-        return annotation, result, errors
+        return annotation, result, errors, audit
 
     validated: list[tuple[Annotation, dict[str, Any]]] = []
     source_errors: list[dict[str, Any]] = []
+    source_audits: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        for position, (annotation, result, errors) in enumerate(executor.map(validate_one, annotations), start=1):
+        for position, (annotation, result, errors, audit) in enumerate(
+            executor.map(validate_one, annotations), start=1
+        ):
+            source_audits.append(audit)
             if errors or result is None:
                 source_errors.append(
                     {
@@ -667,7 +781,7 @@ def validate_source(
             else:
                 validated.append((annotation, result))
             if position % 250 == 0 or position == len(annotations):
-                print(f"Validated source episodes: {position}/{len(annotations)}", file=sys.stderr)
+                LOGGER.info("Validated source episodes: %s/%s", position, len(annotations))
 
     plans: list[EpisodePlan] = []
     global_index_start = 0
@@ -686,7 +800,7 @@ def validate_source(
             )
         )
         global_index_start += result["length"]
-    return source_info, stats, plans, source_errors
+    return source_info, stats, plans, source_errors, source_audits
 
 
 def _scalar_stats(values: np.ndarray) -> dict[str, list[float | int]]:
@@ -843,7 +957,7 @@ def build_dataset(
                 }
             )
             if position % 100 == 0 or position == len(plans):
-                print(f"Generated episodes: {position}/{len(plans)}", file=sys.stderr)
+                LOGGER.info("Generated episodes: %s/%s", position, len(plans))
 
         meta_dir = staging_root / "meta"
         _write_json(meta_dir / "info.json", output_info)
@@ -878,10 +992,7 @@ def build_dataset(
         )
         staging_root.rename(output_root)
     except Exception:
-        print(
-            f"Generation failed. Partial output was kept for inspection at: {staging_root}",
-            file=sys.stderr,
-        )
+        LOGGER.error("Generation failed. Partial output was kept for inspection at: %s", staging_root)
         raise
 
 
@@ -899,8 +1010,6 @@ def _annotation_summary(
         "excluded_by_reason": dict(sorted(Counter(item.reason for item in excluded).items())),
         "warning_count": len(warnings),
         "warnings_by_code": dict(sorted(Counter(item.code for item in warnings).items())),
-        "excluded": [asdict(item) for item in excluded],
-        "warnings": [asdict(item) for item in warnings],
     }
 
 
@@ -939,6 +1048,12 @@ def _parse_args() -> argparse.Namespace:
         help="Use ffprobe to count every selected camera video's frames. This is much slower.",
     )
     parser.add_argument("--ffprobe-bin", default="ffprobe")
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=DEFAULT_LOG_ROOT,
+        help="Root directory for timestamped per-run logs.",
+    )
     parser.add_argument("--report-path", type=Path, help="Optional JSON path for the check report.")
     parser.add_argument("--expected-annotation-count", type=int, default=EXPECTED_ANNOTATION_COUNT)
     parser.add_argument("--expected-valid-episodes", type=int, default=EXPECTED_VALID_EPISODE_COUNT)
@@ -952,41 +1067,70 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    run_dir = _setup_run_logging(args.log_dir)
+    LOGGER.info("Run logs: %s", run_dir)
+
     annotations, excluded, warnings = load_annotations(args.annotation_dir)
     summary = _annotation_summary(args.annotation_dir, annotations, excluded, warnings)
+    summary.update(
+        {
+            "run_started_at_utc": datetime.now(UTC).isoformat(),
+            "run_log_dir": str(run_dir),
+            "mode": "annotations_only" if args.annotations_only else "write" if args.write else "check",
+            "result": "running",
+        }
+    )
+    annotation_audits = _annotation_audit_rows(annotations, excluded, warnings)
+    _write_jsonl(run_dir / "annotation_validation.jsonl", annotation_audits)
+    _write_jsonl(run_dir / "source_validation.jsonl", [])
+
     count_errors = _check_expected_counts(
         summary,
         args.expected_annotation_count,
         args.expected_valid_episodes,
     )
     summary["count_errors"] = count_errors
+    LOGGER.info(
+        "Annotations: total=%s valid=%s excluded=%s warnings=%s",
+        summary["annotation_file_count"],
+        summary["valid_annotation_count"],
+        summary["excluded_annotation_count"],
+        summary["warning_count"],
+    )
 
     if args.annotations_only:
-        if args.report_path is not None:
-            _write_json(args.report_path, summary)
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        summary["result"] = "failed" if count_errors else "annotations_valid"
+        summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+        _persist_summary(summary, run_dir, args.report_path)
+        LOGGER.info("Result: %s", summary["result"])
         return 1 if count_errors else 0
 
     if count_errors:
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-        print("Refusing source validation because annotation counts did not match expectations.", file=sys.stderr)
+        summary["result"] = "failed"
+        summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+        _persist_summary(summary, run_dir, args.report_path)
+        LOGGER.error("Annotation counts did not match expectations; source validation was not run.")
         return 1
 
     try:
-        source_info, source_stats, plans, source_errors = validate_source(
+        source_info, source_stats, plans, source_errors, source_audits = validate_source(
             annotations,
             args.source_root,
             workers=args.workers,
             probe_videos=args.probe_videos,
             ffprobe_bin=args.ffprobe_bin,
         )
-    except (FileNotFoundError, KeyError, OSError, ValueError) as error:
+    except Exception as error:
         summary["source_validation_error"] = str(error)
-        if args.report_path is not None:
-            _write_json(args.report_path, summary)
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        summary["result"] = "failed"
+        summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+        _persist_summary(summary, run_dir, args.report_path)
+        LOGGER.error("Source validation could not be completed: %s", error)
         return 1
 
+    _write_jsonl(run_dir / "source_validation.jsonl", source_audits)
+    row_relation_counts = dict(sorted(Counter(row["row_relation"] for row in source_audits).items()))
+    source_status_counts = dict(sorted(Counter(row["status"] for row in source_audits).items()))
     summary.update(
         {
             "source_root": str(args.source_root.resolve()),
@@ -994,36 +1138,59 @@ def main() -> int:
             "source_checked_episode_count": len(annotations),
             "source_valid_episode_count": len(plans),
             "source_error_count": len(source_errors),
-            "source_errors": source_errors,
+            "source_row_relation_counts": row_relation_counts,
+            "source_status_counts": source_status_counts,
             "output_frame_count": sum(plan.length for plan in plans),
-
             "video_frame_probe": args.probe_videos,
         }
     )
-    if args.report_path is not None:
-        _write_json(args.report_path, summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    LOGGER.info(
+        "Source: checked=%s valid=%s errors=%s row_relations=%s",
+        len(source_audits),
+        len(plans),
+        len(source_errors),
+        row_relation_counts,
+    )
 
     if source_errors:
-        print("Source validation failed; no output dataset was created.", file=sys.stderr)
+        summary["result"] = "failed"
+        summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+        _persist_summary(summary, run_dir, args.report_path)
+        LOGGER.error("Source validation failed; no output dataset was created.")
         return 1
     if not args.write:
-        print("Check completed successfully. Re-run with --write to create the dataset.", file=sys.stderr)
+        summary["result"] = "source_valid"
+        summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+        _persist_summary(summary, run_dir, args.report_path)
+        LOGGER.info("Check completed successfully. Re-run with --write to create the dataset.")
         return 0
 
-    build_dataset(
-        args.output_root,
-        args.source_root,
-        args.annotation_dir,
-        source_info,
-        source_stats,
-        plans,
-        excluded,
-        warnings,
-        compression=args.compression,
-        probe_videos=args.probe_videos,
-    )
-    print(f"Created progress dataset: {args.output_root}")
+    try:
+        build_dataset(
+            args.output_root,
+            args.source_root,
+            args.annotation_dir,
+            source_info,
+            source_stats,
+            plans,
+            excluded,
+            warnings,
+            compression=args.compression,
+            probe_videos=args.probe_videos,
+        )
+    except Exception as error:
+        summary["generation_error"] = str(error)
+        summary["result"] = "failed"
+        summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+        _persist_summary(summary, run_dir, args.report_path)
+        LOGGER.error("Dataset generation failed: %s", error)
+        return 1
+
+    summary["result"] = "dataset_created"
+    summary["output_root"] = str(args.output_root.resolve())
+    summary["run_finished_at_utc"] = datetime.now(UTC).isoformat()
+    _persist_summary(summary, run_dir, args.report_path)
+    LOGGER.info("Created progress dataset: %s", args.output_root)
     return 0
 
 
