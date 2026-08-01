@@ -148,13 +148,29 @@ def create_torch_dataset(
             raise ValueError("Episode subset must contain non-negative integer indices.")
         logging.info("Loading LeRobot episode subset: %s episodes", len(episodes))
 
+    # LeRobot's native episodes= filtering rebuilds episode_data_index as a compact
+    # array while retaining the original episode_index values. Non-contiguous subsets
+    # can then index that compact array with an original episode index and fail. Keep
+    # the full internal index and restrict the externally visible frame indices instead.
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        episodes=episodes,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if episodes is not None:
+        episode_from = dataset.episode_data_index["from"]
+        episode_to = dataset.episode_data_index["to"]
+        max_episode_index = max(episodes)
+        if max_episode_index >= len(episode_from):
+            raise ValueError(f"Episode index {max_episode_index} is outside dataset range [0, {len(episode_from)})")
+        frame_indices = [
+            frame_index
+            for episode_index in episodes
+            for frame_index in range(int(episode_from[episode_index]), int(episode_to[episode_index]))
+        ]
+        dataset = torch.utils.data.Subset(dataset, frame_indices)
+        logging.info("Selected LeRobot episode subset: %s frames", len(frame_indices))
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
