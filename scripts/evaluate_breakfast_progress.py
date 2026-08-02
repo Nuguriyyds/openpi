@@ -19,6 +19,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from typing import Any
@@ -428,15 +429,23 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
             LOGGER.info("Checkpoint %s: %s/%s frames", checkpoint_dir.name, completed, len(frame_specs))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        episode_index=np.asarray(result_episode_indices, dtype=np.int32),
-        task_index=np.asarray(result_task_indices, dtype=np.int16),
-        frame_index=np.asarray(result_frame_indices, dtype=np.int32),
-        prediction=np.asarray(result_predictions, dtype=np.float32),
-        target=np.asarray(result_targets, dtype=np.float32),
-        infer_ms=np.asarray(result_infer_ms, dtype=np.float32),
-    )
+    with tempfile.TemporaryDirectory(prefix="breakfast-progress-evaluation-") as temporary_directory:
+        local_output = Path(temporary_directory) / "predictions.npz"
+        np.savez_compressed(
+            local_output,
+            episode_index=np.asarray(result_episode_indices, dtype=np.int32),
+            task_index=np.asarray(result_task_indices, dtype=np.int16),
+            frame_index=np.asarray(result_frame_indices, dtype=np.int32),
+            prediction=np.asarray(result_predictions, dtype=np.float32),
+            target=np.asarray(result_targets, dtype=np.float32),
+            infer_ms=np.asarray(result_infer_ms, dtype=np.float32),
+        )
+        with local_output.open("rb") as source_file, output_path.open("wb") as destination_file:
+            shutil.copyfileobj(source_file, destination_file, length=8 * 1024 * 1024)
+        if local_output.stat().st_size != output_path.stat().st_size:
+            raise OSError(
+                f"Prediction file copy size mismatch: {local_output.stat().st_size} != {output_path.stat().st_size}"
+            )
     LOGGER.info("Saved checkpoint predictions: %s", output_path)
     return 0
 
