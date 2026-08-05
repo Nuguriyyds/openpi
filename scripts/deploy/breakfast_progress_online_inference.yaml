@@ -1,0 +1,33 @@
+online_inference_execution:
+  # host: 10.11.0.65
+  # host: "115.190.61.151"
+  # port: 22222
+  host: 127.0.0.1
+  port: 8001
+  platform: ros2
+  model_config: ''
+  checkpoint_dir: ''
+  # prompt: Alternately use the left arm and the right arm to pick up the goods from the nearby box and place them in the distant box, until the nearby box is empty.
+  # prompt: Use the left arm or the right arm or both arms to pick up one object from the nearby box and place it in the distant box.
+  prompt: Pick up the bread from the bread rack and put it in the toaster and press the button on the toaster, then pour some drink from the water bottle into the cup, and finally pick up the toasted bread and place it on the plate.
+  fps: 30.0
+  can_left: can0
+  can_right: can1
+  speed_percent: 100
+  action_horizon: 10
+  progress_threshold: 0.95
+  log_dir: logs/breakfast_progress_online
+  subtasks:
+    - name: put_bread_in_toaster
+      prompt: Pick up all bread pieces from the bread rack and insert them into the toaster.
+    - name: activate_toaster
+      prompt: Push down the toaster's front lever to activate the toaster, then return the right gripper to its initial resting configuration.
+    - name: pour_drink
+      prompt: Pour drink from the water bottle into the cup, return the bottle upright, and return the left gripper to its initial resting configuration.
+    - name: plate_toast
+      prompt: Remove all toasted bread from the toaster and place it on the plate.
+  max_inferences: 0  # 最大推理次数，0 表示无限循环
+  replay_flag: false  # 是否启用重放功能
+  replay_path: /home/geekplus/develop/data/agilex_pick_up_a_banana_from_the_table_and_put_it_in_the_basket_clean_new_action  # 重放数据集路径
+  replay_id: 10  # 重放 episode ID
+
