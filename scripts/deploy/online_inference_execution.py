@@ -110,10 +110,17 @@ class JSONLRunLogger:
     """Write deployment results as one JSON object per line."""
 
     def __init__(self, root: str):
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-        self.run_dir = Path(root).expanduser() / timestamp
-        self.run_dir.mkdir(parents=True, exist_ok=False)
+        shared_run_dir = os.environ.get("BREAKFAST_RUN_DIR")
+        if shared_run_dir:
+            self.run_dir = Path(shared_run_dir).expanduser().resolve()
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            self.run_dir = Path(root).expanduser() / timestamp
+            self.run_dir.mkdir(parents=True, exist_ok=False)
         self.path = self.run_dir / "events.jsonl"
+        if self.path.exists():
+            raise FileExistsError(f"JSONL event log already exists: {self.path}")
         self._lock = threading.Lock()
 
     @staticmethod
@@ -216,13 +223,22 @@ class ObservationBuffer:
             'cam_left_wrist': None,
             'cam_right_wrist': None,
         }
+        self.image_timestamps = {name: 0.0 for name in self.images}
+        self.image_ros_timestamps_ns = {name: 0 for name in self.images}
         self.joint_left = np.zeros(6)
         self.joint_right = np.zeros(6)
         self.gripper_position = np.zeros(2)
         self.timestamp = 0.0
         self._last_update = 0.0
 
-    def update_images(self, cam_name: str, image: np.ndarray):
+    def update_images(
+        self,
+        cam_name: str,
+        image: np.ndarray,
+        *,
+        timestamp: float | None = None,
+        ros_timestamp_ns: int = 0,
+    ):
         """更新相机图像 (HxWxC 格式)"""
         with self._lock:
             if cam_name in self.images:
@@ -231,6 +247,8 @@ class ObservationBuffer:
                     self.images[cam_name] = np.transpose(image, (2, 0, 1))
                 else:
                     self.images[cam_name] = image
+                self.image_timestamps[cam_name] = float(timestamp if timestamp is not None else time.time())
+                self.image_ros_timestamps_ns[cam_name] = int(ros_timestamp_ns)
 
     def update_joints(self, side: str, joints: np.ndarray):
         """更新关节角度 (弧度)"""
@@ -270,6 +288,8 @@ class ObservationBuffer:
             return {
                 'images': {k: v.copy() if v is not None else v
                           for k, v in self.images.items()},
+                'image_timestamps': self.image_timestamps.copy(),
+                'image_ros_timestamps_ns': self.image_ros_timestamps_ns.copy(),
                 'joint_left': self.joint_left.copy(),
                 'joint_right': self.joint_right.copy(),
                 'gripper_position': self.gripper_position.copy(),
@@ -458,8 +478,15 @@ class ROS2ObservationCollector(Node):
         try:
             # ROS Image → RGB numpy (模型使用 RGB 格式训练)
             image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-            self.obs_buffer.update_images(cam_name, image)
-            self.obs_buffer.update_timestamp(time.time())
+            receipt_timestamp = time.time()
+            ros_timestamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+            self.obs_buffer.update_images(
+                cam_name,
+                image,
+                timestamp=receipt_timestamp,
+                ros_timestamp_ns=ros_timestamp_ns,
+            )
+            self.obs_buffer.update_timestamp(receipt_timestamp)
             with self._ready_lock:
                 self._topic_ready[cam_name] = True
         except Exception as e:
@@ -562,6 +589,7 @@ def run_ros2_inference(args):
     print(f"JSONL log: {run_logger.path}")
     run_logger.write(
         "session_start",
+        run_dir=str(run_logger.run_dir),
         server_host=args.host,
         server_port=args.port,
         server_metadata=server_metadata,
@@ -718,6 +746,12 @@ def run_ros2_inference(args):
                 progress_raw=progress_decision["progress_raw"],
                 progress_clipped=progress_decision["progress"],
                 progress_history=progress_decision["history"],
+                observation_timestamp_unix=float(
+                    obs_snapshot.get("image_timestamps", {}).get("cam_top", obs_snapshot["timestamp"])
+                ),
+                observation_top_ros_timestamp_ns=int(
+                    obs_snapshot.get("image_ros_timestamps_ns", {}).get("cam_top", 0)
+                ),
                 actions_shape=list(action_chunk.shape),
                 progress_shape=list(progress_chunk.shape),
                 inference_ms=dt_ms,
