@@ -8,6 +8,8 @@ from datetime import datetime
 import html
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 import cv2
 import numpy as np
@@ -15,6 +17,40 @@ import numpy as np
 
 PALETTE_HEX = ("#4cc9f0", "#f72585", "#fca311", "#80ed99")
 PALETTE_BGR = ((240, 201, 76), (133, 37, 247), (17, 163, 252), (153, 237, 128))
+
+
+def transcode_for_browser(source_path: Path, output_path: Path) -> None:
+    """Create an H.264/yuv420p MP4 that desktop browsers can decode."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required to create the browser-compatible video")
+
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        raise RuntimeError(f"ffmpeg failed to create {output_path}: {detail}")
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -366,8 +402,11 @@ def main() -> None:
 
     inferences, completions, alignment = align_events(events, frames, fps)
     summary = summarize(events, inferences, completions)
+    browser_video_path = run_dir / "top_browser.mp4"
+    transcode_for_browser(video_path, browser_video_path)
+    print(f"Browser video: {browser_video_path}")
     html_path = run_dir / args.html_name
-    write_html(html_path, video_path.name, duration, inferences, completions, summary, alignment)
+    write_html(html_path, browser_video_path.name, duration, inferences, completions, summary, alignment)
     print(f"HTML report: {html_path}")
 
     if args.export_mp4:
