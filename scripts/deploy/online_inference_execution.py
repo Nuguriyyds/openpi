@@ -847,7 +847,8 @@ def run_ros2_inference(args):
         arm_right.disconnect()
 
         ros2_node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
         run_logger.write("session_end", inference_count=inference_count)
         print(f"\n[统计] 总推理次数: {inference_count}")
         print("[完成]")
