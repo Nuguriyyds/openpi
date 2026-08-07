@@ -85,7 +85,9 @@ set -e
 stop_recorder
 trap - EXIT INT TERM
 
-if [[ -s "$RUN_DIR/events.jsonl" && -s "$RUN_DIR/top.mp4" ]]; then
+if [[ "$CLIENT_STATUS" -ne 0 ]]; then
+  echo "WARNING: Robot client failed with status $CLIENT_STATUS; skipping report generation." >&2
+elif [[ -s "$RUN_DIR/events.jsonl" && -s "$RUN_DIR/top.mp4" ]]; then
   RENDER_ARGS=(--run-dir "$RUN_DIR")
   if [[ "$EXPORT_MP4" -eq 1 ]]; then
     RENDER_ARGS+=(--export-mp4)
