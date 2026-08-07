@@ -898,7 +898,7 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
-        name="pi05_agilex_breakfast_ttrtc_s1_action",
+        name="pi05_agilex_breakfast_frozen_head_s1_action",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAGILEXDataConfig(
             # S1 and S2 intentionally use identical explicit data locations.
@@ -952,7 +952,7 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
     TrainConfig(
-        name="pi05_agilex_breakfast_ttrtc_s2_completion_head",
+        name="pi05_agilex_breakfast_frozen_head_s2_completion_head",
         model=pi0_config.Pi0Config(
             pi05=True,
             completion_head=pi0_config.CompletionHeadConfig(enabled=True),
