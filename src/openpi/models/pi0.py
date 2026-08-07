@@ -9,6 +9,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models.completion import CompletionHead
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -101,6 +102,10 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        if config.completion_head.enabled:
+            # The VLM hidden size comes from the selected PaliGemma config; it
+            # is never hard-coded in the completion implementation.
+            self.completion_head = CompletionHead(paligemma_config.width, config.completion_head, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -201,6 +206,49 @@ class Pi0(_model.BaseModel):
         train: bool = False,
         training_time_rtc: object | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
+        action_loss, _, _ = self._compute_action_loss_and_prefix(
+            rng,
+            observation,
+            actions,
+            train=train,
+            training_time_rtc=training_time_rtc,
+        )
+        return action_loss
+
+    def compute_completion_logits(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        train: bool = False,
+    ) -> jax.Array:
+        """Runs the frozen prefix only, for validation without an action target."""
+
+        if not hasattr(self, "completion_head"):
+            raise ValueError("completion head is disabled in Pi0Config")
+        preprocess_rng = jax.random.fold_in(rng, 0xC0A4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+        )
+        assert prefix_out is not None
+        head_rng = jax.random.fold_in(rng, 0xC0A5)
+        return self.completion_head(prefix_out, prefix_mask, rng=head_rng, train=train)
+
+    def _compute_action_loss_and_prefix(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool,
+        training_time_rtc: object | None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         rtc_enabled = bool(getattr(training_time_rtc, "enabled", False))
         if rtc_enabled:
             preprocess_rng, noise_rng, time_rng, delay_rng = jax.random.split(rng, 4)
@@ -243,18 +291,13 @@ class Pi0(_model.BaseModel):
             clean_timestep = float(getattr(training_time_rtc, "clean_timestep", 0.0))
             time_for_actions = jnp.where(action_prefix_mask, clean_timestep, time[..., None])
 
-        if rtc_enabled:
-            time_expanded = time_for_actions[..., None]
-        else:
-            time_expanded = time[..., None, None]
+        time_expanded = time_for_actions[..., None] if rtc_enabled else time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, x_t, time_for_actions
-        )
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time_for_actions)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -266,7 +309,7 @@ class Pi0(_model.BaseModel):
 
         loss = jnp.square(v_t - u_t)
         if not rtc_enabled:
-            return jnp.mean(loss, axis=-1)
+            return jnp.mean(loss, axis=-1), prefix_out, prefix_mask
 
         assert action_prefix_mask is not None
         postfix_mask = jnp.logical_not(action_prefix_mask)
@@ -276,9 +319,10 @@ class Pi0(_model.BaseModel):
             # over non-prefix tokens, then normalize by the non-prefix token count.
             token_loss = jnp.sum(loss, axis=-1) * postfix_mask
             normalizer = jnp.sum(postfix_mask) + 1e-8
-            return token_loss * (jnp.asarray(token_loss.size, dtype=token_loss.dtype) / normalizer)
+            action_loss = token_loss * (jnp.asarray(token_loss.size, dtype=token_loss.dtype) / normalizer)
+            return action_loss, prefix_out, prefix_mask
         if loss_normalization == "token_mean":
-            return jnp.mean(loss, axis=-1) * postfix_mask
+            return jnp.mean(loss, axis=-1) * postfix_mask, prefix_out, prefix_mask
         raise ValueError(f"Unknown TTRTC loss_normalization: {loss_normalization}")
 
     @override
@@ -365,7 +409,7 @@ class Pi0(_model.BaseModel):
             return x_next, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _x_t, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 

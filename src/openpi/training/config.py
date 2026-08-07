@@ -23,6 +23,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.completion as _completion
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -94,6 +95,10 @@ class DataConfig:
     # Optional LeRobot cache/data root. When set by a config, the data loader
     # exports it as HF_LEROBOT_HOME before constructing the dataset.
     lerobot_home: str | None = None
+    # Optional episode subset and raw completion label key. They are populated
+    # only by the completion training loader; ordinary configs remain unchanged.
+    episodes: Sequence[int] | None = None
+    completion_label_key: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -181,6 +186,11 @@ class DataConfigFactory(abc.ABC):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
 
+    def resolve_assets_dir(self, default_assets_dir: pathlib.Path) -> epath.Path:
+        """Returns the asset root used by both readers and asset-generation scripts."""
+
+        return epath.Path(self.assets.assets_dir or default_assets_dir)
+
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
@@ -188,7 +198,7 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(self.resolve_assets_dir(assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -538,8 +548,10 @@ class TrainConfig:
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
     # Optional training-time RTC prefix-conditioning loss. Disabled by default.
-    training_time_rtc: _ttrtc.TrainingTimeRTCConfig = dataclasses.field(
-        default_factory=_ttrtc.TrainingTimeRTCConfig
+    training_time_rtc: _ttrtc.TrainingTimeRTCConfig = dataclasses.field(default_factory=_ttrtc.TrainingTimeRTCConfig)
+    # Explicitly selects the legacy, S1 action-only, or S2 head-only path.
+    completion: _completion.CompletionTrainingConfig = dataclasses.field(
+        default_factory=_completion.CompletionTrainingConfig
     )
 
     # Base directory for config assets (e.g., norm stats).
@@ -601,6 +613,18 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        completion_head = getattr(self.model, "completion_head", None)
+        completion_head_enabled = completion_head is not None and completion_head.enabled
+        stage = self.completion.stage
+        if stage in ("disabled", "action") and completion_head_enabled:
+            raise ValueError(f"completion head must be disabled for completion stage {stage!r}")
+        if stage == "head" and not completion_head_enabled:
+            raise ValueError("completion head must be enabled for completion stage 'head'")
+        if self.completion.uses_completion_data:
+            if self.model.model_type != _model.ModelType.PI05:
+                raise ValueError("staged completion training is only supported for pi0.5")
+            if self.completion.split_manifest_path is None:
+                raise ValueError("completion.split_manifest_path must be set for staged completion training")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -872,6 +896,124 @@ _CONFIGS = [
         fsdp_devices=4,
         checkpoint_base_dir="/mnt/data/models/openpi/checkpoints",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_agilex_breakfast_ttrtc_s1_action",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAGILEXDataConfig(
+            # S1 and S2 intentionally use identical explicit data locations.
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/dataset/ei/huggingface",
+            ),
+        ),
+        training_time_rtc=_ttrtc.TrainingTimeRTCConfig(
+            enabled=True,
+            simulated_delay=5,
+            delay_sampling="exponential",
+            clean_timestep=0.0,
+            loss_normalization="reference",
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="action",
+            label_key="completion",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_subtask_730_frozen_head.json"
+            ),
+            split_seed=42,
+            episodes_per_group=4,
+            val_groups=5,
+            test_groups=5,
+            val_interval=1_000,
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_lr=1e-5,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True).get_vlm_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=50_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=16,
+        num_workers=4,
+        log_interval=100,
+        save_interval=10_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
+    TrainConfig(
+        name="pi05_agilex_breakfast_ttrtc_s2_completion_head",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/dataset/ei/huggingface",
+            ),
+        ),
+        # This remains descriptive metadata for the S1 action checkpoint; the
+        # S2 trainer takes the prefix-only branch and never computes action loss.
+        training_time_rtc=_ttrtc.TrainingTimeRTCConfig(
+            enabled=True,
+            simulated_delay=5,
+            delay_sampling="exponential",
+            clean_timestep=0.0,
+            loss_normalization="reference",
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            label_key="completion",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_subtask_730_frozen_head.json"
+            ),
+            split_seed=42,
+            episodes_per_group=4,
+            val_groups=5,
+            test_groups=5,
+            val_interval=1_000,
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_lr=1e-5,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ).get_completion_head_only_freeze_filter(),
+        # Start a new S2 run from the exported S1 params. Only the new head may
+        # be absent; all VLM and action weights are checked strictly.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/path/to/s1_checkpoint/params",
+            missing_regex=r"completion_head/.*",
+        ),
+        num_train_steps=50_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=16,
+        num_workers=4,
+        log_interval=100,
+        save_interval=10_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
     #
     # Fine-tuning Aloha configs.

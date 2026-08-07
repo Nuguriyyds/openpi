@@ -306,7 +306,15 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+def validate_train_config(config: _config.TrainConfig) -> None:
+    if config.completion.uses_completion_data:
+        raise NotImplementedError(
+            "Staged completion training is only supported by the JAX trainer; use scripts/train.py."
+        )
+
+
 def train_loop(config: _config.TrainConfig):
+    validate_train_config(config)
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)

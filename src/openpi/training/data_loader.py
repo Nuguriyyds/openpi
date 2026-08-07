@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -12,11 +13,13 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.training.completion_data as _completion_data
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+COMPLETION_TARGET_KEY = "completion_target"
 
 
 class Dataset(Protocol[T_co]):
@@ -51,12 +54,23 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        *,
+        preserve_keys: dict[str, str] | None = None,
+    ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        self._preserve_keys = preserve_keys or {}
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        sample = self._dataset[index]
+        preserved = {output_key: sample[input_key] for output_key, input_key in self._preserve_keys.items()}
+        transformed = self._transform(sample)
+        transformed.update(preserved)
+        return transformed
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -147,6 +161,7 @@ def create_torch_dataset(
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         root=dataset_root,
+        episodes=None if data_config.episodes is None else list(data_config.episodes),
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -187,6 +202,9 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
+    preserve_keys = None
+    if data_config.completion_label_key is not None:
+        preserve_keys = {COMPLETION_TARGET_KEY: data_config.completion_label_key}
     return TransformedDataset(
         dataset,
         [
@@ -195,6 +213,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
+        preserve_keys=preserve_keys,
     )
 
 
@@ -227,15 +246,68 @@ def transform_iterable_dataset(
     )
 
 
+def prepare_completion_data(config: _config.TrainConfig) -> _completion_data.CompletionDataInfo:
+    """Creates/reuses the split manifest and audits labels only for S2 head training."""
+
+    if not config.completion.uses_completion_data:
+        raise ValueError("completion data preparation requires completion stage 'action' or 'head'")
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.repo_id in (None, "fake"):
+        raise ValueError("completion training requires an explicit non-fake LeRobot repo_id")
+    if data_config.rlds_data_dir is not None:
+        raise ValueError("completion training currently supports only LeRobot datasets, not RLDS")
+    if data_config.lerobot_home is not None:
+        os.environ["HF_LEROBOT_HOME"] = data_config.lerobot_home
+        dataset_root: str | None = os.path.join(data_config.lerobot_home, data_config.repo_id)
+    else:
+        dataset_root = None
+    metadata = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id, root=dataset_root)
+    manifest_path = config.completion.split_manifest_path
+    if manifest_path is None:
+        raise ValueError("completion.split_manifest_path must be set")
+    info = _completion_data.prepare_completion_data(
+        metadata,
+        repo_id=data_config.repo_id,
+        dataset_root=metadata.root,
+        label_key=config.completion.label_key,
+        manifest_path=manifest_path,
+        audit_labels=config.completion.requires_completion_labels,
+        seed=config.completion.split_seed,
+        episodes_per_group=config.completion.episodes_per_group,
+        val_groups=config.completion.val_groups,
+        test_groups=config.completion.test_groups,
+    )
+    logging.info(
+        "Completion split: train_episodes=%d val_episodes=%d test_episodes=%d audit_labels=%s",
+        len(info.manifest.episode_ids("train")),
+        len(info.manifest.episode_ids("val")),
+        len(info.manifest.episode_ids("test")),
+        config.completion.requires_completion_labels,
+    )
+    if info.pos_weight is not None:
+        logging.info(
+            "Completion train labels: positive=%d negative=%d pos_weight=%.6f",
+            info.train_positive_count,
+            info.train_negative_count,
+            info.pos_weight,
+        )
+    return info
+
+
 def create_data_loader(
     config: _config.TrainConfig,
     *,
+    split: _completion_data.SplitName = "train",
+    completion_data_info: _completion_data.CompletionDataInfo | None = None,
     sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[
+    tuple[_model.Observation, _model.Actions]
+    | tuple[_model.Observation, _model.Actions, jax.Array]
+]:
     """Create a data loader for training.
 
     Args:
@@ -249,7 +321,22 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    uses_completion_split = config.completion.uses_completion_data
+    emits_completion_target = config.completion.trains_completion_head
+    if uses_completion_split:
+        if completion_data_info is None:
+            completion_data_info = prepare_completion_data(config)
+        data_config = dataclasses.replace(
+            data_config,
+            episodes=completion_data_info.manifest.episode_ids(split),
+            completion_label_key=config.completion.label_key if emits_completion_target else None,
+        )
+    elif split != "train":
+        raise ValueError(f"split={split!r} is only available for staged completion training")
+
     if data_config.rlds_data_dir is not None:
+        if uses_completion_split:
+            raise ValueError("completion training currently supports only LeRobot datasets, not RLDS")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -272,6 +359,8 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        repeat=not uses_completion_split or split == "train",
+        drop_last=not uses_completion_split or split == "train",
     )
 
 
@@ -288,6 +377,8 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    repeat: bool = True,
+    drop_last: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -339,6 +430,8 @@ def create_torch_data_loader(
         num_workers=num_workers,
         seed=seed,
         framework=framework,
+        repeat=repeat,
+        drop_last=drop_last,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -400,6 +493,8 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        repeat: bool = True,
+        drop_last: bool = True,
     ):
         """Create a PyTorch data loader.
 
@@ -431,6 +526,14 @@ class TorchDataLoader:
                 jax.sharding.PartitionSpec("B"),
             )
         self._num_batches = num_batches
+        self._repeat = repeat
+        # Validation must keep every frame, including a final short batch. A
+        # data-sharded JAX array still requires that batch to divide evenly
+        # across devices, so pad it here and trim the repeated rows in the
+        # completion evaluator.
+        self._batch_size_multiple = (
+            len(self._sharding.device_set) if not drop_last and self._sharding is not None else 1
+        )
 
         mp_context = None
         if num_workers > 0:
@@ -448,7 +551,7 @@ class TorchDataLoader:
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
+            drop_last=drop_last,
             generator=generator,
         )
 
@@ -470,9 +573,12 @@ class TorchDataLoader:
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
+                    batch = _pad_batch_to_multiple(batch, self._batch_size_multiple)
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+            if not self._repeat:
+                return
 
 
 def _collate_fn(items):
@@ -480,6 +586,26 @@ def _collate_fn(items):
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
     return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+
+
+def _pad_batch_to_multiple(batch, multiple: int):
+    """Pads a final evaluation batch by repeating its last row."""
+
+    if multiple <= 1:
+        return batch
+    leaves = jax.tree.leaves(batch)
+    if not leaves:
+        raise ValueError("cannot pad an empty batch tree")
+    batch_size = leaves[0].shape[0]
+    if any(leaf.shape[0] != batch_size for leaf in leaves):
+        raise ValueError("all batch leaves must have the same leading dimension")
+    padding = (-batch_size) % multiple
+    if padding == 0:
+        return batch
+    return jax.tree.map(
+        lambda x: np.concatenate([x, np.repeat(x[-1:], padding, axis=0)], axis=0),
+        batch,
+    )
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -544,4 +670,8 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            training_batch = (_model.Observation.from_dict(batch), batch["actions"])
+            if self._data_config.completion_label_key is None:
+                yield training_batch
+            else:
+                yield (*training_batch, batch[COMPLETION_TARGET_KEY])

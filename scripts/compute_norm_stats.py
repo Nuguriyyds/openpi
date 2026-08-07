@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+
 import numpy as np
 import tqdm
 import tyro
@@ -86,9 +88,32 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
+def prepare_data_config(config: _config.TrainConfig) -> _config.DataConfig:
+    """Creates the data config, restricting completion statistics to the persisted train split."""
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if config.completion.uses_completion_data:
+        completion_info = _data_loader.prepare_completion_data(config)
+        train_episode_ids = completion_info.manifest.episode_ids("train")
+        data_config = dataclasses.replace(data_config, episodes=train_episode_ids)
+        print(f"Computing completion norm stats from {len(train_episode_ids)} train episode(s)")
+    return data_config
+
+
+def norm_stats_output_path(config: _config.TrainConfig, data_config: _config.DataConfig):
+    """Returns the same asset path that DataConfigFactory uses when loading norm stats."""
+
+    if data_config.asset_id is None:
+        raise ValueError("Data config must have an asset_id to save normalization statistics")
+    assets_dir = config.data.resolve_assets_dir(config.assets_dirs)
+    if "://" in str(assets_dir):
+        raise ValueError(f"Normalization statistics can only be written to a local assets_dir, got {assets_dir}")
+    return assets_dir / data_config.asset_id
+
+
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    data_config = prepare_data_config(config)
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
@@ -108,7 +133,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = norm_stats_output_path(config, data_config)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

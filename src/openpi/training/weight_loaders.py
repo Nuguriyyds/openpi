@@ -46,12 +46,15 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Missing keys are initialized from the reference model only when they
+    # fully match this expression. The default preserves historical LoRA-only
+    # behavior; completion configs explicitly add ``completion_head/.*``.
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

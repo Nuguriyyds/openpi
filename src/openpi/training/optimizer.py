@@ -1,10 +1,10 @@
 import dataclasses
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import jax.numpy as jnp
 import optax
 
-import openpi.shared.array_typing as at
+import openpi.training.completion as _completion
 
 
 @runtime_checkable
@@ -58,7 +58,7 @@ class OptimizerConfig(Protocol):
     def create(
         self,
         lr: optax.ScalarOrSchedule,
-        weight_decay_mask: at.PyTree | None = None,
+        weight_decay_mask: Any | None = None,
     ) -> optax.GradientTransformation: ...
 
 
@@ -76,7 +76,7 @@ class AdamW(OptimizerConfig):
     def create(
         self,
         lr: optax.ScalarOrSchedule,
-        weight_decay_mask: at.PyTree | None = None,
+        weight_decay_mask: Any | None = None,
     ) -> optax.GradientTransformation:
         tx = optax.adamw(
             lr, b1=self.b1, b2=self.b2, eps=self.eps, weight_decay=self.weight_decay, mask=weight_decay_mask
@@ -96,14 +96,37 @@ class SGD(OptimizerConfig):
     def create(
         self,
         lr: optax.ScalarOrSchedule,
-        weight_decay_mask: at.PyTree | None = None,
+        weight_decay_mask: Any | None = None,
     ) -> optax.GradientTransformation:
         assert weight_decay_mask is None, "Weight decay is not supported for SGD"
         return optax.sgd(lr, momentum=self.momentum, nesterov=self.nesterov)
 
 
 def create_optimizer(
-    optimizer: OptimizerConfig, lr_schedule: LRScheduleConfig, weight_decay_mask: at.PyTree | None = None
+    optimizer: OptimizerConfig, lr_schedule: LRScheduleConfig, weight_decay_mask: Any | None = None
 ) -> optax.GradientTransformation:
     lr = lr_schedule.create()
     return optimizer.create(lr, weight_decay_mask=weight_decay_mask)
+
+
+def create_completion_head_optimizer(
+    completion: _completion.CompletionTrainingConfig,
+    *,
+    decay_steps: int,
+) -> optax.GradientTransformation:
+    """Builds the S2 AdamW optimizer for a head-only trainable parameter tree."""
+
+    if decay_steps <= completion.warmup_steps:
+        raise ValueError(
+            f"num_train_steps ({decay_steps}) must exceed completion warmup_steps ({completion.warmup_steps})"
+        )
+    completion_schedule = CosineDecaySchedule(
+        warmup_steps=completion.warmup_steps,
+        peak_lr=completion.peak_lr,
+        decay_steps=decay_steps,
+        decay_lr=completion.decay_lr,
+    )
+    return AdamW(
+        weight_decay=completion.weight_decay,
+        clip_gradient_norm=completion.gradient_clip_norm,
+    ).create(completion_schedule.create(), weight_decay_mask=None)

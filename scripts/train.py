@@ -17,9 +17,11 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.pi0_config as _pi0_config
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
+import openpi.training.completion as _completion
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
@@ -81,11 +83,28 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     )
 
 
+def _frozen_param_dtype_filter(config: _config.TrainConfig) -> nnx.filterlib.Filter:
+    """Returns the frozen params that should be stored in bfloat16."""
+
+    if config.completion.stage == "head":
+        if not isinstance(config.model, _pi0_config.Pi0Config):
+            raise ValueError("completion head training is only supported for Pi0Config models")
+        return config.model.get_vlm_freeze_filter()
+    return config.freeze_filter
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
-    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    if config.completion.stage == "head":
+        tx = _optimizer.create_completion_head_optimizer(
+            config.completion,
+            decay_steps=config.num_train_steps,
+        )
+    else:
+        tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    dtype_filter = _frozen_param_dtype_filter(config)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -101,14 +120,15 @@ def init_train_state(
 
         params = nnx.state(model)
         # Convert frozen params to bfloat16.
-        params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+        params = nnx_utils.state_map(params, dtype_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+        trainable_params = params.filter(config.trainable_filter)
 
         return training_utils.TrainState(
             step=0,
             params=params,
             model_def=nnx.graphdef(model),
             tx=tx,
-            opt_state=tx.init(params.filter(config.trainable_filter)),
+            opt_state=tx.init(trainable_params),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
         )
@@ -138,29 +158,58 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions] | tuple[_model.Observation, _model.Actions, at.Array],
+    *,
+    pos_weight: float | None = None,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        if config.training_time_rtc.enabled:
-            chunked_loss = model.compute_loss(
-                rng, observation, actions, train=True, training_time_rtc=config.training_time_rtc
-            )
-        else:
-            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
-
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
-
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    completion_stage = config.completion.stage
+
+    if completion_stage == "head":
+        if pos_weight is None:
+            raise ValueError("pos_weight is required for completion head training")
+        observation, _actions, completion_targets = batch
+        completion_targets = jnp.asarray(completion_targets, dtype=jnp.float32)
+        if completion_targets.ndim == 2 and completion_targets.shape[-1] == 1:
+            completion_targets = completion_targets[..., 0]
+
+        def completion_loss_fn(model, rng, observation, targets):
+            logits = model.compute_completion_logits(rng, observation, train=True)
+            if logits.shape != targets.shape:
+                raise ValueError(
+                    f"completion target shape {targets.shape} does not match model logits shape {logits.shape}"
+                )
+            return jnp.mean(_completion.weighted_bce_with_logits(logits, targets, pos_weight))
+
+        loss, grads = nnx.value_and_grad(
+            completion_loss_fn,
+            argnums=diff_state,
+        )(model, train_rng, observation, completion_targets)
+        completion_loss = loss
+    else:
+        observation, actions = batch
+
+        @at.typecheck
+        def action_loss_fn(
+            model: _model.BaseModel,
+            rng: at.KeyArrayLike,
+            observation: _model.Observation,
+            actions: _model.Actions,
+        ):
+            if config.training_time_rtc.enabled:
+                chunked_loss = model.compute_loss(
+                    rng, observation, actions, train=True, training_time_rtc=config.training_time_rtc
+                )
+            else:
+                chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss)
+
+        loss, grads = nnx.value_and_grad(action_loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -193,7 +242,111 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if completion_stage == "action":
+        info.update(
+            {
+                "action_loss": loss,
+                "total_loss": loss,
+                "action_grad_norm": optax.global_norm(grads),
+            }
+        )
+    elif completion_stage == "head":
+        info.update(
+            {
+                "completion_loss": completion_loss,
+                "total_loss": loss,
+                "pos_weight": jnp.asarray(pos_weight, dtype=jnp.float32),
+                "completion_grad_norm": optax.global_norm(grads),
+            }
+        )
     return new_state, info
+
+
+def completion_eval_step(
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions, at.Array],
+) -> tuple[jax.Array, jax.Array]:
+    """Computes validation logits without evaluating the action objective."""
+
+    eval_params = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, eval_params)
+    model.eval()
+    observation, _, targets = batch
+    targets = jnp.asarray(targets, dtype=jnp.float32)
+    if targets.ndim == 2 and targets.shape[-1] == 1:
+        targets = targets[..., 0]
+    logits = model.compute_completion_logits(rng, observation, train=False)
+    if logits.shape != targets.shape:
+        raise ValueError(f"completion target shape {targets.shape} does not match logits shape {logits.shape}")
+    return logits, targets
+
+
+def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, float]:
+    """Aggregates the fixed-threshold completion metrics requested for validation."""
+
+    logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+    if logits.shape != targets.shape or logits.size == 0:
+        raise ValueError(f"invalid validation arrays: logits={logits.shape}, targets={targets.shape}")
+    if not np.all(np.logical_or(targets == 0, targets == 1)):
+        raise ValueError("validation completion targets must contain only 0/1")
+    scores = np.empty_like(logits)
+    nonnegative = logits >= 0
+    scores[nonnegative] = 1.0 / (1.0 + np.exp(-logits[nonnegative]))
+    exp_logits = np.exp(logits[~nonnegative])
+    scores[~nonnegative] = exp_logits / (1.0 + exp_logits)
+    predictions = scores >= 0.5
+    positives = targets == 1
+    negatives = ~positives
+    positive_count = int(np.sum(positives))
+    negative_count = int(np.sum(negatives))
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError(
+            f"validation split must contain both classes, got positive={positive_count}, negative={negative_count}"
+        )
+    true_positives = int(np.sum(np.logical_and(predictions, positives)))
+    false_positives = int(np.sum(np.logical_and(predictions, negatives)))
+    false_negatives = int(np.sum(np.logical_and(~predictions, positives)))
+    precision = true_positives / max(true_positives + false_positives, 1)
+    recall = true_positives / max(true_positives + false_negatives, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, np.finfo(np.float64).eps)
+    bce = np.mean(np.logaddexp(0.0, logits) - targets * logits)
+    return {
+        "val/bce": float(bce),
+        "val/positive_count": float(positive_count),
+        "val/negative_count": float(negative_count),
+        "val/positive_score_mean": float(np.mean(scores[positives])),
+        "val/negative_score_mean": float(np.mean(scores[negatives])),
+        "val/precision_at_0.5": float(precision),
+        "val/recall_at_0.5": float(recall),
+        "val/f1_at_0.5": float(f1),
+    }
+
+
+def evaluate_completion(
+    eval_step,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    data_loader: _data_loader.DataLoader,
+    *,
+    expected_count: int,
+) -> dict[str, float]:
+    all_logits = []
+    all_targets = []
+    for batch_index, batch in enumerate(data_loader):
+        logits, targets = eval_step(jax.random.fold_in(rng, batch_index), state, batch)
+        all_logits.append(np.asarray(jax.device_get(logits)))
+        all_targets.append(np.asarray(jax.device_get(targets)))
+    if not all_logits:
+        raise ValueError("validation loader produced no completion examples")
+    logits = np.concatenate(all_logits)
+    targets = np.concatenate(all_targets)
+    if logits.shape[0] < expected_count:
+        raise ValueError(f"validation loader evaluated {logits.shape[0]} frames, expected at least {expected_count}")
+    # The loader may repeat a few rows so the final batch can be sharded across
+    # all devices. Only the original validation examples contribute metrics.
+    return completion_validation_metrics(logits[:expected_count], targets[:expected_count])
 
 
 def main(config: _config.TrainConfig):
@@ -228,11 +381,35 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    completion_stage = config.completion.stage
+    uses_completion_data = config.completion.uses_completion_data
+    trains_completion_head = config.completion.trains_completion_head
+    completion_data_info = None
+    val_data_loader = None
+    pos_weight = None
+    if uses_completion_data:
+        completion_data_info = _data_loader.prepare_completion_data(config)
+    if trains_completion_head:
+        assert completion_data_info is not None
+        pos_weight = completion_data_info.pos_weight
+        if pos_weight is None:
+            raise ValueError("completion head training requires audited train labels and pos_weight")
+
     data_loader = _data_loader.create_data_loader(
         config,
+        split="train",
+        completion_data_info=completion_data_info,
         sharding=data_sharding,
         shuffle=True,
     )
+    if trains_completion_head:
+        val_data_loader = _data_loader.create_data_loader(
+            config,
+            split="val",
+            completion_data_info=completion_data_info,
+            sharding=data_sharding,
+            shuffle=False,
+        )
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -251,12 +428,51 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    if uses_completion_data:
+        audit_model = nnx.merge(train_state.model_def, train_state.params)
+        expected_trainable_groups = ("action",) if completion_stage == "action" else ("completion",)
+        audit = _pi0_config.audit_frozen_vlm_parameters(
+            audit_model,
+            config.freeze_filter,
+            trainable_groups=expected_trainable_groups,
+        )
+        logging.info(
+            "Parameter audit: frozen_vlm=%d frozen_action=%d "
+            "trainable_action=%d trainable_completion=%d",
+            len(audit.frozen_vlm),
+            len(audit.frozen_action),
+            len(audit.trainable_action),
+            len(audit.trainable_completion),
+        )
+        assert completion_data_info is not None
+        dataset_metrics = {
+            "dataset/train_episode_count": len(completion_data_info.manifest.episode_ids("train")),
+            "dataset/val_episode_count": len(completion_data_info.manifest.episode_ids("val")),
+            "dataset/test_episode_count": len(completion_data_info.manifest.episode_ids("test")),
+        }
+        if completion_data_info.pos_weight is not None:
+            dataset_metrics.update(
+                {
+                    "dataset/train_positive_count": completion_data_info.train_positive_count,
+                    "dataset/train_negative_count": completion_data_info.train_negative_count,
+                    "dataset/pos_weight": completion_data_info.pos_weight,
+                }
+            )
+        logging.info("Completion dataset metrics: %s", dataset_metrics)
+        wandb.log(dataset_metrics, step=0)
+
     ptrain_step = jax.jit(
-        functools.partial(train_step, config),
+        functools.partial(train_step, config, pos_weight=pos_weight),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    pcompletion_eval_step = None
+    if trains_completion_head:
+        pcompletion_eval_step = jax.jit(
+            completion_eval_step,
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -279,6 +495,34 @@ def main(config: _config.TrainConfig):
             wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
+
+        if trains_completion_head and (
+            (step + 1) % config.completion.val_interval == 0 or step == config.num_train_steps - 1
+        ):
+            assert pcompletion_eval_step is not None
+            assert val_data_loader is not None
+            assert completion_data_info is not None
+            expected_val_count = sum(
+                completion_data_info.episode_audits[episode_id].frame_count
+                for episode_id in completion_data_info.manifest.episode_ids("val")
+            )
+            with sharding.set_mesh(mesh):
+                val_metrics = evaluate_completion(
+                    pcompletion_eval_step,
+                    jax.random.fold_in(train_rng, step + 1),
+                    train_state,
+                    val_data_loader,
+                    expected_count=expected_val_count,
+                )
+            actual_val_count = int(val_metrics["val/positive_count"] + val_metrics["val/negative_count"])
+            if actual_val_count != expected_val_count:
+                raise ValueError(
+                    f"validation loader evaluated {actual_val_count} frames, expected {expected_val_count}"
+                )
+            pbar.write(
+                f"Step {step} validation: " + ", ".join(f"{key}={value:.4f}" for key, value in val_metrics.items())
+            )
+            wandb.log(val_metrics, step=step)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
