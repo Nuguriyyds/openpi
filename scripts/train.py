@@ -147,7 +147,12 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        if config.training_time_rtc.enabled:
+            chunked_loss = model.compute_loss(
+                rng, observation, actions, train=True, training_time_rtc=config.training_time_rtc
+            )
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
@@ -194,6 +199,12 @@ def train_step(
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+
+    if config.training_time_rtc.enabled and config.model.model_type not in (
+        _model.ModelType.PI0,
+        _model.ModelType.PI05,
+    ):
+        raise ValueError("training_time_rtc is only supported by Pi0/Pi0.5 JAX models.")
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
