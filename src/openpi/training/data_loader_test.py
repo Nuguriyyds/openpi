@@ -124,6 +124,24 @@ def test_pad_batch_to_multiple_repeats_only_the_last_row():
     np.testing.assert_array_equal(padded["matrix"][5:], np.repeat(batch["matrix"][-1:], 3, axis=0))
 
 
+def test_episode_subset_dataset_preserves_global_lerobot_indices():
+    class Dataset:
+        def __init__(self):
+            self.episode_data_index = {
+                "from": np.asarray([0, 2, 5, 9], dtype=np.int64),
+                "to": np.asarray([2, 5, 9, 10], dtype=np.int64),
+            }
+
+        def __getitem__(self, index):
+            return {"global_index": index, "episode_index": 2 if 5 <= index < 9 else 3}
+
+    subset = _data_loader.EpisodeSubsetDataset(Dataset(), [2, 3])
+
+    assert len(subset) == 5
+    assert [subset[index]["global_index"] for index in range(len(subset))] == [5, 6, 7, 8, 9]
+    assert [subset[index]["episode_index"] for index in range(len(subset))] == [2, 2, 2, 2, 3]
+
+
 def test_s1_and_s2_share_manifest_episodes_but_only_s2_emits_target(tmp_path, monkeypatch):
     class DataFactory:
         def create(self, assets_dirs, model):

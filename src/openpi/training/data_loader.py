@@ -76,6 +76,37 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class EpisodeSubsetDataset(Dataset[T_co]):
+    """Exposes selected episode frames while preserving LeRobot's global indices."""
+
+    def __init__(self, dataset: Dataset[T_co], episode_ids: Sequence[int]):
+        self._dataset = dataset
+        self._episode_ids = tuple(int(episode_id) for episode_id in episode_ids)
+        if not self._episode_ids:
+            raise ValueError("episode subset must not be empty")
+        episode_data_index = getattr(dataset, "episode_data_index", None)
+        if episode_data_index is None:
+            raise ValueError("episode subset requires a LeRobotDataset with episode_data_index")
+        starts = episode_data_index["from"]
+        ends = episode_data_index["to"]
+        max_episode_id = len(starts) - 1
+        invalid_ids = [episode_id for episode_id in self._episode_ids if episode_id < 0 or episode_id > max_episode_id]
+        if invalid_ids:
+            raise ValueError(f"episode subset contains out-of-range episode IDs: {invalid_ids}")
+        self._indices = np.concatenate(
+            [
+                np.arange(int(starts[episode_id]), int(ends[episode_id]), dtype=np.int64)
+                for episode_id in self._episode_ids
+            ]
+        )
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[int(self._indices[int(index)])]
+
+    def __len__(self) -> int:
+        return int(self._indices.shape[0])
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -161,11 +192,12 @@ def create_torch_dataset(
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         root=dataset_root,
-        episodes=None if data_config.episodes is None else list(data_config.episodes),
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if data_config.episodes is not None:
+        dataset = EpisodeSubsetDataset(dataset, data_config.episodes)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
