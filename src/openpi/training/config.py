@@ -965,7 +965,7 @@ _CONFIGS = [
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
-                lerobot_home="/mnt/data/dataset/ei/huggingface",
+                lerobot_home="/mnt/models/wyt/data",
             ),
         ),
         # This remains descriptive metadata for the S1 action checkpoint; the
@@ -1001,7 +1001,7 @@ _CONFIGS = [
         # Start a new S2 run from the exported S1 params. Only the new head may
         # be absent; all VLM and action weights are checked strictly.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/path/to/s1_checkpoint/params",
+            "/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_frozen_head_s1_action/s1_action/49999",
             missing_regex=r"completion_head/.*",
         ),
         num_train_steps=50_000,
