@@ -958,7 +958,7 @@ _CONFIGS = [
             completion_head=pi0_config.CompletionHeadConfig(enabled=True),
         ),
         data=LeRobotAGILEXDataConfig(
-            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            repo_id="agilex_make_breakfast_subtask_730_frozen_head",
             assets=AssetsConfig(
                 assets_dir="/mnt/data/models/wyt/assets",
                 asset_id="agilex_make_breakfast_subtask_730",
