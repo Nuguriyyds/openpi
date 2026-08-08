@@ -298,7 +298,11 @@ def audit_episode_parquet(
     expected_length: int,
     label_key: str = "completion",
 ) -> EpisodeAudit:
-    """Reads only scalar audit columns and enforces the exact last-two label rule."""
+    """Reads only scalar audit columns and enforces the exact last-two label rule.
+
+    Episodes shorter than 2 frames are exempt from the last-two-frames rule;
+    they must be labeled all-0 instead.
+    """
 
     path = pathlib.Path(parquet_path)
     if not path.is_file():
@@ -318,8 +322,6 @@ def audit_episode_parquet(
         raise ValueError(
             f"episode {episode_id} has {len(labels)} parquet rows but metadata length is {expected_length}"
         )
-    if expected_length < 2:
-        raise ValueError(f"episode {episode_id} has only {expected_length} frame(s); at least 2 are required")
     if not np.all(episode_values == episode_id):
         bad = np.flatnonzero(episode_values != episode_id).tolist()
         raise ValueError(f"episode {episode_id} parquet contains mismatched episode_index at rows {bad}")
@@ -344,6 +346,24 @@ def audit_episode_parquet(
         ]
         raise ValueError(f"episode {episode_id} field {label_key!r} contains labels outside 0/1: {details}")
     numeric_labels = numeric_labels.astype(np.int8)
+
+    # Episodes shorter than 2 frames cannot satisfy the last-two-frames rule,
+    # so they are labeled all-0 and exempt from that part of the audit.
+    if expected_length < 2:
+        positive_rows = np.flatnonzero(numeric_labels != 0).tolist()
+        if positive_rows:
+            raise ValueError(
+                f"episode {episode_id} has only {expected_length} frame(s); all labels must be 0, "
+                f"but found positive labels at frames {positive_rows}"
+            )
+        positive_count = 0
+        return EpisodeAudit(
+            episode_id=episode_id,
+            frame_count=expected_length,
+            positive_count=positive_count,
+            negative_count=expected_length - positive_count,
+        )
+
     early_positive_rows = np.flatnonzero(numeric_labels[:-2] != 0).tolist()
     if early_positive_rows:
         raise ValueError(

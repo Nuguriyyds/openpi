@@ -95,6 +95,29 @@ def test_episode_audit_reports_specific_episode_for_bad_labels(tmp_path, labels,
         completion_data.audit_episode_parquet(path, episode_id=23, expected_length=len(labels))
 
 
+def test_episode_audit_accepts_single_frame_all_zero(tmp_path):
+    """Episodes shorter than 2 frames are exempt from the last-two rule and must be all-0."""
+
+    path = tmp_path / "episode_002797.parquet"
+    _write_episode(path, 2797, [0])
+
+    audit = completion_data.audit_episode_parquet(path, episode_id=2797, expected_length=1)
+
+    assert audit.frame_count == 1
+    assert audit.positive_count == 0
+    assert audit.negative_count == 1
+
+
+def test_episode_audit_rejects_positive_label_on_short_episode(tmp_path):
+    """A single-frame episode with label 1 must fail the audit."""
+
+    path = tmp_path / "episode_000001.parquet"
+    _write_episode(path, 1, [1])
+
+    with pytest.raises(ValueError, match=r"episode 1.*all labels must be 0"):
+        completion_data.audit_episode_parquet(path, episode_id=1, expected_length=1)
+
+
 def test_episode_audit_reports_missing_completion_field(tmp_path):
     path = tmp_path / "episode_000009.parquet"
     _write_episode(path, 9, [0, 0, 1, 1], include_completion=False)
