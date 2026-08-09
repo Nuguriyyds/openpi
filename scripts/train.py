@@ -171,18 +171,26 @@ def train_step(
     completion_stage = config.completion.stage
 
     if completion_stage == "head":
-        if pos_weight is None:
-            raise ValueError("pos_weight is required for completion head training")
         observation, _actions, completion_targets = batch
         completion_targets = jnp.asarray(completion_targets, dtype=jnp.float32)
         if completion_targets.ndim == 2 and completion_targets.shape[-1] == 1:
             completion_targets = completion_targets[..., 0]
+
+        focal_gamma = config.completion.focal_gamma
+        focal_alpha = config.completion.focal_alpha
+        uses_focal = config.completion.uses_focal_loss
+        if not uses_focal and pos_weight is None:
+            raise ValueError("pos_weight is required for completion head training")
 
         def completion_loss_fn(model, rng, observation, targets):
             logits = model.compute_completion_logits(rng, observation, train=True)
             if logits.shape != targets.shape:
                 raise ValueError(
                     f"completion target shape {targets.shape} does not match model logits shape {logits.shape}"
+                )
+            if uses_focal:
+                return jnp.mean(
+                    _completion.focal_loss_with_logits(logits, targets, gamma=focal_gamma, alpha=focal_alpha)
                 )
             return jnp.mean(_completion.weighted_bce_with_logits(logits, targets, pos_weight))
 
@@ -251,14 +259,17 @@ def train_step(
             }
         )
     elif completion_stage == "head":
-        info.update(
-            {
-                "completion_loss": completion_loss,
-                "total_loss": loss,
-                "pos_weight": jnp.asarray(pos_weight, dtype=jnp.float32),
-                "completion_grad_norm": optax.global_norm(grads),
-            }
-        )
+        head_info = {
+            "completion_loss": completion_loss,
+            "total_loss": loss,
+            "completion_grad_norm": optax.global_norm(grads),
+        }
+        if uses_focal:
+            head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
+            head_info["focal_alpha"] = jnp.asarray(focal_alpha, dtype=jnp.float32)
+        else:
+            head_info["pos_weight"] = jnp.asarray(pos_weight, dtype=jnp.float32)
+        info.update(head_info)
     return new_state, info
 
 
@@ -392,7 +403,7 @@ def main(config: _config.TrainConfig):
     if trains_completion_head:
         assert completion_data_info is not None
         pos_weight = completion_data_info.pos_weight
-        if pos_weight is None:
+        if not config.completion.uses_focal_loss and pos_weight is None:
             raise ValueError("completion head training requires audited train labels and pos_weight")
 
     data_loader = _data_loader.create_data_loader(

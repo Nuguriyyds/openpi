@@ -993,6 +993,8 @@ _CONFIGS = [
             decay_lr=1e-5,
             weight_decay=1e-4,
             gradient_clip_norm=1.0,
+            focal_gamma=2.0,
+            focal_alpha=0.25,
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
@@ -1007,7 +1009,7 @@ _CONFIGS = [
         num_train_steps=10_000,
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        batch_size=16,
+        batch_size=64,
         num_workers=4,
         log_interval=100,
         save_interval=2_500,

@@ -36,6 +36,12 @@ class CompletionTrainingConfig:
     weight_decay: float = 1.0e-4
     gradient_clip_norm: float = 1.0
 
+    # Focal loss parameters.  When ``focal_gamma > 0`` the head training uses
+    # focal loss instead of weighted BCE.  ``focal_alpha`` balances the positive
+    # class (same role as ``pos_weight`` but applied inside the focal term).
+    focal_gamma: float = 0.0
+    focal_alpha: float = 0.25
+
     def __post_init__(self) -> None:
         if self.stage not in ("disabled", "action", "head"):
             raise ValueError(f"unsupported completion training stage: {self.stage!r}")
@@ -57,6 +63,10 @@ class CompletionTrainingConfig:
             raise ValueError("completion.weight_decay must be non-negative")
         if self.gradient_clip_norm <= 0:
             raise ValueError("completion.gradient_clip_norm must be positive")
+        if self.focal_gamma < 0:
+            raise ValueError("completion.focal_gamma must be non-negative")
+        if not 0.0 < self.focal_alpha < 1.0:
+            raise ValueError("completion.focal_alpha must be in (0, 1)")
 
     @property
     def uses_completion_data(self) -> bool:
@@ -73,6 +83,12 @@ class CompletionTrainingConfig:
         """Whether the raw dataset must contain audited completion labels."""
 
         return self.stage == "head"
+
+    @property
+    def uses_focal_loss(self) -> bool:
+        """Whether head training uses focal loss instead of weighted BCE."""
+
+        return self.focal_gamma > 0.0
 
 
 def positive_class_weight(negative_count: int, positive_count: int) -> float:
@@ -100,3 +116,44 @@ def bce_with_logits(logits: jax.Array, targets: jax.Array) -> jax.Array:
     """Stable unweighted per-example BCE used for validation reporting."""
 
     return weighted_bce_with_logits(logits, targets, 1.0)
+
+
+def focal_loss_with_logits(
+    logits: jax.Array, targets: jax.Array, *, gamma: float, alpha: float
+) -> jax.Array:
+    """Numerically stable focal loss with logits.
+
+    ``FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)``
+
+    where ``p_t`` is the predicted probability for the true class.  The
+    ``(1 - p_t)^gamma`` term down-weights well-classified examples, letting the
+    model focus on hard examples — effective for extreme class imbalance.
+
+    Args:
+        logits: Raw model logits, shape ``[batch]``.
+        targets: Binary targets (0 or 1), same shape as ``logits``.
+        gamma: Focusing parameter; ``0`` reduces to standard weighted BCE.
+        alpha: Weight for the positive class (``1 - alpha`` for negative).
+    """
+
+    logits = jnp.asarray(logits, dtype=jnp.float32)
+    targets = jnp.asarray(targets, dtype=jnp.float32)
+    if logits.shape != targets.shape:
+        raise ValueError(f"completion logits shape {logits.shape} does not match targets shape {targets.shape}")
+
+    # Per-example cross-entropy: softplus(-|logit|) adjusted by sign.
+    # For positive target: softplus(-logit); for negative: softplus(logit).
+    # This is equivalent to -log(sigmoid(logit * (2*target - 1))).
+    signed_logits = logits * (2.0 * targets - 1.0)
+    cross_entropy = jax.nn.softplus(-signed_logits)
+
+    # p_t = probability of the true class.
+    p_t = jnp.exp(-cross_entropy)
+
+    # Focal modulating factor: (1 - p_t)^gamma.
+    focal_weight = (1.0 - p_t) ** gamma
+
+    # alpha_t: alpha for positive, (1 - alpha) for negative.
+    alpha_t = targets * alpha + (1.0 - targets) * (1.0 - alpha)
+
+    return alpha_t * focal_weight * cross_entropy
