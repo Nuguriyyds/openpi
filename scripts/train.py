@@ -293,8 +293,37 @@ def completion_eval_step(
     return logits, targets
 
 
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    """Average-rank assignment for ties, matching scipy.stats.rankdata (method='average')."""
+
+    values = np.asarray(values, dtype=np.float64)
+    sorter = np.argsort(values, kind="mergesort")
+    # inv[i] = position of values[i] in the sorted array (0-indexed).
+    inv = np.empty(sorter.size, dtype=np.int64)
+    inv[sorter] = np.arange(sorter.size, dtype=np.int64)
+    sorted_values = values[sorter]
+    # Identify tie groups in sorted order.
+    is_tie_start = np.concatenate(([True], sorted_values[1:] != sorted_values[:-1]))
+    sorted_group_ids = np.cumsum(is_tie_start) - 1
+    # Map group ids back to original positions.
+    group_ids = sorted_group_ids[inv]
+    # Average rank within each tie group: mean of (1-indexed) sorted positions.
+    counts = np.bincount(sorted_group_ids)
+    rank_sums = np.zeros(counts.size, dtype=np.float64)
+    np.add.at(rank_sums, sorted_group_ids, np.arange(1, sorter.size + 1, dtype=np.float64))
+    avg_ranks = rank_sums / np.maximum(counts, 1)
+    return avg_ranks[group_ids]
+
+
 def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, float]:
-    """Aggregates the fixed-threshold completion metrics requested for validation."""
+    """Aggregates the fixed-threshold completion metrics requested for validation.
+
+    In addition to the fixed 0.5-threshold precision/recall/f1, this also reports
+    the best-F1 threshold and the ROC-AUC. The fixed-threshold metrics can be
+    misleading when the head's logit distribution is shifted away from 0 (so that
+    all sigmoid scores fall on one side of 0.5); the best-threshold and AUC
+    metrics disentangle "the head learned nothing" from "the threshold is wrong".
+    """
 
     logits = np.asarray(logits, dtype=np.float64).reshape(-1)
     targets = np.asarray(targets, dtype=np.int64).reshape(-1)
@@ -323,6 +352,35 @@ def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray) -> di
     recall = true_positives / max(true_positives + false_negatives, 1)
     f1 = 2.0 * precision * recall / max(precision + recall, np.finfo(np.float64).eps)
     bce = np.mean(np.logaddexp(0.0, logits) - targets * logits)
+
+    # Best-threshold F1: sweep over unique scores plus 0.5 to find the threshold
+    # that maximises F1. This reveals whether the head has learned a useful
+    # ordering even when the fixed 0.5 threshold yields zero precision/recall.
+    candidate_thresholds = np.unique(scores)
+    best_f1 = 0.0
+    best_threshold = 0.5
+    best_precision = 0.0
+    best_recall = 0.0
+    for threshold in candidate_thresholds:
+        preds = scores >= threshold
+        tp = int(np.sum(np.logical_and(preds, positives)))
+        fp = int(np.sum(np.logical_and(preds, negatives)))
+        fn = int(np.sum(np.logical_and(~preds, positives)))
+        p = tp / max(tp + fp, 1)
+        r = tp / max(tp + fn, 1)
+        f = 2.0 * p * r / max(p + r, np.finfo(np.float64).eps)
+        if f > best_f1:
+            best_f1 = f
+            best_threshold = float(threshold)
+            best_precision = p
+            best_recall = r
+
+    # ROC-AUC computed by the Mann-Whitney U statistic (rank-based, threshold-free).
+    ranks = _rankdata(scores)
+    auc = (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2) / (
+        positive_count * negative_count
+    )
+
     return {
         "val/bce": float(bce),
         "val/positive_count": float(positive_count),
@@ -332,6 +390,11 @@ def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray) -> di
         "val/precision_at_0.5": float(precision),
         "val/recall_at_0.5": float(recall),
         "val/f1_at_0.5": float(f1),
+        "val/best_f1": float(best_f1),
+        "val/best_threshold": float(best_threshold),
+        "val/best_precision": float(best_precision),
+        "val/best_recall": float(best_recall),
+        "val/auc": float(auc),
     }
 
 
