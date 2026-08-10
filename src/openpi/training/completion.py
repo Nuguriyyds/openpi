@@ -42,6 +42,17 @@ class CompletionTrainingConfig:
     focal_gamma: float = 0.0
     focal_alpha: float = 0.25
 
+    # Optional diagnostic sampler for the completion head. It constructs every
+    # training batch from a fixed mixture of positive frames, negatives close
+    # to the positive suffix, and ordinary early negatives. Validation always
+    # keeps the original frame distribution.
+    balanced_sampling: bool = False
+    balanced_positive_fraction: float = 0.25
+    balanced_hard_negative_fraction: float = 0.25
+    hard_negative_window: int = 16
+    train_episode_limit: int | None = None
+    bce_pos_weight_override: float | None = None
+
     def __post_init__(self) -> None:
         if self.stage not in ("disabled", "action", "head"):
             raise ValueError(f"unsupported completion training stage: {self.stage!r}")
@@ -67,6 +78,22 @@ class CompletionTrainingConfig:
             raise ValueError("completion.focal_gamma must be non-negative")
         if not 0.0 < self.focal_alpha < 1.0:
             raise ValueError("completion.focal_alpha must be in (0, 1)")
+        if not 0.0 < self.balanced_positive_fraction < 1.0:
+            raise ValueError("completion.balanced_positive_fraction must be in (0, 1)")
+        if not 0.0 <= self.balanced_hard_negative_fraction < 1.0:
+            raise ValueError("completion.balanced_hard_negative_fraction must be in [0, 1)")
+        if self.balanced_positive_fraction + self.balanced_hard_negative_fraction >= 1.0:
+            raise ValueError("completion balanced positive and hard-negative fractions must sum to less than 1")
+        if self.hard_negative_window <= 0:
+            raise ValueError("completion.hard_negative_window must be positive")
+        if self.train_episode_limit is not None and self.train_episode_limit <= 0:
+            raise ValueError("completion.train_episode_limit must be positive when set")
+        if self.bce_pos_weight_override is not None and self.bce_pos_weight_override <= 0:
+            raise ValueError("completion.bce_pos_weight_override must be positive when set")
+        if self.balanced_sampling and self.stage != "head":
+            raise ValueError("completion.balanced_sampling is only supported for stage 'head'")
+        if self.train_episode_limit is not None and self.stage != "head":
+            raise ValueError("completion.train_episode_limit is only supported for stage 'head'")
 
     @property
     def uses_completion_data(self) -> bool:

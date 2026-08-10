@@ -263,6 +263,8 @@ def train_step(
             "completion_loss": completion_loss,
             "total_loss": loss,
             "completion_grad_norm": optax.global_norm(grads),
+            "completion_positive_count": jnp.sum(completion_targets),
+            "completion_positive_fraction": jnp.mean(completion_targets),
         }
         if uses_focal:
             head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
@@ -315,7 +317,9 @@ def _rankdata(values: np.ndarray) -> np.ndarray:
     return avg_ranks[group_ids]
 
 
-def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, float]:
+def completion_validation_metrics(
+    logits: np.ndarray, targets: np.ndarray, *, prefix: str = "val"
+) -> dict[str, float]:
     """Aggregates the fixed-threshold completion metrics requested for validation.
 
     In addition to the fixed 0.5-threshold precision/recall/f1, this also reports
@@ -382,19 +386,19 @@ def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray) -> di
     )
 
     return {
-        "val/bce": float(bce),
-        "val/positive_count": float(positive_count),
-        "val/negative_count": float(negative_count),
-        "val/positive_score_mean": float(np.mean(scores[positives])),
-        "val/negative_score_mean": float(np.mean(scores[negatives])),
-        "val/precision_at_0.5": float(precision),
-        "val/recall_at_0.5": float(recall),
-        "val/f1_at_0.5": float(f1),
-        "val/best_f1": float(best_f1),
-        "val/best_threshold": float(best_threshold),
-        "val/best_precision": float(best_precision),
-        "val/best_recall": float(best_recall),
-        "val/auc": float(auc),
+        f"{prefix}/bce": float(bce),
+        f"{prefix}/positive_count": float(positive_count),
+        f"{prefix}/negative_count": float(negative_count),
+        f"{prefix}/positive_score_mean": float(np.mean(scores[positives])),
+        f"{prefix}/negative_score_mean": float(np.mean(scores[negatives])),
+        f"{prefix}/precision_at_0.5": float(precision),
+        f"{prefix}/recall_at_0.5": float(recall),
+        f"{prefix}/f1_at_0.5": float(f1),
+        f"{prefix}/best_f1": float(best_f1),
+        f"{prefix}/best_threshold": float(best_threshold),
+        f"{prefix}/best_precision": float(best_precision),
+        f"{prefix}/best_recall": float(best_recall),
+        f"{prefix}/auc": float(auc),
     }
 
 
@@ -405,6 +409,7 @@ def evaluate_completion(
     data_loader: _data_loader.DataLoader,
     *,
     expected_count: int,
+    metric_prefix: str = "val",
 ) -> dict[str, float]:
     all_logits = []
     all_targets = []
@@ -420,7 +425,7 @@ def evaluate_completion(
         raise ValueError(f"validation loader evaluated {logits.shape[0]} frames, expected at least {expected_count}")
     # The loader may repeat a few rows so the final batch can be sharded across
     # all devices. Only the original validation examples contribute metrics.
-    return completion_validation_metrics(logits[:expected_count], targets[:expected_count])
+    return completion_validation_metrics(logits[:expected_count], targets[:expected_count], prefix=metric_prefix)
 
 
 def main(config: _config.TrainConfig):
@@ -460,12 +465,17 @@ def main(config: _config.TrainConfig):
     trains_completion_head = config.completion.trains_completion_head
     completion_data_info = None
     val_data_loader = None
+    train_eval_data_loader = None
     pos_weight = None
     if uses_completion_data:
         completion_data_info = _data_loader.prepare_completion_data(config)
     if trains_completion_head:
         assert completion_data_info is not None
-        pos_weight = completion_data_info.pos_weight
+        pos_weight = (
+            config.completion.bce_pos_weight_override
+            if config.completion.bce_pos_weight_override is not None
+            else completion_data_info.pos_weight
+        )
         if not config.completion.uses_focal_loss and pos_weight is None:
             raise ValueError("completion head training requires audited train labels and pos_weight")
 
@@ -484,6 +494,15 @@ def main(config: _config.TrainConfig):
             sharding=data_sharding,
             shuffle=False,
         )
+        if config.completion.train_episode_limit is not None:
+            train_eval_data_loader = _data_loader.create_data_loader(
+                config,
+                split="train",
+                completion_data_info=completion_data_info,
+                sharding=data_sharding,
+                shuffle=False,
+                natural_train_eval=True,
+            )
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -530,6 +549,7 @@ def main(config: _config.TrainConfig):
                     "dataset/train_positive_count": completion_data_info.train_positive_count,
                     "dataset/train_negative_count": completion_data_info.train_negative_count,
                     "dataset/pos_weight": completion_data_info.pos_weight,
+                    "dataset/effective_pos_weight": pos_weight,
                 }
             )
         logging.info("Completion dataset metrics: %s", dataset_metrics)
@@ -597,6 +617,29 @@ def main(config: _config.TrainConfig):
                 f"Step {step} validation: " + ", ".join(f"{key}={value:.4f}" for key, value in val_metrics.items())
             )
             wandb.log(val_metrics, step=step)
+
+            if train_eval_data_loader is not None:
+                train_episode_ids = completion_data_info.manifest.episode_ids("train")[
+                    : config.completion.train_episode_limit
+                ]
+                expected_train_eval_count = sum(
+                    completion_data_info.episode_audits[episode_id].frame_count
+                    for episode_id in train_episode_ids
+                )
+                with sharding.set_mesh(mesh):
+                    train_eval_metrics = evaluate_completion(
+                        pcompletion_eval_step,
+                        jax.random.fold_in(train_rng, step + 0xC0A4),
+                        train_state,
+                        train_eval_data_loader,
+                        expected_count=expected_train_eval_count,
+                        metric_prefix="train_overfit",
+                    )
+                pbar.write(
+                    f"Step {step} train-overfit: "
+                    + ", ".join(f"{key}={value:.4f}" for key, value in train_eval_metrics.items())
+                )
+                wandb.log(train_eval_metrics, step=step)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

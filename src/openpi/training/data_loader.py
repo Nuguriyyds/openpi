@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.training.completion as _completion
 import openpi.training.completion_data as _completion_data
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
@@ -105,6 +106,102 @@ class EpisodeSubsetDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return int(self._indices.shape[0])
+
+
+class BalancedCompletionSampler(torch.utils.data.Sampler[int]):
+    """Yields fixed-composition batches over an episode-subset dataset.
+
+    Dataset-local indices are reconstructed from the audited episode lengths;
+    ``EpisodeSubsetDataset`` concatenates episodes in the same order. Sampling
+    is with replacement across batches so the two positive frames per episode
+    cannot be exhausted after only a handful of optimizer steps.
+    """
+
+    def __init__(
+        self,
+        episode_ids: Sequence[int],
+        episode_audits: typing.Mapping[int, _completion_data.EpisodeAudit],
+        *,
+        batch_size: int,
+        positive_fraction: float,
+        hard_negative_fraction: float,
+        hard_negative_window: int,
+        seed: int,
+    ):
+        if batch_size < 3:
+            raise ValueError("balanced completion sampling requires batch_size >= 3")
+        positive_per_batch = max(1, int(round(batch_size * positive_fraction)))
+        hard_negative_per_batch = max(1, int(round(batch_size * hard_negative_fraction)))
+        ordinary_negative_per_batch = batch_size - positive_per_batch - hard_negative_per_batch
+        if ordinary_negative_per_batch <= 0:
+            raise ValueError("balanced completion fractions leave no ordinary negatives in a batch")
+
+        positives: list[int] = []
+        hard_negatives: list[int] = []
+        ordinary_negatives: list[int] = []
+        offset = 0
+        for episode_id in episode_ids:
+            audit = episode_audits[int(episode_id)]
+            positive_start = audit.frame_count - audit.positive_count
+            positives.extend(range(offset + positive_start, offset + audit.frame_count))
+            hard_start = max(0, positive_start - hard_negative_window)
+            hard_negatives.extend(range(offset + hard_start, offset + positive_start))
+            ordinary_negatives.extend(range(offset, offset + hard_start))
+            offset += audit.frame_count
+
+        if not positives:
+            raise ValueError("balanced completion sampling found no positive frames")
+        if not hard_negatives:
+            raise ValueError("balanced completion sampling found no hard-negative frames")
+        if not ordinary_negatives:
+            # Very short diagnostic episodes may contain only terminal-near
+            # negatives. Keep the sampler usable while making the fallback
+            # explicit through the public pool sizes below.
+            ordinary_negatives = list(hard_negatives)
+
+        self._positive_indices = np.asarray(positives, dtype=np.int64)
+        self._hard_negative_indices = np.asarray(hard_negatives, dtype=np.int64)
+        self._ordinary_negative_indices = np.asarray(ordinary_negatives, dtype=np.int64)
+        self._positive_per_batch = positive_per_batch
+        self._hard_negative_per_batch = hard_negative_per_batch
+        self._ordinary_negative_per_batch = ordinary_negative_per_batch
+        self._batch_size = batch_size
+        self._batch_count = max(1, int(np.ceil(offset / batch_size)))
+        self._seed = seed
+        self._epoch = 0
+
+    @property
+    def batch_composition(self) -> dict[str, int]:
+        return {
+            "positive": self._positive_per_batch,
+            "hard_negative": self._hard_negative_per_batch,
+            "ordinary_negative": self._ordinary_negative_per_batch,
+        }
+
+    @property
+    def pool_sizes(self) -> dict[str, int]:
+        return {
+            "positive": int(self._positive_indices.size),
+            "hard_negative": int(self._hard_negative_indices.size),
+            "ordinary_negative": int(self._ordinary_negative_indices.size),
+        }
+
+    def __iter__(self) -> Iterator[int]:
+        rng = np.random.default_rng(self._seed + self._epoch)
+        self._epoch += 1
+        for _ in range(self._batch_count):
+            batch = np.concatenate(
+                [
+                    rng.choice(self._positive_indices, self._positive_per_batch, replace=True),
+                    rng.choice(self._hard_negative_indices, self._hard_negative_per_batch, replace=True),
+                    rng.choice(self._ordinary_negative_indices, self._ordinary_negative_per_batch, replace=True),
+                ]
+            )
+            rng.shuffle(batch)
+            yield from (int(index) for index in batch)
+
+    def __len__(self) -> int:
+        return self._batch_count * self._batch_size
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -336,6 +433,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    natural_train_eval: bool = False,
 ) -> DataLoader[
     tuple[_model.Observation, _model.Actions]
     | tuple[_model.Observation, _model.Actions, jax.Array]
@@ -350,17 +448,28 @@ def create_data_loader(
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
     """
+    if natural_train_eval and split != "train":
+        raise ValueError("natural_train_eval is only valid for the train split")
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     uses_completion_split = config.completion.uses_completion_data
     emits_completion_target = config.completion.trains_completion_head
+    selected_episode_ids: tuple[int, ...] | None = None
     if uses_completion_split:
         if completion_data_info is None:
             completion_data_info = prepare_completion_data(config)
+        selected_episode_ids = completion_data_info.manifest.episode_ids(split)
+        if split == "train" and config.completion.train_episode_limit is not None:
+            selected_episode_ids = selected_episode_ids[: config.completion.train_episode_limit]
+            logging.info(
+                "Completion diagnostic episode limit: using %d train episodes: %s",
+                len(selected_episode_ids),
+                selected_episode_ids,
+            )
         data_config = dataclasses.replace(
             data_config,
-            episodes=completion_data_info.manifest.episode_ids(split),
+            episodes=selected_episode_ids,
             completion_label_key=config.completion.label_key if emits_completion_target else None,
         )
     elif split != "train":
@@ -391,8 +500,21 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
-        repeat=not uses_completion_split or split == "train",
-        drop_last=not uses_completion_split or split == "train",
+        repeat=(not uses_completion_split or split == "train") and not natural_train_eval,
+        drop_last=(not uses_completion_split or split == "train") and not natural_train_eval,
+        completion_sampling_config=(
+            config.completion
+            if split == "train" and config.completion.balanced_sampling and not natural_train_eval
+            else None
+        ),
+        completion_episode_audits=(
+            completion_data_info.episode_audits
+            if split == "train"
+            and config.completion.balanced_sampling
+            and not natural_train_eval
+            and completion_data_info is not None
+            else None
+        ),
     )
 
 
@@ -411,6 +533,8 @@ def create_torch_data_loader(
     framework: str = "jax",
     repeat: bool = True,
     drop_last: bool = True,
+    completion_sampling_config: _completion.CompletionTrainingConfig | None = None,
+    completion_episode_audits: typing.Mapping[int, _completion_data.EpisodeAudit] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -450,6 +574,26 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+
+    if completion_sampling_config is not None:
+        if sampler is not None:
+            raise ValueError("balanced completion sampling cannot be combined with a distributed sampler")
+        if completion_episode_audits is None or data_config.episodes is None:
+            raise ValueError("balanced completion sampling requires audited episode labels")
+        sampler = BalancedCompletionSampler(
+            data_config.episodes,
+            completion_episode_audits,
+            batch_size=local_batch_size,
+            positive_fraction=completion_sampling_config.balanced_positive_fraction,
+            hard_negative_fraction=completion_sampling_config.balanced_hard_negative_fraction,
+            hard_negative_window=completion_sampling_config.hard_negative_window,
+            seed=seed,
+        )
+        logging.info(
+            "Balanced completion sampler: batch=%s pools=%s",
+            sampler.batch_composition,
+            sampler.pool_sizes,
+        )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

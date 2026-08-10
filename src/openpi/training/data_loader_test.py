@@ -7,6 +7,7 @@ import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import completion
+from openpi.training import completion_data
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
@@ -140,6 +141,38 @@ def test_episode_subset_dataset_preserves_global_lerobot_indices():
     assert len(subset) == 5
     assert [subset[index]["global_index"] for index in range(len(subset))] == [5, 6, 7, 8, 9]
     assert [subset[index]["episode_index"] for index in range(len(subset))] == [2, 2, 2, 2, 3]
+
+
+def test_balanced_completion_sampler_guarantees_each_batch_composition():
+    audits = {
+        episode_id: completion_data.EpisodeAudit(
+            episode_id=episode_id,
+            frame_count=30,
+            positive_count=2,
+            negative_count=28,
+        )
+        for episode_id in (7, 8)
+    }
+    sampler = _data_loader.BalancedCompletionSampler(
+        (7, 8),
+        audits,
+        batch_size=8,
+        positive_fraction=0.25,
+        hard_negative_fraction=0.25,
+        hard_negative_window=4,
+        seed=123,
+    )
+    indices = list(sampler)
+    positive = {28, 29, 58, 59}
+    hard_negative = {24, 25, 26, 27, 54, 55, 56, 57}
+
+    assert sampler.batch_composition == {"positive": 2, "hard_negative": 2, "ordinary_negative": 4}
+    assert len(indices) % 8 == 0
+    for start in range(0, len(indices), 8):
+        batch = indices[start : start + 8]
+        assert sum(index in positive for index in batch) == 2
+        assert sum(index in hard_negative for index in batch) == 2
+        assert sum(index not in positive | hard_negative for index in batch) == 4
 
 
 def test_s1_and_s2_share_manifest_episodes_but_only_s2_emits_target(tmp_path, monkeypatch):

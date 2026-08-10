@@ -1017,6 +1017,77 @@ _CONFIGS = [
         fsdp_devices=2,
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
+    # Diagnostic run: prove that the frozen prefix can separate completion on
+    # a small episode subset before spending compute on the full imbalanced
+    # dataset. Every train batch is 25% positive, 25% terminal-near negative,
+    # and 50% ordinary negative; validation remains naturally distributed.
+    TrainConfig(
+        name="pi05_agilex_breakfast_frozen_head_s2_completion_overfit",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="agilex_make_breakfast_subtask_730_frozen_head",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/models/wyt/data",
+            ),
+        ),
+        training_time_rtc=_ttrtc.TrainingTimeRTCConfig(
+            enabled=True,
+            simulated_delay=5,
+            delay_sampling="exponential",
+            clean_timestep=0.0,
+            loss_normalization="reference",
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            label_key="completion",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_subtask_730_frozen_head.json"
+            ),
+            split_seed=42,
+            episodes_per_group=4,
+            val_groups=5,
+            test_groups=5,
+            val_interval=100,
+            warmup_steps=25,
+            peak_lr=3e-5,
+            decay_lr=3e-6,
+            weight_decay=1e-4,
+            gradient_clip_norm=5.0,
+            focal_gamma=0.0,
+            balanced_sampling=True,
+            balanced_positive_fraction=0.25,
+            balanced_hard_negative_fraction=0.25,
+            hard_negative_window=16,
+            train_episode_limit=20,
+            bce_pos_weight_override=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_frozen_head_s1_action/s1_action/49999/params",
+            missing_regex=r"completion_head/.*",
+        ),
+        num_train_steps=1_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=5.0),
+        ema_decay=None,
+        batch_size=64,
+        num_workers=4,
+        log_interval=25,
+        save_interval=100,
+        keep_period=100,
+        fsdp_devices=2,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
     #
     # Fine-tuning Aloha configs.
     #

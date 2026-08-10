@@ -36,3 +36,19 @@ switch is enabled, `scripts/train.py` passes the TTRTC config into `Pi0.compute_
 python scripts/train.py pi05_agilex_empty_the_box_all_470 --exp-name regular_pi05
 python scripts/train.py pi05_agilex_empty_the_box_all_470_ttrtc --exp-name ttrtc_pi05
 ```
+
+## Completion-head overfit diagnostic
+
+Before another full completion-head run, use the balanced 20-episode diagnostic:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py \
+  pi05_agilex_breakfast_frozen_head_s2_completion_overfit \
+  --exp-name=s2_completion_overfit --overwrite
+```
+
+Every train batch contains 16 positive frames, 16 terminal-near negatives, and
+32 ordinary negatives. Look for `completion_positive_count=16`, then compare
+`train_overfit/best_f1` and `train_overfit/auc` with the naturally distributed
+`val/*` metrics. If the train-overfit metrics cannot approach 1.0, the frozen
+single-frame prefix and/or final-two-frame label is not separable.

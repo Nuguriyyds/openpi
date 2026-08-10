@@ -49,6 +49,18 @@ def test_breakfast_two_stage_configs_are_explicit_and_share_the_split():
     assert not s2.data.assets.asset_id.startswith("/")
 
 
+def test_completion_overfit_config_uses_balanced_unweighted_bce():
+    overfit = config.get_config("pi05_agilex_breakfast_frozen_head_s2_completion_overfit")
+
+    assert overfit.completion.stage == "head"
+    assert overfit.completion.balanced_sampling
+    assert overfit.completion.train_episode_limit == 20
+    assert overfit.completion.bce_pos_weight_override == 1.0
+    assert not overfit.completion.uses_focal_loss
+    assert overfit.batch_size == 64
+    assert overfit.ema_decay is None
+
+
 @pytest.mark.parametrize(
     ("stage", "head_enabled", "pi05", "error"),
     [
