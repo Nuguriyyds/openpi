@@ -779,9 +779,9 @@ def _html_document(manifest: dict[str, Any]) -> str:
               addMetric("Best threshold", formatNumber(m.best_threshold, 4));
               addMetric("Best precision", formatNumber(m.best_precision, 4));
               addMetric("Best recall", formatNumber(m.best_recall, 4));
-              addMetric("F1 @ 0.5", formatNumber(m.f1_at_0.5, 4));
-              addMetric("Precision @ 0.5", formatNumber(m.precision_at_0.5, 4));
-              addMetric("Recall @ 0.5", formatNumber(m.recall_at_0.5, 4));
+              addMetric("F1 @ 0.5", formatNumber(m["f1_at_0.5"], 4));
+              addMetric("Precision @ 0.5", formatNumber(m["precision_at_0.5"], 4));
+              addMetric("Recall @ 0.5", formatNumber(m["recall_at_0.5"], 4));
               addMetric("BCE", formatNumber(m.bce, 4));
               addMetric("Positive score mean", formatNumber(m.positive_score_mean, 4));
               addMetric("Negative score mean", formatNumber(m.negative_score_mean, 4));
