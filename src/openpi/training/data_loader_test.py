@@ -175,6 +175,63 @@ def test_balanced_completion_sampler_guarantees_each_batch_composition():
         assert sum(index not in positive | hard_negative for index in batch) == 4
 
 
+def test_progress_stratified_sampler_covers_all_bins_and_is_reproducible():
+    episode_ids = (7, 8)
+    audits = {
+        episode_id: completion_data.EpisodeAudit(
+            episode_id=episode_id,
+            frame_count=21,
+            positive_count=0,
+            negative_count=0,
+            task_index=episode_id,
+        )
+        for episode_id in episode_ids
+    }
+    sampler = _data_loader.ProgressStratifiedSampler(episode_ids, audits, batch_size=20, seed=123)
+    same_seed_sampler = _data_loader.ProgressStratifiedSampler(episode_ids, audits, batch_size=20, seed=123)
+
+    indices = list(sampler)
+    assert indices == list(same_seed_sampler)
+    assert sampler.batch_composition == {f"bin_{index}": 2 for index in range(10)}
+    assert sampler.pool_sizes.keys() == {f"bin_{index}" for index in range(10)}
+    assert all(size > 0 for size in sampler.pool_sizes.values())
+    assert all(size == 2 for size in sampler.episode_pool_sizes.values())
+
+    targets = completion_data.make_progress_targets(21)
+    for batch_start in range(0, len(indices), 20):
+        batch = indices[batch_start : batch_start + 20]
+        bin_counts = np.zeros(10, dtype=np.int32)
+        for index in batch:
+            local_frame = index % 21
+            bin_index = min(int(targets[local_frame] * 10), 9)
+            bin_counts[bin_index] += 1
+        np.testing.assert_array_equal(bin_counts, np.full(10, 2, dtype=np.int32))
+
+
+def test_progress_stratified_sampler_rotates_remainder_bins():
+    audits = {
+        episode_id: completion_data.EpisodeAudit(
+            episode_id=episode_id,
+            frame_count=21,
+            positive_count=0,
+            negative_count=0,
+        )
+        for episode_id in (1, 2)
+    }
+    sampler = _data_loader.ProgressStratifiedSampler((1, 2), audits, batch_size=24, seed=9)
+    indices = list(sampler)
+    targets = completion_data.make_progress_targets(21)
+
+    first_batch_counts = np.zeros(10, dtype=np.int32)
+    second_batch_counts = np.zeros(10, dtype=np.int32)
+    for index in indices[:24]:
+        first_batch_counts[min(int(targets[index % 21] * 10), 9)] += 1
+    for index in indices[24:48]:
+        second_batch_counts[min(int(targets[index % 21] * 10), 9)] += 1
+    np.testing.assert_array_equal(first_batch_counts, np.asarray([3, 3, 3, 3, 2, 2, 2, 2, 2, 2]))
+    np.testing.assert_array_equal(second_batch_counts, np.asarray([2, 3, 3, 3, 3, 2, 2, 2, 2, 2]))
+
+
 def test_s1_and_s2_share_manifest_episodes_but_only_s2_emits_target(tmp_path, monkeypatch):
     class DataFactory:
         def create(self, assets_dirs, model):

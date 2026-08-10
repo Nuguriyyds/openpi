@@ -153,6 +153,57 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def _jax_correlation(left: jax.Array, right: jax.Array) -> jax.Array:
+    """Finite Pearson correlation for a fixed-size JAX batch."""
+
+    left = jnp.asarray(left, dtype=jnp.float32).reshape(-1)
+    right = jnp.asarray(right, dtype=jnp.float32).reshape(-1)
+    left_centered = left - jnp.mean(left)
+    right_centered = right - jnp.mean(right)
+    denominator = jnp.sqrt(jnp.sum(jnp.square(left_centered)) * jnp.sum(jnp.square(right_centered)))
+    return jnp.where(
+        denominator > jnp.finfo(jnp.float32).eps, jnp.sum(left_centered * right_centered) / denominator, 0.0
+    )
+
+
+def _jax_ordinal_ranks(values: jax.Array) -> jax.Array:
+    """Ranks used for per-batch Spearman logging (ties are deterministically ordered)."""
+
+    values = jnp.asarray(values, dtype=jnp.float32).reshape(-1)
+    return jnp.argsort(jnp.argsort(values)).astype(jnp.float32)
+
+
+def progress_batch_metrics(predictions: jax.Array, targets: jax.Array) -> dict[str, jax.Array]:
+    """Regression metrics emitted from the JITted progress training step."""
+
+    predictions = jnp.asarray(predictions, dtype=jnp.float32).reshape(-1)
+    targets = jnp.asarray(targets, dtype=jnp.float32).reshape(-1)
+    absolute_error = jnp.abs(predictions - targets)
+    early = targets <= 0.1
+    late = targets >= 0.9
+
+    def endpoint_mae(mask: jax.Array) -> jax.Array:
+        count = jnp.sum(mask.astype(jnp.float32))
+        return jnp.sum(jnp.where(mask, absolute_error, 0.0)) / jnp.maximum(count, 1.0)
+
+    return {
+        "mae": jnp.mean(absolute_error),
+        "rmse": jnp.sqrt(jnp.mean(jnp.square(predictions - targets))),
+        "pearson": _jax_correlation(predictions, targets),
+        "spearman": _jax_correlation(_jax_ordinal_ranks(predictions), _jax_ordinal_ranks(targets)),
+        "prediction_mean": jnp.mean(predictions),
+        "prediction_std": jnp.std(predictions),
+        "prediction_min": jnp.min(predictions),
+        "prediction_max": jnp.max(predictions),
+        "target_mean": jnp.mean(targets),
+        "target_std": jnp.std(targets),
+        "target_min": jnp.min(targets),
+        "target_max": jnp.max(targets),
+        "early_mae": endpoint_mae(early),
+        "late_mae": endpoint_mae(late),
+    }
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -179,26 +230,47 @@ def train_step(
         focal_gamma = config.completion.focal_gamma
         focal_alpha = config.completion.focal_alpha
         uses_focal = config.completion.uses_focal_loss
-        if not uses_focal and pos_weight is None:
+        uses_progress = config.completion.uses_progress_objective
+        if not uses_progress and not uses_focal and pos_weight is None:
             raise ValueError("pos_weight is required for completion head training")
 
-        def completion_loss_fn(model, rng, observation, targets):
-            logits = model.compute_completion_logits(rng, observation, train=True)
-            if logits.shape != targets.shape:
-                raise ValueError(
-                    f"completion target shape {targets.shape} does not match model logits shape {logits.shape}"
-                )
-            if uses_focal:
-                return jnp.mean(
-                    _completion.focal_loss_with_logits(logits, targets, gamma=focal_gamma, alpha=focal_alpha)
-                )
-            return jnp.mean(_completion.weighted_bce_with_logits(logits, targets, pos_weight))
+        if uses_progress:
 
-        loss, grads = nnx.value_and_grad(
-            completion_loss_fn,
-            argnums=diff_state,
-        )(model, train_rng, observation, completion_targets)
-        completion_loss = loss
+            def progress_loss_fn(model, rng, observation, targets):
+                logits = model.compute_completion_logits(rng, observation, train=True)
+                if logits.shape != targets.shape:
+                    raise ValueError(
+                        f"progress target shape {targets.shape} does not match model logits shape {logits.shape}"
+                    )
+                predictions = _completion.progress_predictions_from_logits(logits)
+                loss = jnp.mean(_completion.progress_huber_loss(logits, targets, delta=config.completion.huber_delta))
+                return loss, progress_batch_metrics(predictions, targets)
+
+            (loss, progress_metrics), grads = nnx.value_and_grad(
+                progress_loss_fn,
+                argnums=diff_state,
+                has_aux=True,
+            )(model, train_rng, observation, completion_targets)
+            completion_loss = loss
+        else:
+
+            def completion_loss_fn(model, rng, observation, targets):
+                logits = model.compute_completion_logits(rng, observation, train=True)
+                if logits.shape != targets.shape:
+                    raise ValueError(
+                        f"completion target shape {targets.shape} does not match model logits shape {logits.shape}"
+                    )
+                if uses_focal:
+                    return jnp.mean(
+                        _completion.focal_loss_with_logits(logits, targets, gamma=focal_gamma, alpha=focal_alpha)
+                    )
+                return jnp.mean(_completion.weighted_bce_with_logits(logits, targets, pos_weight))
+
+            loss, grads = nnx.value_and_grad(
+                completion_loss_fn,
+                argnums=diff_state,
+            )(model, train_rng, observation, completion_targets)
+            completion_loss = loss
     else:
         observation, actions = batch
 
@@ -259,18 +331,26 @@ def train_step(
             }
         )
     elif completion_stage == "head":
-        head_info = {
-            "completion_loss": completion_loss,
-            "total_loss": loss,
-            "completion_grad_norm": optax.global_norm(grads),
-            "completion_positive_count": jnp.sum(completion_targets),
-            "completion_positive_fraction": jnp.mean(completion_targets),
-        }
-        if uses_focal:
-            head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
-            head_info["focal_alpha"] = jnp.asarray(focal_alpha, dtype=jnp.float32)
+        if uses_progress:
+            head_info = {
+                "progress_loss": completion_loss,
+                "total_loss": loss,
+                "completion_grad_norm": optax.global_norm(grads),
+                **{f"progress_{name}": value for name, value in progress_metrics.items()},
+            }
         else:
-            head_info["pos_weight"] = jnp.asarray(pos_weight, dtype=jnp.float32)
+            head_info = {
+                "completion_loss": completion_loss,
+                "total_loss": loss,
+                "completion_grad_norm": optax.global_norm(grads),
+                "completion_positive_count": jnp.sum(completion_targets),
+                "completion_positive_fraction": jnp.mean(completion_targets),
+            }
+            if uses_focal:
+                head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
+                head_info["focal_alpha"] = jnp.asarray(focal_alpha, dtype=jnp.float32)
+            else:
+                head_info["pos_weight"] = jnp.asarray(pos_weight, dtype=jnp.float32)
         info.update(head_info)
     return new_state, info
 
@@ -317,9 +397,7 @@ def _rankdata(values: np.ndarray) -> np.ndarray:
     return avg_ranks[group_ids]
 
 
-def completion_validation_metrics(
-    logits: np.ndarray, targets: np.ndarray, *, prefix: str = "val"
-) -> dict[str, float]:
+def completion_validation_metrics(logits: np.ndarray, targets: np.ndarray, *, prefix: str = "val") -> dict[str, float]:
     """Aggregates the fixed-threshold completion metrics requested for validation.
 
     In addition to the fixed 0.5-threshold precision/recall/f1, this also reports
@@ -381,9 +459,7 @@ def completion_validation_metrics(
 
     # ROC-AUC computed by the Mann-Whitney U statistic (rank-based, threshold-free).
     ranks = _rankdata(scores)
-    auc = (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2) / (
-        positive_count * negative_count
-    )
+    auc = (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2) / (positive_count * negative_count)
 
     return {
         f"{prefix}/bce": float(bce),
@@ -402,6 +478,78 @@ def completion_validation_metrics(
     }
 
 
+def _sigmoid_numpy(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    scores = np.empty_like(logits)
+    nonnegative = logits >= 0
+    scores[nonnegative] = 1.0 / (1.0 + np.exp(-logits[nonnegative]))
+    exp_logits = np.exp(logits[~nonnegative])
+    scores[~nonnegative] = exp_logits / (1.0 + exp_logits)
+    return scores
+
+
+def _safe_correlation(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64).reshape(-1)
+    right = np.asarray(right, dtype=np.float64).reshape(-1)
+    if len(left) < 2:
+        return 0.0
+    left_centered = left - np.mean(left)
+    right_centered = right - np.mean(right)
+    denominator = float(np.sqrt(np.sum(np.square(left_centered)) * np.sum(np.square(right_centered))))
+    if denominator <= np.finfo(np.float64).eps:
+        return 0.0
+    return float(np.sum(left_centered * right_centered) / denominator)
+
+
+def progress_validation_metrics(
+    logits: np.ndarray,
+    targets: np.ndarray,
+    *,
+    huber_delta: float,
+    prefix: str = "val",
+) -> dict[str, float]:
+    """Aggregates continuous progress-regression metrics without binary thresholds."""
+
+    logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+    targets = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if logits.shape != targets.shape or logits.size == 0:
+        raise ValueError(f"invalid progress validation arrays: logits={logits.shape}, targets={targets.shape}")
+    if not np.all(np.isfinite(logits)) or not np.all(np.isfinite(targets)):
+        raise ValueError("progress validation logits and targets must be finite")
+    if np.any((targets < 0.0) | (targets > 1.0)):
+        raise ValueError("progress validation targets must lie in [0, 1]")
+    if huber_delta <= 0:
+        raise ValueError("progress Huber delta must be positive")
+
+    predictions = _sigmoid_numpy(logits)
+    absolute_error = np.abs(predictions - targets)
+    huber = np.where(
+        absolute_error <= huber_delta,
+        0.5 * np.square(absolute_error),
+        huber_delta * (absolute_error - 0.5 * huber_delta),
+    )
+    early = targets <= 0.1
+    late = targets >= 0.9
+    return {
+        f"{prefix}/loss": float(np.mean(huber)),
+        f"{prefix}/mae": float(np.mean(absolute_error)),
+        f"{prefix}/rmse": float(np.sqrt(np.mean(np.square(predictions - targets)))),
+        f"{prefix}/pearson": _safe_correlation(predictions, targets),
+        f"{prefix}/spearman": _safe_correlation(_rankdata(predictions), _rankdata(targets)),
+        f"{prefix}/prediction_mean": float(np.mean(predictions)),
+        f"{prefix}/prediction_std": float(np.std(predictions)),
+        f"{prefix}/prediction_min": float(np.min(predictions)),
+        f"{prefix}/prediction_max": float(np.max(predictions)),
+        f"{prefix}/target_mean": float(np.mean(targets)),
+        f"{prefix}/target_std": float(np.std(targets)),
+        f"{prefix}/target_min": float(np.min(targets)),
+        f"{prefix}/target_max": float(np.max(targets)),
+        f"{prefix}/early_mae": float(np.mean(absolute_error[early])) if np.any(early) else 0.0,
+        f"{prefix}/late_mae": float(np.mean(absolute_error[late])) if np.any(late) else 0.0,
+        f"{prefix}/frame_count": float(targets.size),
+    }
+
+
 def evaluate_completion(
     eval_step,
     rng: at.KeyArrayLike,
@@ -410,6 +558,8 @@ def evaluate_completion(
     *,
     expected_count: int,
     metric_prefix: str = "val",
+    objective: _completion.CompletionObjective = "binary",
+    huber_delta: float = 0.1,
 ) -> dict[str, float]:
     all_logits = []
     all_targets = []
@@ -425,7 +575,16 @@ def evaluate_completion(
         raise ValueError(f"validation loader evaluated {logits.shape[0]} frames, expected at least {expected_count}")
     # The loader may repeat a few rows so the final batch can be sharded across
     # all devices. Only the original validation examples contribute metrics.
-    return completion_validation_metrics(logits[:expected_count], targets[:expected_count], prefix=metric_prefix)
+    if objective == "progress":
+        return progress_validation_metrics(
+            logits[:expected_count],
+            targets[:expected_count],
+            huber_delta=huber_delta,
+            prefix=metric_prefix,
+        )
+    if objective == "binary":
+        return completion_validation_metrics(logits[:expected_count], targets[:expected_count], prefix=metric_prefix)
+    raise ValueError(f"unsupported completion objective: {objective!r}")
 
 
 def main(config: _config.TrainConfig):
@@ -471,13 +630,14 @@ def main(config: _config.TrainConfig):
         completion_data_info = _data_loader.prepare_completion_data(config)
     if trains_completion_head:
         assert completion_data_info is not None
-        pos_weight = (
-            config.completion.bce_pos_weight_override
-            if config.completion.bce_pos_weight_override is not None
-            else completion_data_info.pos_weight
-        )
-        if not config.completion.uses_focal_loss and pos_weight is None:
-            raise ValueError("completion head training requires audited train labels and pos_weight")
+        if not config.completion.uses_progress_objective:
+            pos_weight = (
+                config.completion.bce_pos_weight_override
+                if config.completion.bce_pos_weight_override is not None
+                else completion_data_info.pos_weight
+            )
+            if not config.completion.uses_focal_loss and pos_weight is None:
+                raise ValueError("completion head training requires audited train labels and pos_weight")
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -530,8 +690,7 @@ def main(config: _config.TrainConfig):
             trainable_groups=expected_trainable_groups,
         )
         logging.info(
-            "Parameter audit: frozen_vlm=%d frozen_action=%d "
-            "trainable_action=%d trainable_completion=%d",
+            "Parameter audit: frozen_vlm=%d frozen_action=%d trainable_action=%d trainable_completion=%d",
             len(audit.frozen_vlm),
             len(audit.frozen_action),
             len(audit.trainable_action),
@@ -543,7 +702,15 @@ def main(config: _config.TrainConfig):
             "dataset/val_episode_count": len(completion_data_info.manifest.episode_ids("val")),
             "dataset/test_episode_count": len(completion_data_info.manifest.episode_ids("test")),
         }
-        if completion_data_info.pos_weight is not None:
+        if config.completion.uses_progress_objective:
+            dataset_metrics.update(
+                {
+                    "dataset/progress_objective": 1.0,
+                    "dataset/progress_bin_count": _completion.PROGRESS_BIN_COUNT,
+                    "dataset/progress_huber_delta": config.completion.huber_delta,
+                }
+            )
+        elif completion_data_info.pos_weight is not None:
             dataset_metrics.update(
                 {
                     "dataset/train_positive_count": completion_data_info.train_positive_count,
@@ -607,8 +774,13 @@ def main(config: _config.TrainConfig):
                     train_state,
                     val_data_loader,
                     expected_count=expected_val_count,
+                    objective=config.completion.objective,
+                    huber_delta=config.completion.huber_delta,
                 )
-            actual_val_count = int(val_metrics["val/positive_count"] + val_metrics["val/negative_count"])
+            if config.completion.uses_progress_objective:
+                actual_val_count = int(val_metrics["val/frame_count"])
+            else:
+                actual_val_count = int(val_metrics["val/positive_count"] + val_metrics["val/negative_count"])
             if actual_val_count != expected_val_count:
                 raise ValueError(
                     f"validation loader evaluated {actual_val_count} frames, expected {expected_val_count}"
@@ -623,8 +795,7 @@ def main(config: _config.TrainConfig):
                     : config.completion.train_episode_limit
                 ]
                 expected_train_eval_count = sum(
-                    completion_data_info.episode_audits[episode_id].frame_count
-                    for episode_id in train_episode_ids
+                    completion_data_info.episode_audits[episode_id].frame_count for episode_id in train_episode_ids
                 )
                 with sharding.set_mesh(mesh):
                     train_eval_metrics = evaluate_completion(
@@ -634,6 +805,8 @@ def main(config: _config.TrainConfig):
                         train_eval_data_loader,
                         expected_count=expected_train_eval_count,
                         metric_prefix="train_overfit",
+                        objective=config.completion.objective,
+                        huber_delta=config.completion.huber_delta,
                     )
                 pbar.write(
                     f"Step {step} train-overfit: "

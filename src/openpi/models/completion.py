@@ -12,7 +12,7 @@ import jax.numpy as jnp
 
 @dataclasses.dataclass(frozen=True)
 class CompletionHeadConfig:
-    """Configuration for the optional VLM completion classifier.
+    """Configuration for the optional VLM completion prediction head.
 
     ``input_dim`` deliberately does not live in this config. It is read from
     the selected PaliGemma model configuration when the model is constructed.
@@ -60,7 +60,7 @@ def masked_attention_pool(
 
 
 class CompletionHead(nnx.Module):
-    """FP32 learned-attention classifier over frozen VLM prefix outputs."""
+    """FP32 learned-attention head over frozen VLM prefix outputs."""
 
     def __init__(self, input_dim: int, config: CompletionHeadConfig, *, rngs: nnx.Rngs):
         if input_dim <= 0:

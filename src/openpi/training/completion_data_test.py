@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -15,6 +16,21 @@ def _write_episode(path, episode_id: int, labels, *, include_completion: bool = 
     if include_completion:
         columns["completion"] = labels
     pq.write_table(pa.table(columns), path)
+
+
+def _write_progress_episode(path, episode_id: int, labels, *, frame_indices=None, task_indices=None):
+    frame_count = len(labels)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [episode_id] * frame_count,
+                "frame_index": list(range(frame_count)) if frame_indices is None else frame_indices,
+                "task_index": [17] * frame_count if task_indices is None else task_indices,
+                "progress": pa.array(np.asarray(labels, dtype=np.float32), type=pa.float32()),
+            }
+        ),
+        path,
+    )
 
 
 def test_four_episode_grouping_is_fixed_and_has_no_leakage(tmp_path):
@@ -134,6 +150,78 @@ def test_episode_audit_rejects_fractional_frame_indices(tmp_path):
         completion_data.audit_episode_parquet(path, episode_id=31, expected_length=4)
 
 
+@pytest.mark.parametrize(
+    ("frame_count", "expected"),
+    [
+        (1, [1.0]),
+        (2, [0.0, 1.0]),
+        (5, [0.0, 0.25, 0.5, 0.75, 1.0]),
+    ],
+)
+def test_progress_labels_have_required_linear_endpoints_and_monotonicity(frame_count, expected):
+    labels = completion_data.make_progress_targets(frame_count)
+
+    assert labels.dtype == np.float32
+    np.testing.assert_array_equal(labels, np.asarray(expected, dtype=np.float32))
+    assert labels[-1] == np.float32(1.0)
+    if frame_count > 1:
+        assert labels[0] == np.float32(0.0)
+    assert np.all(np.diff(labels) >= 0.0)
+
+
+def test_progress_episode_audit_accepts_exact_float32_linear_targets(tmp_path):
+    path = tmp_path / "episode_000019.parquet"
+    _write_progress_episode(path, 19, completion_data.make_progress_targets(5))
+
+    audit = completion_data.audit_progress_episode_parquet(path, episode_id=19, expected_length=5)
+
+    assert audit.frame_count == 5
+    assert audit.task_index == 17
+    assert audit.positive_count == audit.negative_count == 0
+
+
+def test_progress_episode_audit_rejects_noncontiguous_frame_indices(tmp_path):
+    path = tmp_path / "episode_000020.parquet"
+    _write_progress_episode(
+        path,
+        20,
+        completion_data.make_progress_targets(5),
+        frame_indices=[0, 1, 3, 4, 5],
+    )
+
+    with pytest.raises(ValueError, match=r"episode 20.*frame_index must be exactly"):
+        completion_data.audit_progress_episode_parquet(path, episode_id=20, expected_length=5)
+
+
+def test_progress_episode_audit_rejects_multiple_task_indices(tmp_path):
+    path = tmp_path / "episode_000021.parquet"
+    _write_progress_episode(
+        path,
+        21,
+        completion_data.make_progress_targets(5),
+        task_indices=[4, 4, 5, 5, 5],
+    )
+
+    with pytest.raises(ValueError, match=r"episode 21.*exactly one task_index"):
+        completion_data.audit_progress_episode_parquet(path, episode_id=21, expected_length=5)
+
+
+@pytest.mark.parametrize(
+    ("labels", "message"),
+    [
+        ([0.1, 0.25, 0.5, 0.75, 1.0], "first frame"),
+        ([0.0, 0.25, 0.5, 0.75, 0.9], "last frame"),
+        ([0.0, 0.5, 0.4, 0.75, 1.0], "monotonic"),
+    ],
+)
+def test_progress_episode_audit_enforces_endpoints_and_monotonicity(tmp_path, labels, message):
+    path = tmp_path / "episode_000022.parquet"
+    _write_progress_episode(path, 22, labels)
+
+    with pytest.raises(ValueError, match=message):
+        completion_data.audit_progress_episode_parquet(path, episode_id=22, expected_length=5)
+
+
 def test_prepare_completion_data_requires_fully_mounted_parquet_files(tmp_path):
     class Metadata:
         def __init__(self):
@@ -183,6 +271,35 @@ def test_prepare_split_only_does_not_require_completion_labels_or_parquet_files(
     assert info.train_positive_count is None
     assert info.train_negative_count is None
     assert info.pos_weight is None
+
+
+def test_derived_label_dataset_can_reuse_source_manifest_identity(tmp_path):
+    class Metadata:
+        def __init__(self):
+            self.features = {}
+            self.episodes = {episode_id: {"length": 4} for episode_id in range(44)}
+
+        @staticmethod
+        def get_data_file_path(episode_id):
+            return f"data/chunk-000/episode_{episode_id:06d}.parquet"
+
+    manifest_path = tmp_path / "split.json"
+    manifest_identity = "agilex_make_breakfast_subtask_730_frozen_head"
+    completion_data.load_or_create_split_manifest(manifest_path, range(44), repo_id=manifest_identity)
+
+    info = completion_data.prepare_completion_data(
+        Metadata(),
+        repo_id="agilex_make_breakfast_subtask_730_frozen_head_progress",
+        dataset_root=tmp_path,
+        label_key="progress",
+        manifest_path=manifest_path,
+        manifest_repo_id=manifest_identity,
+        objective="progress",
+        audit_labels=False,
+    )
+
+    assert info.manifest.repo_id == manifest_identity
+    assert info.manifest.episode_ids("train")
 
 
 def test_existing_manifest_rejects_dataset_drift(tmp_path):

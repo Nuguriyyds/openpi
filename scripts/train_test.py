@@ -10,6 +10,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from openpi.models import pi0_config
@@ -111,9 +112,7 @@ def test_train_step_dispatches_action_and_head_stages_separately():
 
     def branch_calls(branch, name):
         return any(
-            isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and child.func.attr == name
+            isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == name
             for statement in branch
             for child in ast.walk(statement)
         )
@@ -126,6 +125,36 @@ def test_train_step_dispatches_action_and_head_stages_separately():
 
 def test_joint_action_completion_api_is_not_present():
     assert not hasattr(train, "compute_action_loss_and_completion_logits")
+
+
+def test_progress_validation_metrics_are_continuous_and_threshold_free():
+    logits = np.asarray([-5.0, -1.0, 0.0, 1.0, 5.0], dtype=np.float32)
+    targets = np.asarray([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+
+    metrics = train.progress_validation_metrics(logits, targets, huber_delta=0.1, prefix="progress_val")
+
+    assert set(metrics) >= {
+        "progress_val/loss",
+        "progress_val/mae",
+        "progress_val/rmse",
+        "progress_val/pearson",
+        "progress_val/spearman",
+        "progress_val/prediction_mean",
+        "progress_val/prediction_std",
+        "progress_val/prediction_min",
+        "progress_val/prediction_max",
+        "progress_val/target_mean",
+        "progress_val/target_std",
+        "progress_val/target_min",
+        "progress_val/target_max",
+        "progress_val/early_mae",
+        "progress_val/late_mae",
+    }
+    assert metrics["progress_val/frame_count"] == 5.0
+    assert metrics["progress_val/prediction_min"] >= 0.0
+    assert metrics["progress_val/prediction_max"] <= 1.0
+    assert metrics["progress_val/pearson"] > 0.9
+    assert metrics["progress_val/spearman"] > 0.9
 
 
 @pytest.mark.parametrize("config_name", ["debug"])

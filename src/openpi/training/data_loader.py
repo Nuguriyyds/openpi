@@ -130,8 +130,8 @@ class BalancedCompletionSampler(torch.utils.data.Sampler[int]):
     ):
         if batch_size < 3:
             raise ValueError("balanced completion sampling requires batch_size >= 3")
-        positive_per_batch = max(1, int(round(batch_size * positive_fraction)))
-        hard_negative_per_batch = max(1, int(round(batch_size * hard_negative_fraction)))
+        positive_per_batch = max(1, round(batch_size * positive_fraction))
+        hard_negative_per_batch = max(1, round(batch_size * hard_negative_fraction))
         ordinary_negative_per_batch = batch_size - positive_per_batch - hard_negative_per_batch
         if ordinary_negative_per_batch <= 0:
             raise ValueError("balanced completion fractions leave no ordinary negatives in a batch")
@@ -197,6 +197,122 @@ class BalancedCompletionSampler(torch.utils.data.Sampler[int]):
                     rng.choice(self._ordinary_negative_indices, self._ordinary_negative_per_batch, replace=True),
                 ]
             )
+            rng.shuffle(batch)
+            yield from (int(index) for index in batch)
+
+    def __len__(self) -> int:
+        return self._batch_count * self._batch_size
+
+
+class ProgressStratifiedSampler(torch.utils.data.Sampler[int]):
+    """Samples uniformly over ten within-subtask progress bins and episodes.
+
+    Each draw first chooses an episode uniformly from the episodes represented
+    in a bin, then chooses one of that episode's frames in the bin. That
+    two-stage draw keeps long episodes from dominating merely because they
+    contribute more frames. Draws use replacement so sparse bins stay present
+    in every batch throughout a run.
+    """
+
+    def __init__(
+        self,
+        episode_ids: Sequence[int],
+        episode_audits: typing.Mapping[int, _completion_data.EpisodeAudit],
+        *,
+        batch_size: int,
+        seed: int,
+        bin_count: int = _completion.PROGRESS_BIN_COUNT,
+    ):
+        if bin_count != _completion.PROGRESS_BIN_COUNT:
+            raise ValueError(f"progress sampling requires exactly {_completion.PROGRESS_BIN_COUNT} bins")
+        if batch_size < bin_count:
+            raise ValueError(f"progress-stratified sampling requires batch_size >= {bin_count}")
+        if not episode_ids:
+            raise ValueError("progress-stratified sampling requires at least one episode")
+
+        indices_by_bin_episode: list[dict[int, np.ndarray]] = [{} for _ in range(bin_count)]
+        offset = 0
+        for raw_episode_id in episode_ids:
+            episode_id = int(raw_episode_id)
+            audit = episode_audits[episode_id]
+            targets = _completion_data.make_progress_targets(audit.frame_count)
+            bin_indices = np.minimum((targets * bin_count).astype(np.int64), bin_count - 1)
+            for bin_index in range(bin_count):
+                local_indices = np.flatnonzero(bin_indices == bin_index)
+                if local_indices.size:
+                    indices_by_bin_episode[bin_index][episode_id] = (offset + local_indices).astype(np.int64)
+            offset += audit.frame_count
+
+        empty_bins = [bin_index for bin_index, pools in enumerate(indices_by_bin_episode) if not pools]
+        if empty_bins:
+            raise ValueError(
+                "progress-stratified sampling found no frames in progress bin(s) "
+                f"{empty_bins}; use episodes that cover all {_completion.PROGRESS_BIN_COUNT} bins"
+            )
+
+        self._indices_by_bin_episode = indices_by_bin_episode
+        self._episode_ids_by_bin = [
+            np.asarray(sorted(episode_pools), dtype=np.int64) for episode_pools in indices_by_bin_episode
+        ]
+        self._pool_sizes = {
+            f"bin_{bin_index}": int(sum(len(indices) for indices in episode_pools.values()))
+            for bin_index, episode_pools in enumerate(indices_by_bin_episode)
+        }
+        self._episode_pool_sizes = {
+            f"bin_{bin_index}": len(episode_pools) for bin_index, episode_pools in enumerate(indices_by_bin_episode)
+        }
+        self._batch_size = batch_size
+        self._bin_count = bin_count
+        self._batch_count = max(1, int(np.ceil(offset / batch_size)))
+        self._seed = seed
+        self._epoch = 0
+
+    def _batch_composition(self, batch_index: int, *, epoch: int) -> dict[str, int]:
+        base_count, remainder = divmod(self._batch_size, self._bin_count)
+        composition = {f"bin_{bin_index}": base_count for bin_index in range(self._bin_count)}
+        # Rotate the bins that receive the remainder to avoid a systematic
+        # advantage for early progress ranges when batch_size is not divisible.
+        start_bin = (epoch * self._batch_count + batch_index) % self._bin_count
+        for offset in range(remainder):
+            composition[f"bin_{(start_bin + offset) % self._bin_count}"] += 1
+        return composition
+
+    @property
+    def batch_composition(self) -> dict[str, int]:
+        """Exact composition of the first batch; remainders rotate thereafter."""
+
+        return self._batch_composition(0, epoch=self._epoch)
+
+    @property
+    def pool_sizes(self) -> dict[str, int]:
+        return dict(self._pool_sizes)
+
+    @property
+    def episode_pool_sizes(self) -> dict[str, int]:
+        return dict(self._episode_pool_sizes)
+
+    def __iter__(self) -> Iterator[int]:
+        epoch = self._epoch
+        rng = np.random.default_rng(self._seed + epoch)
+        self._epoch += 1
+        for batch_index in range(self._batch_count):
+            composition = self._batch_composition(batch_index, epoch=epoch)
+            batch_parts: list[np.ndarray] = []
+            for bin_index in range(self._bin_count):
+                count = composition[f"bin_{bin_index}"]
+                if count == 0:
+                    continue
+                episode_ids = self._episode_ids_by_bin[bin_index]
+                sampled_episode_ids = rng.choice(episode_ids, count, replace=True)
+                sampled_indices = np.asarray(
+                    [
+                        rng.choice(self._indices_by_bin_episode[bin_index][int(episode_id)])
+                        for episode_id in sampled_episode_ids
+                    ],
+                    dtype=np.int64,
+                )
+                batch_parts.append(sampled_indices)
+            batch = np.concatenate(batch_parts)
             rng.shuffle(batch)
             yield from (int(index) for index in batch)
 
@@ -400,6 +516,8 @@ def prepare_completion_data(config: _config.TrainConfig) -> _completion_data.Com
         dataset_root=metadata.root,
         label_key=config.completion.label_key,
         manifest_path=manifest_path,
+        manifest_repo_id=config.completion.split_manifest_repo_id,
+        objective=config.completion.objective,
         audit_labels=config.completion.requires_completion_labels,
         seed=config.completion.split_seed,
         episodes_per_group=config.completion.episodes_per_group,
@@ -413,7 +531,13 @@ def prepare_completion_data(config: _config.TrainConfig) -> _completion_data.Com
         len(info.manifest.episode_ids("test")),
         config.completion.requires_completion_labels,
     )
-    if info.pos_weight is not None:
+    if config.completion.uses_progress_objective:
+        logging.info(
+            "Progress train labels audited: train_episodes=%d bins=%d",
+            len(info.manifest.episode_ids("train")),
+            _completion.PROGRESS_BIN_COUNT,
+        )
+    elif info.pos_weight is not None:
         logging.info(
             "Completion train labels: positive=%d negative=%d pos_weight=%.6f",
             info.train_positive_count,
@@ -434,10 +558,7 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
     natural_train_eval: bool = False,
-) -> DataLoader[
-    tuple[_model.Observation, _model.Actions]
-    | tuple[_model.Observation, _model.Actions, jax.Array]
-]:
+) -> DataLoader[tuple[_model.Observation, _model.Actions] | tuple[_model.Observation, _model.Actions, jax.Array]]:
     """Create a data loader for training.
 
     Args:
@@ -507,10 +628,15 @@ def create_data_loader(
             if split == "train" and config.completion.balanced_sampling and not natural_train_eval
             else None
         ),
+        progress_sampling_config=(
+            config.completion
+            if split == "train" and config.completion.uses_progress_stratified_sampling and not natural_train_eval
+            else None
+        ),
         completion_episode_audits=(
             completion_data_info.episode_audits
             if split == "train"
-            and config.completion.balanced_sampling
+            and (config.completion.balanced_sampling or config.completion.uses_progress_stratified_sampling)
             and not natural_train_eval
             and completion_data_info is not None
             else None
@@ -534,6 +660,7 @@ def create_torch_data_loader(
     repeat: bool = True,
     drop_last: bool = True,
     completion_sampling_config: _completion.CompletionTrainingConfig | None = None,
+    progress_sampling_config: _completion.CompletionTrainingConfig | None = None,
     completion_episode_audits: typing.Mapping[int, _completion_data.EpisodeAudit] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
@@ -593,6 +720,25 @@ def create_torch_data_loader(
             "Balanced completion sampler: batch=%s pools=%s",
             sampler.batch_composition,
             sampler.pool_sizes,
+        )
+
+    if progress_sampling_config is not None:
+        if sampler is not None:
+            raise ValueError("progress-stratified sampling cannot be combined with another sampler")
+        if completion_episode_audits is None or data_config.episodes is None:
+            raise ValueError("progress-stratified sampling requires audited progress labels")
+        sampler = ProgressStratifiedSampler(
+            data_config.episodes,
+            completion_episode_audits,
+            batch_size=local_batch_size,
+            seed=seed,
+        )
+        logging.info(
+            "Progress-stratified sampler: batch=%s pools=%s episode_pools=%s "
+            "(replacement=True; remainder bins rotate each batch)",
+            sampler.batch_composition,
+            sampler.pool_sizes,
+            sampler.episode_pool_sizes,
         )
 
     logging.info(f"local_batch_size: {local_batch_size}")

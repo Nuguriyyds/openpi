@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal
+from typing import Final, Literal
 
 import jax
 import jax.numpy as jnp
 
 CompletionTrainingStage = Literal["disabled", "action", "head"]
+CompletionObjective = Literal["binary", "progress"]
+PROGRESS_BIN_COUNT: Final = 10
 
 
 @dataclasses.dataclass(frozen=True)
@@ -16,14 +18,22 @@ class CompletionTrainingConfig:
     """Options for the staged breakfast action/completion training workflow.
 
     ``action`` trains only the TTRTC action path while using the persisted split
-    manifest, but it does not require completion labels. ``head`` loads the S1
-    checkpoint, audits completion labels, and trains only the completion head.
-    ``disabled`` preserves the legacy training path.
+    manifest, but it does not require head labels. ``head`` loads the S1
+    checkpoint, audits labels for the selected objective, and trains only the
+    completion-head parameter path. ``disabled`` preserves the legacy path.
     """
 
     stage: CompletionTrainingStage = "disabled"
+    # ``binary`` preserves the original last-two-frames completion task.
+    # ``progress`` regresses a continuous, within-subtask [0, 1] target.
+    objective: CompletionObjective = "binary"
     label_key: str = "completion"
     split_manifest_path: str | None = None
+    # A labeled derivative can live under a different LeRobot repo_id while
+    # retaining the same episodes as the source action dataset. When set, this
+    # is the canonical dataset identity recorded in and validated against the
+    # persisted split manifest; the loader still reads ``data.repo_id``.
+    split_manifest_repo_id: str | None = None
     split_seed: int = 42
     episodes_per_group: int = 4
     val_groups: int = 5
@@ -35,6 +45,9 @@ class CompletionTrainingConfig:
     decay_lr: float = 1.0e-5
     weight_decay: float = 1.0e-4
     gradient_clip_norm: float = 1.0
+
+    # The progress objective applies Huber to sigmoid(logits), not to logits.
+    huber_delta: float = 0.1
 
     # Focal loss parameters.  When ``focal_gamma > 0`` the head training uses
     # focal loss instead of weighted BCE.  ``focal_alpha`` balances the positive
@@ -56,8 +69,12 @@ class CompletionTrainingConfig:
     def __post_init__(self) -> None:
         if self.stage not in ("disabled", "action", "head"):
             raise ValueError(f"unsupported completion training stage: {self.stage!r}")
+        if self.objective not in ("binary", "progress"):
+            raise ValueError(f"unsupported completion objective: {self.objective!r}")
         if not self.label_key:
             raise ValueError("completion.label_key must not be empty")
+        if self.split_manifest_repo_id is not None and not self.split_manifest_repo_id:
+            raise ValueError("completion.split_manifest_repo_id must not be empty when set")
         if self.episodes_per_group <= 0:
             raise ValueError("completion.episodes_per_group must be positive")
         if self.val_groups <= 0:
@@ -74,6 +91,8 @@ class CompletionTrainingConfig:
             raise ValueError("completion.weight_decay must be non-negative")
         if self.gradient_clip_norm <= 0:
             raise ValueError("completion.gradient_clip_norm must be positive")
+        if self.huber_delta <= 0:
+            raise ValueError("completion.huber_delta must be positive")
         if self.focal_gamma < 0:
             raise ValueError("completion.focal_gamma must be non-negative")
         if not 0.0 < self.focal_alpha < 1.0:
@@ -94,6 +113,15 @@ class CompletionTrainingConfig:
             raise ValueError("completion.balanced_sampling is only supported for stage 'head'")
         if self.train_episode_limit is not None and self.stage != "head":
             raise ValueError("completion.train_episode_limit is only supported for stage 'head'")
+        if self.objective == "progress":
+            if self.stage != "head":
+                raise ValueError("completion.objective='progress' is only supported for stage 'head'")
+            if self.focal_gamma != 0.0:
+                raise ValueError("progress objective does not support focal loss")
+            if self.balanced_sampling:
+                raise ValueError("progress objective uses progress-stratified sampling, not balanced_sampling")
+            if self.bce_pos_weight_override is not None:
+                raise ValueError("progress objective does not support bce_pos_weight_override")
 
     @property
     def uses_completion_data(self) -> bool:
@@ -107,7 +135,7 @@ class CompletionTrainingConfig:
 
     @property
     def requires_completion_labels(self) -> bool:
-        """Whether the raw dataset must contain audited completion labels."""
+        """Whether the raw dataset must contain audited head labels."""
 
         return self.stage == "head"
 
@@ -115,7 +143,19 @@ class CompletionTrainingConfig:
     def uses_focal_loss(self) -> bool:
         """Whether head training uses focal loss instead of weighted BCE."""
 
-        return self.focal_gamma > 0.0
+        return self.objective == "binary" and self.focal_gamma > 0.0
+
+    @property
+    def uses_progress_objective(self) -> bool:
+        """Whether head training regresses within-subtask progress."""
+
+        return self.stage == "head" and self.objective == "progress"
+
+    @property
+    def uses_progress_stratified_sampling(self) -> bool:
+        """Whether the training loader must use the progress sampler."""
+
+        return self.uses_progress_objective
 
 
 def positive_class_weight(negative_count: int, positive_count: int) -> float:
@@ -145,9 +185,7 @@ def bce_with_logits(logits: jax.Array, targets: jax.Array) -> jax.Array:
     return weighted_bce_with_logits(logits, targets, 1.0)
 
 
-def focal_loss_with_logits(
-    logits: jax.Array, targets: jax.Array, *, gamma: float, alpha: float
-) -> jax.Array:
+def focal_loss_with_logits(logits: jax.Array, targets: jax.Array, *, gamma: float, alpha: float) -> jax.Array:
     """Numerically stable focal loss with logits.
 
     ``FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)``
@@ -184,3 +222,29 @@ def focal_loss_with_logits(
     alpha_t = targets * alpha + (1.0 - targets) * (1.0 - alpha)
 
     return alpha_t * focal_weight * cross_entropy
+
+
+def progress_predictions_from_logits(logits: jax.Array) -> jax.Array:
+    """Maps FP32 completion logits to bounded continuous progress predictions."""
+
+    return jax.nn.sigmoid(jnp.asarray(logits, dtype=jnp.float32))
+
+
+def progress_huber_loss(
+    logits: jax.Array,
+    targets: jax.Array,
+    *,
+    delta: float = 0.1,
+) -> jax.Array:
+    """Per-example Huber loss on ``sigmoid(logits)`` for progress regression."""
+
+    if delta <= 0:
+        raise ValueError("progress Huber delta must be positive")
+    predictions = progress_predictions_from_logits(logits)
+    targets = jnp.asarray(targets, dtype=jnp.float32)
+    if predictions.shape != targets.shape:
+        raise ValueError(f"progress logits shape {predictions.shape} does not match targets shape {targets.shape}")
+    absolute_error = jnp.abs(predictions - targets)
+    quadratic = jnp.minimum(absolute_error, jnp.asarray(delta, dtype=jnp.float32))
+    linear = absolute_error - quadratic
+    return 0.5 * jnp.square(quadratic) + jnp.asarray(delta, dtype=jnp.float32) * linear

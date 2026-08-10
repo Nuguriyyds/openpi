@@ -88,6 +88,28 @@ def test_s2_parameter_audit_freezes_vlm_and_action_and_trains_only_head():
     assert all(path.startswith("completion_head/") for path in audit.trainable_completion)
 
 
+def test_progress_head_freeze_filter_only_unfreezes_completion_head():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        completion_head=_pi0_config.CompletionHeadConfig(enabled=True, dropout_rate=0.0),
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+
+    audit = _pi0_config.audit_frozen_vlm_parameters(
+        abstract_model,
+        config.get_completion_head_only_freeze_filter(),
+        trainable_groups=("completion",),
+    )
+
+    assert audit.frozen_vlm
+    assert audit.frozen_action
+    assert not audit.trainable_action
+    assert audit.trainable_completion
+    assert all(path.startswith("completion_head/") for path in audit.trainable_completion)
+
+
 def test_completion_disabled_preserves_legacy_model_structure():
     config = _pi0_config.Pi0Config(
         pi05=True,

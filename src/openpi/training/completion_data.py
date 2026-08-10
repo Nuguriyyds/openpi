@@ -11,6 +11,7 @@ import random
 from typing import Any, Literal
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 SplitName = Literal["train", "val", "test"]
@@ -75,6 +76,9 @@ class EpisodeAudit:
     frame_count: int
     positive_count: int
     negative_count: int
+    # Progress labels additionally audit this value. Keeping it optional
+    # preserves the binary audit's public shape and old manifests/tests.
+    task_index: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,6 +295,46 @@ def _as_scalar_array(column: Any, *, column_name: str, episode_id: int) -> np.nd
     return np.asarray(scalars)
 
 
+def make_progress_targets(frame_count: int) -> np.ndarray:
+    """Returns exact float32 linear within-episode progress targets.
+
+    A single-frame subtask is conventionally complete at its only frame. For
+    every longer episode the explicit assignments keep both endpoints bitwise
+    exact after float32 arithmetic.
+    """
+
+    if frame_count <= 0:
+        raise ValueError(f"progress labels require a positive frame count, got {frame_count}")
+    if frame_count == 1:
+        return np.ones((1,), dtype=np.float32)
+    targets = np.arange(frame_count, dtype=np.float32) / np.float32(frame_count - 1)
+    targets[0] = np.float32(0.0)
+    targets[-1] = np.float32(1.0)
+    return targets
+
+
+def _validate_episode_and_frame_indices(
+    episode_values: np.ndarray,
+    frame_values: np.ndarray,
+    *,
+    episode_id: int,
+    expected_length: int,
+) -> None:
+    if not np.all(episode_values == episode_id):
+        bad = np.flatnonzero(episode_values != episode_id).tolist()
+        raise ValueError(f"episode {episode_id} parquet contains mismatched episode_index at rows {bad}")
+    try:
+        integer_frames = frame_values.astype(np.int64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"episode {episode_id} has non-integer frame_index values") from error
+    if not np.array_equal(frame_values, integer_frames):
+        raise ValueError(f"episode {episode_id} has non-integer frame_index values: {frame_values.tolist()}")
+    if not np.array_equal(integer_frames, np.arange(expected_length, dtype=np.int64)):
+        raise ValueError(
+            f"episode {episode_id} frame_index must be exactly 0..{expected_length - 1}, got {integer_frames.tolist()}"
+        )
+
+
 def audit_episode_parquet(
     parquet_path: str | os.PathLike[str],
     *,
@@ -322,19 +366,12 @@ def audit_episode_parquet(
         raise ValueError(
             f"episode {episode_id} has {len(labels)} parquet rows but metadata length is {expected_length}"
         )
-    if not np.all(episode_values == episode_id):
-        bad = np.flatnonzero(episode_values != episode_id).tolist()
-        raise ValueError(f"episode {episode_id} parquet contains mismatched episode_index at rows {bad}")
-    try:
-        integer_frames = frame_values.astype(np.int64)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"episode {episode_id} has non-integer frame_index values") from error
-    if not np.array_equal(frame_values, integer_frames):
-        raise ValueError(f"episode {episode_id} has non-integer frame_index values: {frame_values.tolist()}")
-    if not np.array_equal(integer_frames, np.arange(expected_length, dtype=np.int64)):
-        raise ValueError(
-            f"episode {episode_id} frame_index must be exactly 0..{expected_length - 1}, got {integer_frames.tolist()}"
-        )
+    _validate_episode_and_frame_indices(
+        episode_values,
+        frame_values,
+        episode_id=episode_id,
+        expected_length=expected_length,
+    )
 
     numeric_labels = np.asarray(labels)
     valid_label_mask = np.logical_or(numeric_labels == 0, numeric_labels == 1)
@@ -383,6 +420,91 @@ def audit_episode_parquet(
     )
 
 
+def audit_progress_episode_parquet(
+    parquet_path: str | os.PathLike[str],
+    *,
+    episode_id: int,
+    expected_length: int,
+    label_key: str = "progress",
+) -> EpisodeAudit:
+    """Audits one subtask's exact float32 linear progress labels.
+
+    Progress data is deliberately stricter than the legacy completion audit:
+    every episode must contain one task index, contiguous local frame indices,
+    and the exact target implied by its own length. This prevents an episode
+    boundary or subtask-ID bug from silently becoming a regression target.
+    """
+
+    path = pathlib.Path(parquet_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"episode {episode_id} parquet file is missing: {path}")
+    parquet_file = pq.ParquetFile(path)
+    available_columns = set(parquet_file.schema_arrow.names)
+    required_columns = {"episode_index", "frame_index", "task_index", label_key}
+    missing_columns = sorted(required_columns - available_columns)
+    if missing_columns:
+        raise ValueError(f"episode {episode_id} is missing parquet field(s) {missing_columns} in {path}")
+    progress_field = parquet_file.schema_arrow.field(label_key)
+    if not pa.types.is_float32(progress_field.type):
+        raise ValueError(f"episode {episode_id} field {label_key!r} must be parquet float32, got {progress_field.type}")
+    table = parquet_file.read(columns=["episode_index", "frame_index", "task_index", label_key])
+    episode_values = _as_scalar_array(table["episode_index"], column_name="episode_index", episode_id=episode_id)
+    frame_values = _as_scalar_array(table["frame_index"], column_name="frame_index", episode_id=episode_id)
+    task_values = _as_scalar_array(table["task_index"], column_name="task_index", episode_id=episode_id)
+    labels = _as_scalar_array(table[label_key], column_name=label_key, episode_id=episode_id)
+
+    if len(labels) != expected_length:
+        raise ValueError(
+            f"episode {episode_id} has {len(labels)} parquet rows but metadata length is {expected_length}"
+        )
+    _validate_episode_and_frame_indices(
+        episode_values,
+        frame_values,
+        episode_id=episode_id,
+        expected_length=expected_length,
+    )
+    try:
+        integer_tasks = task_values.astype(np.int64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"episode {episode_id} has non-integer task_index values") from error
+    if not np.array_equal(task_values, integer_tasks):
+        raise ValueError(f"episode {episode_id} has non-integer task_index values: {task_values.tolist()}")
+    unique_tasks = np.unique(integer_tasks)
+    if len(unique_tasks) != 1:
+        raise ValueError(f"episode {episode_id} must contain exactly one task_index, got {unique_tasks.tolist()}")
+
+    try:
+        progress = np.asarray(labels, dtype=np.float32)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"episode {episode_id} field {label_key!r} contains non-numeric progress labels") from error
+    if not np.all(np.isfinite(progress)):
+        bad_rows = np.flatnonzero(~np.isfinite(progress)).tolist()
+        raise ValueError(f"episode {episode_id} field {label_key!r} contains non-finite labels at rows {bad_rows}")
+    if np.any((progress < 0.0) | (progress > 1.0)):
+        bad_rows = np.flatnonzero((progress < 0.0) | (progress > 1.0)).tolist()
+        raise ValueError(f"episode {episode_id} field {label_key!r} contains labels outside [0, 1] at rows {bad_rows}")
+    expected_progress = make_progress_targets(expected_length)
+    if expected_length > 1 and progress[0] != np.float32(0.0):
+        raise ValueError(f"episode {episode_id} progress first frame must be exactly 0.0")
+    if progress[-1] != np.float32(1.0):
+        raise ValueError(f"episode {episode_id} progress last frame must be exactly 1.0")
+    if np.any(np.diff(progress) < 0.0):
+        bad_rows = (np.flatnonzero(np.diff(progress) < 0.0) + 1).tolist()
+        raise ValueError(f"episode {episode_id} progress must be monotonic non-decreasing; offending rows {bad_rows}")
+    if not np.array_equal(progress, expected_progress):
+        raise ValueError(
+            f"episode {episode_id} field {label_key!r} must equal local_frame_index / "
+            f"(episode_length - 1): got {progress.tolist()}, expected {expected_progress.tolist()}"
+        )
+    return EpisodeAudit(
+        episode_id=episode_id,
+        frame_count=expected_length,
+        positive_count=0,
+        negative_count=0,
+        task_index=int(unique_tasks[0]),
+    )
+
+
 def prepare_completion_data(
     dataset_metadata: Any,
     *,
@@ -390,20 +512,28 @@ def prepare_completion_data(
     dataset_root: str | os.PathLike[str],
     label_key: str,
     manifest_path: str | os.PathLike[str],
+    manifest_repo_id: str | None = None,
+    objective: Literal["binary", "progress"] = "binary",
     audit_labels: bool = True,
     seed: int = 42,
     episodes_per_group: int = 4,
     val_groups: int = 5,
     test_groups: int = 5,
 ) -> CompletionDataInfo:
-    """Persists/reuses splits and optionally audits labels for head training."""
+    """Persists/reuses splits and audits labels for the selected head objective."""
 
+    if objective not in ("binary", "progress"):
+        raise ValueError(f"unsupported completion objective: {objective!r}")
+
+    if manifest_repo_id is not None and not manifest_repo_id:
+        raise ValueError("manifest_repo_id must not be empty when set")
+    canonical_manifest_repo_id = manifest_repo_id or repo_id
     episode_ids = tuple(sorted(int(episode_id) for episode_id in dataset_metadata.episodes))
     if not audit_labels:
         manifest = load_or_create_split_manifest(
             manifest_path,
             episode_ids,
-            repo_id=repo_id,
+            repo_id=canonical_manifest_repo_id,
             seed=seed,
             episodes_per_group=episodes_per_group,
             val_groups=val_groups,
@@ -418,7 +548,7 @@ def prepare_completion_data(
         )
 
     if label_key not in dataset_metadata.features:
-        raise ValueError(f"completion field {label_key!r} is missing from dataset metadata")
+        raise ValueError(f"{objective} label field {label_key!r} is missing from dataset metadata")
     root = pathlib.Path(dataset_root)
     parquet_paths = {episode_id: root / dataset_metadata.get_data_file_path(episode_id) for episode_id in episode_ids}
     missing_paths = [path for path in parquet_paths.values() if not path.is_file()]
@@ -434,20 +564,30 @@ def prepare_completion_data(
     manifest = load_or_create_split_manifest(
         manifest_path,
         episode_ids,
-        repo_id=repo_id,
+        repo_id=canonical_manifest_repo_id,
         seed=seed,
         episodes_per_group=episodes_per_group,
         val_groups=val_groups,
         test_groups=test_groups,
     )
-    audits = {}
+    audits: dict[int, EpisodeAudit] = {}
     for episode_id in episode_ids:
         episode_metadata = dataset_metadata.episodes[episode_id]
-        audits[episode_id] = audit_episode_parquet(
+        audit_fn = audit_episode_parquet if objective == "binary" else audit_progress_episode_parquet
+        audits[episode_id] = audit_fn(
             parquet_paths[episode_id],
             episode_id=episode_id,
             expected_length=int(episode_metadata["length"]),
             label_key=label_key,
+        )
+
+    if objective == "progress":
+        return CompletionDataInfo(
+            manifest=manifest,
+            episode_audits=audits,
+            train_positive_count=None,
+            train_negative_count=None,
+            pos_weight=None,
         )
 
     train_ids = manifest.episode_ids("train")
