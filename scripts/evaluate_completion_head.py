@@ -419,7 +419,11 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
 
     # JIT-compile compute_completion_logits for speed. The first call compiles;
     # subsequent calls with the same shapes reuse the cached XLA program.
-    compute_fn = nnx_utils.module_jit(model.compute_completion_logits)
+    # ``train`` must be a static argument because preprocess_observation and
+    # the completion head both branch on it with a Python ``if train:``.
+    compute_fn = nnx_utils.module_jit(
+        model.compute_completion_logits, static_argnames="train"
+    )
 
     # Determine test episodes from the split manifest.
     manifest_path = config.completion.split_manifest_path
