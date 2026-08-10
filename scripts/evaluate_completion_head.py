@@ -14,6 +14,7 @@ per-episode detection metrics (precision, recall, F1 at the best threshold).
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 from datetime import UTC, datetime
 import json
@@ -553,8 +554,17 @@ def _load_report_series(
     *,
     output_dir: Path,
     copy_videos: bool,
+    embed_videos: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Builds per-episode series for the HTML / MP4 reports."""
+    """Builds per-episode series for the HTML / MP4 reports.
+
+    Video handling (highest priority wins):
+      * ``embed_videos`` – read each video and store it as a ``data:`` URI so the
+        HTML report is fully self-contained (works when downloaded as a single file).
+      * ``copy_videos``  – copy video files into ``<output_dir>/videos/`` and
+        reference them via a relative path.
+      * otherwise        – reference the source video via a ``file://`` URI.
+    """
 
     meta_dir = dataset_root / "meta"
     info = _read_json(meta_dir / "info.json")
@@ -573,7 +583,7 @@ def _load_report_series(
         targets = values["target"]
 
     videos_dir = output_dir / "videos"
-    if copy_videos:
+    if copy_videos and not embed_videos:
         videos_dir.mkdir(parents=True, exist_ok=True)
 
     series: list[dict[str, Any]] = []
@@ -602,7 +612,12 @@ def _load_report_series(
         )
         if not source_video.is_file():
             raise FileNotFoundError(f"Top-camera video not found: {source_video}")
-        if copy_videos:
+
+        if embed_videos:
+            video_data = source_video.read_bytes()
+            video_b64 = base64.b64encode(video_data).decode("ascii")
+            video_path = f"data:video/mp4;base64,{video_b64}"
+        elif copy_videos:
             destination = videos_dir / f"episode_{episode_index:06d}.mp4"
             shutil.copy2(source_video, destination)
             video_path = destination.relative_to(output_dir).as_posix()
@@ -1294,6 +1309,7 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         series, _ = _load_report_series(
             dataset_root, prediction_file, metrics["episodes"],
             output_dir=report_dir, copy_videos=args.copy_videos,
+            embed_videos=args.embed_videos,
         )
         manifest = {
             "checkpoint_step": step,
@@ -1339,6 +1355,7 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             "noise_seed": args.seed,
             "threshold": args.threshold,
             "copy_videos": args.copy_videos,
+            "embed_videos": args.embed_videos,
             "export_mp4": args.export_mp4,
         },
         "started_at_utc": started_at.isoformat(),
@@ -1375,7 +1392,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-copy-videos",
         dest="copy_videos", action="store_false",
-        help="Reference dataset videos by absolute file URI instead of copying them into each HTML report.",
+        help="When videos are not embedded, reference them by absolute file URI instead of copying them "
+        "into each HTML report. Ignored when --no-embed-videos is not also passed.",
+    )
+    parser.add_argument(
+        "--no-embed-videos",
+        dest="embed_videos", action="store_false",
+        help="Do not embed videos as base64 data URIs. By default videos are embedded so each HTML "
+        "report is a self-contained file that works when downloaded standalone.",
     )
     parser.add_argument(
         "--export-mp4", action="store_true",
@@ -1384,7 +1408,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable used by --export-mp4.")
     parser.add_argument("--worker-checkpoint", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
-    parser.set_defaults(copy_videos=True)
+    parser.set_defaults(copy_videos=True, embed_videos=True)
     args = parser.parse_args()
 
     if args.batch_size < 1:
