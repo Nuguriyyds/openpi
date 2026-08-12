@@ -325,9 +325,11 @@ def test_window_completion_targets_flat_over_trailing_window(frame_count, window
     np.testing.assert_array_equal(targets, np.asarray(expected, dtype=np.float32))
 
 
-def test_window_completion_targets_rejects_episode_shorter_than_window():
-    with pytest.raises(ValueError, match="shorter than window_frames"):
-        completion_data.make_window_completion_targets(2, 3)
+def test_window_completion_targets_exempts_episode_shorter_than_window():
+    targets = completion_data.make_window_completion_targets(2, 3)
+
+    assert targets.dtype == np.float32
+    np.testing.assert_array_equal(targets, np.asarray([0.0, 0.0], dtype=np.float32))
 
 
 @pytest.mark.parametrize(
@@ -347,9 +349,11 @@ def test_window_progress_targets_ramp_over_trailing_window(frame_count, window_f
     assert targets[-1] == np.float32(1.0)
 
 
-def test_window_progress_targets_rejects_episode_shorter_than_window():
-    with pytest.raises(ValueError, match="shorter than window_frames"):
-        completion_data.make_window_progress_targets(2, 3, 0.5)
+def test_window_progress_targets_exempts_episode_shorter_than_window():
+    targets = completion_data.make_window_progress_targets(2, 3, 0.5)
+
+    assert targets.dtype == np.float32
+    np.testing.assert_array_equal(targets, np.asarray([0.0, 0.0], dtype=np.float32))
 
 
 @pytest.mark.parametrize("bad_ramp_start", [-0.1, 1.0, 1.5])
@@ -420,4 +424,27 @@ def test_window_progress_episode_audit_rejects_mismatched_ramp(tmp_path):
     with pytest.raises(ValueError, match=r"episode 52.*tail-window ramp"):
         completion_data.audit_window_progress_episode_parquet(
             path, episode_id=52, expected_length=5, window_frames=3, ramp_start=0.5
+        )
+
+
+def test_window_progress_episode_audit_accepts_all_zero_shorter_episode(tmp_path):
+    """Mirrors the real 1-frame episode 2797: too short for the window, labeled all-0."""
+
+    path = tmp_path / "episode_002797.parquet"
+    _write_progress_episode(path, 2797, [0.0])
+
+    audit = completion_data.audit_window_progress_episode_parquet(
+        path, episode_id=2797, expected_length=1, window_frames=15, ramp_start=0.8
+    )
+
+    assert audit.frame_count == 1
+
+
+def test_window_progress_episode_audit_rejects_nonzero_label_on_shorter_episode(tmp_path):
+    path = tmp_path / "episode_000053.parquet"
+    _write_progress_episode(path, 53, [0.5])
+
+    with pytest.raises(ValueError, match=r"episode 53.*shorter than.*all labels must be 0"):
+        completion_data.audit_window_progress_episode_parquet(
+            path, episode_id=53, expected_length=1, window_frames=15, ramp_start=0.8
         )

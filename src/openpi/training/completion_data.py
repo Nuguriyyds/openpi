@@ -316,25 +316,20 @@ def make_progress_targets(frame_count: int) -> np.ndarray:
 def make_window_completion_targets(frame_count: int, window_frames: int) -> np.ndarray:
     """Returns exact float32 labels: ``1.0`` over the trailing ``window_frames``.
 
-    Every frame before the trailing window is ``0.0``. Callers must ensure
-    ``frame_count >= window_frames``; an episode shorter than the window is
-    not expected to occur in this dataset (episode lengths are checked
-    up front by the label-generation script) and is treated as an error
-    here rather than given ad-hoc semantics, since padding the window with
-    frames borrowed from an adjacent episode would mean labeling frames
-    already annotated as the next subtask as if they still belonged to
-    this one.
+    Every frame before the trailing window is ``0.0``. An episode shorter
+    than the window is exempt from the window rule and labeled all-``0.0``
+    instead, mirroring the legacy ``frame_count < 2`` exemption of
+    ``audit_episode_parquet`` — the window doesn't fully fit inside such a
+    short episode's own timeline, and padding it with frames borrowed from an
+    adjacent episode would mean labeling frames already annotated as the next
+    subtask as if they still belonged to this one.
     """
 
     if window_frames <= 0:
         raise ValueError(f"window_frames must be positive, got {window_frames}")
-    if frame_count < window_frames:
-        raise ValueError(
-            f"episode has {frame_count} frame(s), shorter than window_frames={window_frames}; "
-            "episodes this short are not expected in this dataset"
-        )
     targets = np.zeros(frame_count, dtype=np.float32)
-    targets[-window_frames:] = np.float32(1.0)
+    if frame_count >= window_frames:
+        targets[-window_frames:] = np.float32(1.0)
     return targets
 
 
@@ -343,19 +338,16 @@ def make_window_progress_targets(frame_count: int, window_frames: int, ramp_star
     linear ramp from ``ramp_start`` to ``1.0`` across the trailing ``window_frames``.
 
     See ``make_window_completion_targets`` for why ``frame_count < window_frames``
-    is treated as an error rather than a special case.
+    is exempt (labeled all-``0.0``) rather than padded from another episode.
     """
 
     if window_frames <= 0:
         raise ValueError(f"window_frames must be positive, got {window_frames}")
     if not 0.0 <= ramp_start < 1.0:
         raise ValueError(f"ramp_start must be in [0, 1), got {ramp_start}")
-    if frame_count < window_frames:
-        raise ValueError(
-            f"episode has {frame_count} frame(s), shorter than window_frames={window_frames}; "
-            "episodes this short are not expected in this dataset"
-        )
     targets = np.zeros(frame_count, dtype=np.float32)
+    if frame_count < window_frames:
+        return targets
     if window_frames == 1:
         ramp = np.ones(1, dtype=np.float32)
     else:
@@ -577,13 +569,11 @@ def audit_window_progress_episode_parquet(
     """Audits one subtask's exact float32 tail-window ramp labels.
 
     Same structural checks as ``audit_progress_episode_parquet`` (single
-    ``task_index``, contiguous frame indices, finite values in ``[0, 1]``,
-    monotonic non-decreasing, last frame exactly ``1.0``), but compares
-    against ``make_window_progress_targets`` instead of the full-episode
-    linear ramp. Unlike the full-episode ramp, the first frame is not
-    required to be exactly ``0.0`` when ``expected_length == window_frames``
-    (the whole episode is then inside the ramp, so its first frame is
-    ``ramp_start``); the final exact-array comparison catches this either way.
+    ``task_index``, contiguous frame indices, finite values in ``[0, 1]``),
+    but compares against ``make_window_progress_targets`` instead of the
+    full-episode linear ramp. An episode shorter than ``window_frames`` is
+    exempt (must be all-``0.0``, matching ``make_window_progress_targets``'s
+    own exemption) rather than required to end at exactly ``1.0``.
     """
 
     path = pathlib.Path(parquet_path)
@@ -634,11 +624,20 @@ def audit_window_progress_episode_parquet(
     if np.any((progress < 0.0) | (progress > 1.0)):
         bad_rows = np.flatnonzero((progress < 0.0) | (progress > 1.0)).tolist()
         raise ValueError(f"episode {episode_id} field {label_key!r} contains labels outside [0, 1] at rows {bad_rows}")
-    if progress[-1] != np.float32(1.0):
-        raise ValueError(f"episode {episode_id} progress last frame must be exactly 1.0")
-    if np.any(np.diff(progress) < 0.0):
-        bad_rows = (np.flatnonzero(np.diff(progress) < 0.0) + 1).tolist()
-        raise ValueError(f"episode {episode_id} progress must be monotonic non-decreasing; offending rows {bad_rows}")
+    if expected_length < window_frames:
+        positive_rows = np.flatnonzero(progress != 0.0).tolist()
+        if positive_rows:
+            raise ValueError(
+                f"episode {episode_id} has only {expected_length} frame(s), shorter than "
+                f"window_frames={window_frames}; all labels must be 0.0, but found nonzero "
+                f"labels at frames {positive_rows}"
+            )
+    else:
+        if progress[-1] != np.float32(1.0):
+            raise ValueError(f"episode {episode_id} progress last frame must be exactly 1.0")
+        if np.any(np.diff(progress) < 0.0):
+            bad_rows = (np.flatnonzero(np.diff(progress) < 0.0) + 1).tolist()
+            raise ValueError(f"episode {episode_id} progress must be monotonic non-decreasing; offending rows {bad_rows}")
     expected_progress = make_window_progress_targets(expected_length, window_frames, ramp_start)
     if not np.array_equal(progress, expected_progress):
         raise ValueError(

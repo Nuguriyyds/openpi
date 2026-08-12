@@ -8,10 +8,10 @@ Pass ``--window-seconds`` to switch to a tail-window scheme instead: the last
 ``round(window_seconds * fps)`` frames of each episode are labeled ``1.0``,
 everything before is ``0.0``. This is a wider version of the same last-N-frames
 idea, meant to give the completion head a denser positive region to learn
-from. Episodes shorter than the window are not expected to occur in this
-dataset; the script checks episode lengths against the window up front and
-fails with the specific offending episode IDs rather than guessing a label
-for them (see ``--dry-run``).
+from. Episodes shorter than the window don't fully fit it and are labeled
+``0.0`` everywhere, same as the legacy 2-frame rule's exemption; the script
+prints a warning listing any such episodes before writing anything (see
+``--dry-run``) so you can review them, but generation proceeds automatically.
 
 The original dataset is never modified — all output is written to
 ``--output-root``.  The new dataset preserves the full LeRobot v2.1 layout
@@ -65,11 +65,16 @@ def read_fps(meta_dir: pathlib.Path) -> float:
     return fps
 
 
-def check_episode_lengths_fit_window(episode_lengths: dict[int, int], window_frames: int) -> None:
-    """Fails loudly, listing offenders, instead of guessing a label for them.
+def warn_episodes_shorter_than_window(episode_lengths: dict[int, int], window_frames: int) -> None:
+    """Prints the episodes that don't fully fit the window; they'll be labeled all-0.
 
-    Episodes shorter than the window are not expected in this dataset (see
-    module docstring); this is a safety check, not a designed-for code path.
+    This is informational only — generation proceeds either way. An episode
+    shorter than the window is exempt from the window rule for the same
+    reason a <2-frame episode is exempt from the legacy last-2-frames rule:
+    the window doesn't fully fit inside its own timeline, and padding it with
+    frames borrowed from an adjacent episode would mean labeling frames
+    already annotated as the next subtask as if they still belonged to
+    this one.
     """
 
     too_short = {
@@ -79,10 +84,9 @@ def check_episode_lengths_fit_window(episode_lengths: dict[int, int], window_fra
         preview = ", ".join(f"{episode_id}:{length}" for episode_id, length in sorted(too_short.items())[:10])
         remaining = len(too_short) - 10
         suffix = f", and {remaining} more" if remaining > 0 else ""
-        raise ValueError(
-            f"{len(too_short)} episode(s) are shorter than window_frames={window_frames}: {preview}{suffix}. "
-            "These episodes are not expected to be this short; decide by hand how to handle them "
-            "before re-running (this script never pads a short window with frames from another episode)."
+        print(
+            f"  {len(too_short)} episode(s) are shorter than window_frames={window_frames} and will be "
+            f"labeled all-0.0: {preview}{suffix}"
         )
 
 
@@ -309,9 +313,9 @@ def main() -> None:
             f"Window         : {args.window_seconds}s @ {fps} fps = {window_frames} frames "
             f"(episode lengths: min={lengths[0]}, median={lengths[len(lengths) // 2]}, max={lengths[-1]})"
         )
-        # Fails loudly here, before any output is written, if any episode is
-        # shorter than the window (see module docstring — not expected).
-        check_episode_lengths_fit_window(episode_lengths, window_frames)
+        # Informational: episodes shorter than the window will be labeled
+        # all-0 (see module docstring); nothing here blocks generation.
+        warn_episodes_shorter_than_window(episode_lengths, window_frames)
     else:
         short_episodes = {eid: length for eid, length in episode_lengths.items() if length < 2}
         if short_episodes:

@@ -104,13 +104,19 @@ def test_make_window_progress_labels():
     np.testing.assert_allclose(labels, np.asarray([0.0, 0.0, 0.5, 0.75, 1.0], dtype=np.float32), atol=1e-6)
 
 
-def test_check_episode_lengths_fit_window_reports_offending_episodes():
-    with pytest.raises(ValueError, match=r"episode\(s\) are shorter than window_frames=10.*3:5"):
-        label_progress.check_episode_lengths_fit_window({1: 20, 3: 5, 7: 15}, 10)
+def test_warn_episodes_shorter_than_window_reports_offenders(capsys):
+    label_progress.warn_episodes_shorter_than_window({1: 20, 3: 5, 7: 15}, 10)
+
+    captured = capsys.readouterr()
+    assert "window_frames=10" in captured.out
+    assert "3:5" in captured.out
 
 
-def test_check_episode_lengths_fit_window_accepts_when_all_long_enough():
-    label_progress.check_episode_lengths_fit_window({1: 20, 3: 15, 7: 30}, 10)
+def test_warn_episodes_shorter_than_window_silent_when_all_long_enough(capsys):
+    label_progress.warn_episodes_shorter_than_window({1: 20, 3: 15, 7: 30}, 10)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
 
 
 def test_process_parquet_writes_window_ramp_labels(tmp_path):
@@ -128,6 +134,25 @@ def test_process_parquet_writes_window_ramp_labels(tmp_path):
         output["progress"].combine_chunks().to_numpy(),
         np.asarray([0.0, 0.0, 0.5, 0.75, 1.0], dtype=np.float32),
         atol=1e-6,
+    )
+
+
+def test_process_parquet_labels_episode_shorter_than_window_all_zero(tmp_path):
+    """Mirrors the real 1-frame episode 2797: too short for a 15-frame window."""
+
+    source = tmp_path / "episode_002797.parquet"
+    destination = tmp_path / "out" / source.name
+    _write_source_episode(source, 2797, 1)
+
+    result = label_progress.process_parquet(
+        source, destination, 1, force=False, resume=False, window_frames=15, ramp_start=0.8
+    )
+    output = pq.read_table(destination)
+
+    assert result == {"skipped": 0, "written": 1}
+    np.testing.assert_array_equal(
+        output["progress"].combine_chunks().to_numpy(),
+        np.asarray([0.0], dtype=np.float32),
     )
 
 
