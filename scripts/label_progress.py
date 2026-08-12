@@ -5,6 +5,14 @@ Each source episode is treated as one breakfast subtask. Its target is
 at its only frame and therefore receives ``1.0``. The source dataset is only
 read. All metadata, parquet, and optional videos are written below
 ``--output-root``.
+
+Pass ``--window-seconds`` (together with ``--ramp-start``) to switch to a
+tail-window ramp instead: every frame before the trailing
+``round(window_seconds * fps)`` frames is ``0.0``, and those trailing frames
+ramp linearly from ``ramp_start`` up to ``1.0``. Episodes shorter than the
+window are not expected to occur in this dataset; the script checks episode
+lengths against the window up front and fails with the specific offending
+episode IDs rather than guessing a label for them (see ``--dry-run``).
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ import pyarrow.parquet as pq
 import tqdm
 
 from openpi.training.completion_data import make_progress_targets
+from openpi.training.completion_data import make_window_progress_targets
 
 DEFAULT_SRC_ROOT = "/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730"
 LABEL_KEY = "progress"
@@ -42,10 +51,47 @@ def load_episode_lengths(meta_dir: pathlib.Path) -> dict[int, int]:
     return lengths
 
 
+def read_fps(meta_dir: pathlib.Path) -> float:
+    """Reads the dataset-wide frames-per-second from ``info.json``."""
+
+    info = json.loads((meta_dir / "info.json").read_text(encoding="utf-8"))
+    fps = float(info["fps"])
+    if fps <= 0:
+        raise ValueError(f"dataset fps must be positive, got {fps}")
+    return fps
+
+
+def check_episode_lengths_fit_window(episode_lengths: dict[int, int], window_frames: int) -> None:
+    """Fails loudly, listing offenders, instead of guessing a label for them.
+
+    Episodes shorter than the window are not expected in this dataset (see
+    module docstring); this is a safety check, not a designed-for code path.
+    """
+
+    too_short = {
+        episode_id: length for episode_id, length in episode_lengths.items() if length < window_frames
+    }
+    if too_short:
+        preview = ", ".join(f"{episode_id}:{length}" for episode_id, length in sorted(too_short.items())[:10])
+        remaining = len(too_short) - 10
+        suffix = f", and {remaining} more" if remaining > 0 else ""
+        raise ValueError(
+            f"{len(too_short)} episode(s) are shorter than window_frames={window_frames}: {preview}{suffix}. "
+            "These episodes are not expected to be this short; decide by hand how to handle them "
+            "before re-running (this script never pads a short window with frames from another episode)."
+        )
+
+
 def make_progress_labels(num_frames: int) -> np.ndarray:
     """Returns the exact float32 labels required for one subtask episode."""
 
     return make_progress_targets(num_frames)
+
+
+def make_window_progress_labels(num_frames: int, window_frames: int, ramp_start: float) -> np.ndarray:
+    """Returns the exact float32 tail-window ramp labels for one subtask episode."""
+
+    return make_window_progress_targets(num_frames, window_frames, ramp_start)
 
 
 def _scalar_array(column: pa.ChunkedArray, *, name: str, episode_id: int) -> np.ndarray:
@@ -105,7 +151,14 @@ def validate_source_table(table: pa.Table, *, episode_id: int, expected_length: 
     return int(unique_tasks[0])
 
 
-def _validate_existing_progress_table(table: pa.Table, *, episode_id: int, expected_length: int) -> None:
+def _validate_existing_progress_table(
+    table: pa.Table,
+    *,
+    episode_id: int,
+    expected_length: int,
+    window_frames: int | None = None,
+    ramp_start: float | None = None,
+) -> None:
     validate_source_table(table, episode_id=episode_id, expected_length=expected_length)
     if LABEL_KEY not in table.column_names:
         raise ValueError(f"episode {episode_id} destination is missing {LABEL_KEY!r}")
@@ -113,9 +166,15 @@ def _validate_existing_progress_table(table: pa.Table, *, episode_id: int, expec
     if not pa.types.is_float32(field.type):
         raise ValueError(f"episode {episode_id} destination {LABEL_KEY!r} must be float32, got {field.type}")
     labels = _scalar_array(table[LABEL_KEY], name=LABEL_KEY, episode_id=episode_id).astype(np.float32)
-    expected = make_progress_labels(expected_length)
+    if window_frames is not None:
+        assert ramp_start is not None
+        expected = make_window_progress_labels(expected_length, window_frames, ramp_start)
+        description = "tail-window ramp target"
+    else:
+        expected = make_progress_labels(expected_length)
+        description = "linear progress target"
     if not np.array_equal(labels, expected):
-        raise ValueError(f"episode {episode_id} destination {LABEL_KEY!r} is not the expected linear progress target")
+        raise ValueError(f"episode {episode_id} destination {LABEL_KEY!r} is not the expected {description}")
 
 
 def update_hf_schema_metadata(table: pa.Table) -> pa.Table:
@@ -147,6 +206,8 @@ def process_parquet(
     *,
     force: bool,
     resume: bool,
+    window_frames: int | None = None,
+    ramp_start: float | None = None,
 ) -> dict[str, int]:
     """Copies one parquet unchanged except for a verified float32 progress field."""
 
@@ -161,10 +222,20 @@ def process_parquet(
                 raise FileExistsError(
                     f"destination already contains {LABEL_KEY!r}: {dst_path}; use --resume to validate/skip or --force"
                 )
-            _validate_existing_progress_table(destination_table, episode_id=episode_id, expected_length=expected_length)
+            _validate_existing_progress_table(
+                destination_table,
+                episode_id=episode_id,
+                expected_length=expected_length,
+                window_frames=window_frames,
+                ramp_start=ramp_start,
+            )
             return {"skipped": 1, "written": 0}
 
-    labels = pa.array(make_progress_labels(expected_length), type=pa.float32())
+    if window_frames is not None:
+        assert ramp_start is not None
+        labels = pa.array(make_window_progress_labels(expected_length, window_frames, ramp_start), type=pa.float32())
+    else:
+        labels = pa.array(make_progress_labels(expected_length), type=pa.float32())
     if LABEL_KEY in source_table.column_names:
         column_index = source_table.schema.get_field_index(LABEL_KEY)
         output_table = source_table.set_column(column_index, LABEL_KEY, labels)
@@ -179,8 +250,8 @@ def process_parquet(
     return {"skipped": 0, "written": 1}
 
 
-def _process_parquet_worker(args: tuple[str, str, int, bool, bool]) -> dict[str, Any]:
-    src, dst, expected_length, force, resume = args
+def _process_parquet_worker(args: tuple[str, str, int, bool, bool, int | None, float | None]) -> dict[str, Any]:
+    src, dst, expected_length, force, resume, window_frames, ramp_start = args
     try:
         return process_parquet(
             pathlib.Path(src),
@@ -188,6 +259,8 @@ def _process_parquet_worker(args: tuple[str, str, int, bool, bool]) -> dict[str,
             expected_length,
             force=force,
             resume=resume,
+            window_frames=window_frames,
+            ramp_start=ramp_start,
         )
     except Exception as error:
         return {"error": str(error), "src": src}
@@ -222,7 +295,13 @@ def validate_source_jobs(jobs: list[tuple[pathlib.Path, pathlib.Path, int]]) -> 
         validate_source_table(table, episode_id=int(src_path.stem.split("_")[1]), expected_length=expected_length)
 
 
-def write_meta(src_meta: pathlib.Path, dst_meta: pathlib.Path) -> None:
+def write_meta(
+    src_meta: pathlib.Path,
+    dst_meta: pathlib.Path,
+    *,
+    window_seconds: float | None = None,
+    ramp_start: float | None = None,
+) -> None:
     """Copies metadata and atomically adds the progress feature to info.json."""
 
     dst_meta.mkdir(parents=True, exist_ok=True)
@@ -236,6 +315,12 @@ def write_meta(src_meta: pathlib.Path, dst_meta: pathlib.Path) -> None:
             shutil.copytree(item, destination, dirs_exist_ok=True)
     info = json.loads((src_meta / "info.json").read_text(encoding="utf-8"))
     info.setdefault("features", {})[LABEL_KEY] = dict(PROGRESS_FEATURE)
+    if window_seconds is not None:
+        info["window_seconds"] = window_seconds
+        info["ramp_start"] = ramp_start
+    else:
+        info.pop("window_seconds", None)
+        info.pop("ramp_start", None)
     info_path = dst_meta / "info.json"
     temporary_path = info_path.with_suffix(".json.tmp")
     temporary_path.write_text(json.dumps(info, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -253,11 +338,33 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Rewrite destination parquets even when progress exists.")
     parser.add_argument("--skip-videos", action="store_true")
+    parser.add_argument(
+        "--window-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Switch to a tail-window ramp: frames before the trailing round(window_seconds * fps) "
+            "frames are 0.0, and those trailing frames ramp from --ramp-start to 1.0. Requires "
+            "--ramp-start. Unset preserves the legacy full-episode linear ramp."
+        ),
+    )
+    parser.add_argument(
+        "--ramp-start",
+        type=float,
+        default=None,
+        help="Value the tail-window ramp starts at (must be in [0, 1)). Requires --window-seconds.",
+    )
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.resume and args.force:
         parser.error("--resume and --force are mutually exclusive")
+    if (args.window_seconds is None) != (args.ramp_start is None):
+        parser.error("--window-seconds and --ramp-start must be set together")
+    if args.window_seconds is not None and args.window_seconds <= 0:
+        parser.error("--window-seconds must be positive")
+    if args.ramp_start is not None and not 0.0 <= args.ramp_start < 1.0:
+        parser.error("--ramp-start must be in [0, 1)")
     return args
 
 
@@ -276,6 +383,23 @@ def main() -> int:
     print(f"Output dataset : {dst_root}")
     print(f"Episodes       : {len(episode_lengths)}")
     print(f"Parquet files  : {len(jobs)}")
+
+    window_frames: int | None = None
+    if args.window_seconds is not None:
+        fps = read_fps(src_root / "meta")
+        window_frames = round(args.window_seconds * fps)
+        if window_frames <= 0:
+            raise ValueError(f"--window-seconds={args.window_seconds} at fps={fps} rounds to a non-positive window")
+        lengths = sorted(episode_lengths.values())
+        print(
+            f"Window         : {args.window_seconds}s @ {fps} fps = {window_frames} frames, "
+            f"ramp_start={args.ramp_start} "
+            f"(episode lengths: min={lengths[0]}, median={lengths[len(lengths) // 2]}, max={lengths[-1]})"
+        )
+        # Fails loudly here, before any output is written, if any episode is
+        # shorter than the window (see module docstring — not expected).
+        check_episode_lengths_fit_window(episode_lengths, window_frames)
+
     print("Validating every source episode (frame_index and task_index) ...")
     validate_source_jobs(jobs)
 
@@ -283,11 +407,14 @@ def main() -> int:
         print("[DRY RUN] Source audit passed; no output files were written.")
         return 0
 
-    write_meta(src_root / "meta", dst_root / "meta")
+    write_meta(src_root / "meta", dst_root / "meta", window_seconds=args.window_seconds, ramp_start=args.ramp_start)
     if not args.skip_videos and (src_root / "videos").exists():
         shutil.copytree(src_root / "videos", dst_root / "videos", dirs_exist_ok=True)
 
-    work_items = [(str(src), str(dst), length, args.force, args.resume) for src, dst, length in jobs]
+    work_items = [
+        (str(src), str(dst), length, args.force, args.resume, window_frames, args.ramp_start)
+        for src, dst, length in jobs
+    ]
     written = 0
     skipped = 0
     errors: list[dict[str, Any]] = []

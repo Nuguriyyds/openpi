@@ -1221,6 +1221,143 @@ _CONFIGS = [
         fsdp_devices=2,
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
+    # Tail-window variant of the binary completion head: the labeled dataset
+    # (produced by scripts/label_completion.py --window-seconds ...) marks the
+    # last `window_seconds` of each subtask as 1, instead of only the last 2
+    # frames. Same S1 checkpoint, split manifest, and hyperparameters as
+    # s2_completion_head; only the label dataset and its repo_id differ.
+    TrainConfig(
+        name="pi05_agilex_breakfast_frozen_head_s2_completion_window",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="agilex_make_breakfast_subtask_730_frozen_head_completion_window",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/models/wyt/data",
+            ),
+        ),
+        training_time_rtc=_ttrtc.TrainingTimeRTCConfig(
+            enabled=True,
+            simulated_delay=5,
+            delay_sampling="exponential",
+            clean_timestep=0.0,
+            loss_normalization="reference",
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            label_key="completion",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_subtask_730_frozen_head.json"
+            ),
+            split_manifest_repo_id="agilex_make_breakfast_subtask_730_frozen_head",
+            split_seed=42,
+            episodes_per_group=4,
+            val_groups=5,
+            test_groups=5,
+            val_interval=200,
+            warmup_steps=50,
+            peak_lr=3e-5,
+            decay_lr=3e-6,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+            focal_gamma=2.0,
+            focal_alpha=0.25,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_frozen_head_s1_action/s1_action/49999/params",
+            missing_regex=r"completion_head/.*",
+        ),
+        num_train_steps=2_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        batch_size=64,
+        num_workers=4,
+        log_interval=100,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=2,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
+    # Tail-window variant of the progress head: the labeled dataset (produced
+    # by scripts/label_progress.py --window-seconds ... --ramp-start ...)
+    # ramps from ramp_start to 1 over the last window_seconds of each subtask
+    # instead of ramping linearly over the whole subtask. Same S1 checkpoint,
+    # split manifest, and hyperparameters as s2_progress_head; only the label
+    # dataset and its repo_id differ.
+    TrainConfig(
+        name="pi05_agilex_breakfast_frozen_head_s2_progress_window",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True, dropout_rate=0.0),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="agilex_make_breakfast_subtask_730_frozen_head_progress_window",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/models/wyt/data",
+            ),
+        ),
+        training_time_rtc=_ttrtc.TrainingTimeRTCConfig(
+            enabled=True,
+            simulated_delay=5,
+            delay_sampling="exponential",
+            clean_timestep=0.0,
+            loss_normalization="reference",
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            objective="progress",
+            label_key="progress",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_subtask_730_frozen_head.json"
+            ),
+            split_manifest_repo_id="agilex_make_breakfast_subtask_730_frozen_head",
+            split_seed=42,
+            episodes_per_group=4,
+            val_groups=5,
+            test_groups=5,
+            val_interval=200,
+            warmup_steps=50,
+            peak_lr=3e-5,
+            decay_lr=3e-6,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+            huber_delta=0.1,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True, dropout_rate=0.0),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_frozen_head_s1_action/s1_action/49999/params",
+            missing_regex=r"completion_head/.*",
+        ),
+        num_train_steps=2_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        batch_size=64,
+        num_workers=4,
+        log_interval=100,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=2,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
     #
     # Fine-tuning Aloha configs.
     #

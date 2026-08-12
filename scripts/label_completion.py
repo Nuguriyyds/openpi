@@ -4,6 +4,15 @@ Each episode's final 2 frames are labeled ``1.0``; every other frame is ``0.0``.
 Episodes shorter than 2 frames are labeled ``0.0`` everywhere (they cannot
 satisfy the last-two-frames rule and are exempt from that part of the audit).
 
+Pass ``--window-seconds`` to switch to a tail-window scheme instead: the last
+``round(window_seconds * fps)`` frames of each episode are labeled ``1.0``,
+everything before is ``0.0``. This is a wider version of the same last-N-frames
+idea, meant to give the completion head a denser positive region to learn
+from. Episodes shorter than the window are not expected to occur in this
+dataset; the script checks episode lengths against the window up front and
+fails with the specific offending episode IDs rather than guessing a label
+for them (see ``--dry-run``).
+
 The original dataset is never modified — all output is written to
 ``--output-root``.  The new dataset preserves the full LeRobot v2.1 layout
 (``meta/``, ``data/``, ``videos/``) so it can be used as a drop-in replacement
@@ -25,6 +34,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import tqdm
 
+from openpi.training.completion_data import make_window_completion_targets
+
 DEFAULT_SRC_ROOT = "/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730"
 COMPLETION_FEATURE = {"dtype": "float32", "shape": [1], "names": None}
 COMPLETION_HF_FEATURE = {"dtype": "float32", "_type": "Value"}
@@ -42,6 +53,37 @@ def load_episode_lengths(meta_dir: pathlib.Path) -> dict[int, int]:
         record = json.loads(line)
         lengths[int(record["episode_index"])] = int(record["length"])
     return lengths
+
+
+def read_fps(meta_dir: pathlib.Path) -> float:
+    """Reads the dataset-wide frames-per-second from ``info.json``."""
+
+    info = json.loads((meta_dir / "info.json").read_text(encoding="utf-8"))
+    fps = float(info["fps"])
+    if fps <= 0:
+        raise ValueError(f"dataset fps must be positive, got {fps}")
+    return fps
+
+
+def check_episode_lengths_fit_window(episode_lengths: dict[int, int], window_frames: int) -> None:
+    """Fails loudly, listing offenders, instead of guessing a label for them.
+
+    Episodes shorter than the window are not expected in this dataset (see
+    module docstring); this is a safety check, not a designed-for code path.
+    """
+
+    too_short = {
+        episode_id: length for episode_id, length in episode_lengths.items() if length < window_frames
+    }
+    if too_short:
+        preview = ", ".join(f"{episode_id}:{length}" for episode_id, length in sorted(too_short.items())[:10])
+        remaining = len(too_short) - 10
+        suffix = f", and {remaining} more" if remaining > 0 else ""
+        raise ValueError(
+            f"{len(too_short)} episode(s) are shorter than window_frames={window_frames}: {preview}{suffix}. "
+            "These episodes are not expected to be this short; decide by hand how to handle them "
+            "before re-running (this script never pads a short window with frames from another episode)."
+        )
 
 
 def make_completion_labels(num_frames: int) -> np.ndarray:
@@ -86,6 +128,7 @@ def process_parquet(
     expected_length: int,
     *,
     force: bool,
+    window_frames: int | None = None,
 ) -> dict[str, int]:
     """Reads a source parquet, appends ``completion``, writes to ``dst_path``."""
 
@@ -102,7 +145,10 @@ def process_parquet(
         if LABEL_KEY in existing.schema_arrow.names and not force:
             return {"skipped": 1, "written": 0}
 
-    labels = make_completion_labels(num_rows)
+    if window_frames is not None:
+        labels = make_window_completion_targets(num_rows, window_frames)
+    else:
+        labels = make_completion_labels(num_rows)
     completion_col = pa.array(labels, type=pa.float32())
     table = table.append_column(LABEL_KEY, completion_col)
     table = update_hf_schema_metadata(table)
@@ -117,13 +163,14 @@ def process_parquet(
 def _process_parquet_worker(args: tuple) -> dict[str, int]:
     """Wrapper for ``multiprocessing``."""
 
-    src_path, dst_path, expected_length, force = args
+    src_path, dst_path, expected_length, force, window_frames = args
     try:
         return process_parquet(
             pathlib.Path(src_path),
             pathlib.Path(dst_path),
             expected_length,
             force=force,
+            window_frames=window_frames,
         )
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc), "src": str(src_path)}
@@ -152,7 +199,7 @@ def collect_parquet_jobs(
     return jobs
 
 
-def write_meta(src_meta: pathlib.Path, dst_meta: pathlib.Path) -> None:
+def write_meta(src_meta: pathlib.Path, dst_meta: pathlib.Path, *, window_seconds: float | None = None) -> None:
     """Copies ``meta/`` and patches ``info.json`` with the ``completion`` feature."""
 
     dst_meta.mkdir(parents=True, exist_ok=True)
@@ -172,6 +219,10 @@ def write_meta(src_meta: pathlib.Path, dst_meta: pathlib.Path) -> None:
         features[LABEL_KEY] = dict(COMPLETION_FEATURE)
     else:
         features[LABEL_KEY] = dict(COMPLETION_FEATURE)  # overwrite to ensure consistency
+    if window_seconds is not None:
+        info["window_seconds"] = window_seconds
+    else:
+        info.pop("window_seconds", None)
 
     info_path = dst_meta / "info.json"
     tmp_path = info_path.with_suffix(".json.tmp")
@@ -216,7 +267,20 @@ def main() -> None:
         action="store_true",
         help="Skip copying the videos/ directory (use if videos are already present).",
     )
+    parser.add_argument(
+        "--window-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Switch to a tail-window scheme: the last round(window_seconds * fps) frames of each "
+            "episode are labeled 1.0, everything before is 0.0. Unset preserves the legacy "
+            "last-2-frames scheme."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.window_seconds is not None and args.window_seconds <= 0:
+        parser.error("--window-seconds must be positive")
 
     src_root: pathlib.Path = args.src_root.resolve()
     dst_root: pathlib.Path = args.output_root.resolve()
@@ -233,9 +297,25 @@ def main() -> None:
     # --- Load episode metadata ---
     episode_lengths = load_episode_lengths(src_root / "meta")
     print(f"Episodes       : {len(episode_lengths)}")
-    short_episodes = {eid: length for eid, length in episode_lengths.items() if length < 2}
-    if short_episodes:
-        print(f"  Episodes with < 2 frames (labeled all-0): {short_episodes}")
+
+    window_frames: int | None = None
+    if args.window_seconds is not None:
+        fps = read_fps(src_root / "meta")
+        window_frames = round(args.window_seconds * fps)
+        if window_frames <= 0:
+            parser.error(f"--window-seconds={args.window_seconds} at fps={fps} rounds to a non-positive window")
+        lengths = sorted(episode_lengths.values())
+        print(
+            f"Window         : {args.window_seconds}s @ {fps} fps = {window_frames} frames "
+            f"(episode lengths: min={lengths[0]}, median={lengths[len(lengths) // 2]}, max={lengths[-1]})"
+        )
+        # Fails loudly here, before any output is written, if any episode is
+        # shorter than the window (see module docstring — not expected).
+        check_episode_lengths_fit_window(episode_lengths, window_frames)
+    else:
+        short_episodes = {eid: length for eid, length in episode_lengths.items() if length < 2}
+        if short_episodes:
+            print(f"  Episodes with < 2 frames (labeled all-0): {short_episodes}")
 
     jobs = collect_parquet_jobs(src_root, dst_root, episode_lengths)
     print(f"Parquet files  : {len(jobs)}")
@@ -258,8 +338,10 @@ def main() -> None:
 
     # --- 1. Write meta/ ---
     print("\n[1/3] Writing meta/ ...")
-    write_meta(src_root / "meta", dst_root / "meta")
-    print(f"  Patched info.json — added '{LABEL_KEY}' to features")
+    write_meta(src_root / "meta", dst_root / "meta", window_seconds=args.window_seconds)
+    print(f"  Patched info.json — added '{LABEL_KEY}' to features" + (
+        f", window_seconds={args.window_seconds}" if args.window_seconds is not None else ""
+    ))
 
     # --- 2. Copy videos/ ---
     if not args.skip_videos:
@@ -279,7 +361,7 @@ def main() -> None:
     total_skipped = 0
     errors: list[dict] = []
 
-    work_items = [(str(src), str(dst), length, args.force) for src, dst, length in jobs]
+    work_items = [(str(src), str(dst), length, args.force, window_frames) for src, dst, length in jobs]
 
     if args.workers <= 1:
         for item in tqdm.tqdm(work_items, desc="Labeling"):

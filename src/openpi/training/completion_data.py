@@ -313,6 +313,60 @@ def make_progress_targets(frame_count: int) -> np.ndarray:
     return targets
 
 
+def make_window_completion_targets(frame_count: int, window_frames: int) -> np.ndarray:
+    """Returns exact float32 labels: ``1.0`` over the trailing ``window_frames``.
+
+    Every frame before the trailing window is ``0.0``. Callers must ensure
+    ``frame_count >= window_frames``; an episode shorter than the window is
+    not expected to occur in this dataset (episode lengths are checked
+    up front by the label-generation script) and is treated as an error
+    here rather than given ad-hoc semantics, since padding the window with
+    frames borrowed from an adjacent episode would mean labeling frames
+    already annotated as the next subtask as if they still belonged to
+    this one.
+    """
+
+    if window_frames <= 0:
+        raise ValueError(f"window_frames must be positive, got {window_frames}")
+    if frame_count < window_frames:
+        raise ValueError(
+            f"episode has {frame_count} frame(s), shorter than window_frames={window_frames}; "
+            "episodes this short are not expected in this dataset"
+        )
+    targets = np.zeros(frame_count, dtype=np.float32)
+    targets[-window_frames:] = np.float32(1.0)
+    return targets
+
+
+def make_window_progress_targets(frame_count: int, window_frames: int, ramp_start: float) -> np.ndarray:
+    """Returns exact float32 labels: ``0.0`` before the trailing window, then a
+    linear ramp from ``ramp_start`` to ``1.0`` across the trailing ``window_frames``.
+
+    See ``make_window_completion_targets`` for why ``frame_count < window_frames``
+    is treated as an error rather than a special case.
+    """
+
+    if window_frames <= 0:
+        raise ValueError(f"window_frames must be positive, got {window_frames}")
+    if not 0.0 <= ramp_start < 1.0:
+        raise ValueError(f"ramp_start must be in [0, 1), got {ramp_start}")
+    if frame_count < window_frames:
+        raise ValueError(
+            f"episode has {frame_count} frame(s), shorter than window_frames={window_frames}; "
+            "episodes this short are not expected in this dataset"
+        )
+    targets = np.zeros(frame_count, dtype=np.float32)
+    if window_frames == 1:
+        ramp = np.ones(1, dtype=np.float32)
+    else:
+        fraction = np.arange(window_frames, dtype=np.float32) / np.float32(window_frames - 1)
+        ramp = fraction * np.float32(1.0 - ramp_start) + np.float32(ramp_start)
+        ramp[0] = np.float32(ramp_start)
+        ramp[-1] = np.float32(1.0)
+    targets[-window_frames:] = ramp
+    return targets
+
+
 def _validate_episode_and_frame_indices(
     episode_values: np.ndarray,
     frame_values: np.ndarray,
@@ -341,13 +395,17 @@ def audit_episode_parquet(
     episode_id: int,
     expected_length: int,
     label_key: str = "completion",
+    window_frames: int = 2,
 ) -> EpisodeAudit:
-    """Reads only scalar audit columns and enforces the exact last-two label rule.
+    """Reads only scalar audit columns and enforces the exact last-N label rule.
 
-    Episodes shorter than 2 frames are exempt from the last-two-frames rule;
+    ``window_frames`` defaults to ``2`` (the legacy last-two-frames rule).
+    Episodes shorter than ``window_frames`` are exempt from the last-N rule;
     they must be labeled all-0 instead.
     """
 
+    if window_frames <= 0:
+        raise ValueError(f"window_frames must be positive, got {window_frames}")
     path = pathlib.Path(parquet_path)
     if not path.is_file():
         raise FileNotFoundError(f"episode {episode_id} parquet file is missing: {path}")
@@ -384,9 +442,9 @@ def audit_episode_parquet(
         raise ValueError(f"episode {episode_id} field {label_key!r} contains labels outside 0/1: {details}")
     numeric_labels = numeric_labels.astype(np.int8)
 
-    # Episodes shorter than 2 frames cannot satisfy the last-two-frames rule,
-    # so they are labeled all-0 and exempt from that part of the audit.
-    if expected_length < 2:
+    # Episodes shorter than window_frames cannot satisfy the last-N-frames
+    # rule, so they are labeled all-0 and exempt from that part of the audit.
+    if expected_length < window_frames:
         positive_rows = np.flatnonzero(numeric_labels != 0).tolist()
         if positive_rows:
             raise ValueError(
@@ -401,15 +459,17 @@ def audit_episode_parquet(
             negative_count=expected_length - positive_count,
         )
 
-    early_positive_rows = np.flatnonzero(numeric_labels[:-2] != 0).tolist()
+    early_positive_rows = np.flatnonzero(numeric_labels[:-window_frames] != 0).tolist()
     if early_positive_rows:
         raise ValueError(
-            f"episode {episode_id} must have completion=0 before its last 2 frames; offending frames {early_positive_rows}"
+            f"episode {episode_id} must have {label_key}=0 before its last {window_frames} frames; "
+            f"offending frames {early_positive_rows}"
         )
-    final_bad_rows = (np.flatnonzero(numeric_labels[-2:] != 1) + expected_length - 2).tolist()
+    final_bad_rows = (np.flatnonzero(numeric_labels[-window_frames:] != 1) + expected_length - window_frames).tolist()
     if final_bad_rows:
         raise ValueError(
-            f"episode {episode_id} must have completion=1 on exactly its last 2 frames; offending frames {final_bad_rows}"
+            f"episode {episode_id} must have {label_key}=1 on exactly its last {window_frames} frames; "
+            f"offending frames {final_bad_rows}"
         )
     positive_count = int(np.sum(numeric_labels))
     return EpisodeAudit(
@@ -505,6 +565,129 @@ def audit_progress_episode_parquet(
     )
 
 
+def audit_window_progress_episode_parquet(
+    parquet_path: str | os.PathLike[str],
+    *,
+    episode_id: int,
+    expected_length: int,
+    window_frames: int,
+    ramp_start: float,
+    label_key: str = "progress",
+) -> EpisodeAudit:
+    """Audits one subtask's exact float32 tail-window ramp labels.
+
+    Same structural checks as ``audit_progress_episode_parquet`` (single
+    ``task_index``, contiguous frame indices, finite values in ``[0, 1]``,
+    monotonic non-decreasing, last frame exactly ``1.0``), but compares
+    against ``make_window_progress_targets`` instead of the full-episode
+    linear ramp. Unlike the full-episode ramp, the first frame is not
+    required to be exactly ``0.0`` when ``expected_length == window_frames``
+    (the whole episode is then inside the ramp, so its first frame is
+    ``ramp_start``); the final exact-array comparison catches this either way.
+    """
+
+    path = pathlib.Path(parquet_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"episode {episode_id} parquet file is missing: {path}")
+    parquet_file = pq.ParquetFile(path)
+    available_columns = set(parquet_file.schema_arrow.names)
+    required_columns = {"episode_index", "frame_index", "task_index", label_key}
+    missing_columns = sorted(required_columns - available_columns)
+    if missing_columns:
+        raise ValueError(f"episode {episode_id} is missing parquet field(s) {missing_columns} in {path}")
+    progress_field = parquet_file.schema_arrow.field(label_key)
+    if not pa.types.is_float32(progress_field.type):
+        raise ValueError(f"episode {episode_id} field {label_key!r} must be parquet float32, got {progress_field.type}")
+    table = parquet_file.read(columns=["episode_index", "frame_index", "task_index", label_key])
+    episode_values = _as_scalar_array(table["episode_index"], column_name="episode_index", episode_id=episode_id)
+    frame_values = _as_scalar_array(table["frame_index"], column_name="frame_index", episode_id=episode_id)
+    task_values = _as_scalar_array(table["task_index"], column_name="task_index", episode_id=episode_id)
+    labels = _as_scalar_array(table[label_key], column_name=label_key, episode_id=episode_id)
+
+    if len(labels) != expected_length:
+        raise ValueError(
+            f"episode {episode_id} has {len(labels)} parquet rows but metadata length is {expected_length}"
+        )
+    _validate_episode_and_frame_indices(
+        episode_values,
+        frame_values,
+        episode_id=episode_id,
+        expected_length=expected_length,
+    )
+    try:
+        integer_tasks = task_values.astype(np.int64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"episode {episode_id} has non-integer task_index values") from error
+    if not np.array_equal(task_values, integer_tasks):
+        raise ValueError(f"episode {episode_id} has non-integer task_index values: {task_values.tolist()}")
+    unique_tasks = np.unique(integer_tasks)
+    if len(unique_tasks) != 1:
+        raise ValueError(f"episode {episode_id} must contain exactly one task_index, got {unique_tasks.tolist()}")
+
+    try:
+        progress = np.asarray(labels, dtype=np.float32)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"episode {episode_id} field {label_key!r} contains non-numeric progress labels") from error
+    if not np.all(np.isfinite(progress)):
+        bad_rows = np.flatnonzero(~np.isfinite(progress)).tolist()
+        raise ValueError(f"episode {episode_id} field {label_key!r} contains non-finite labels at rows {bad_rows}")
+    if np.any((progress < 0.0) | (progress > 1.0)):
+        bad_rows = np.flatnonzero((progress < 0.0) | (progress > 1.0)).tolist()
+        raise ValueError(f"episode {episode_id} field {label_key!r} contains labels outside [0, 1] at rows {bad_rows}")
+    if progress[-1] != np.float32(1.0):
+        raise ValueError(f"episode {episode_id} progress last frame must be exactly 1.0")
+    if np.any(np.diff(progress) < 0.0):
+        bad_rows = (np.flatnonzero(np.diff(progress) < 0.0) + 1).tolist()
+        raise ValueError(f"episode {episode_id} progress must be monotonic non-decreasing; offending rows {bad_rows}")
+    expected_progress = make_window_progress_targets(expected_length, window_frames, ramp_start)
+    if not np.array_equal(progress, expected_progress):
+        raise ValueError(
+            f"episode {episode_id} field {label_key!r} must equal the tail-window ramp "
+            f"(window_frames={window_frames}, ramp_start={ramp_start}): "
+            f"got {progress.tolist()}, expected {expected_progress.tolist()}"
+        )
+    return EpisodeAudit(
+        episode_id=episode_id,
+        frame_count=expected_length,
+        positive_count=0,
+        negative_count=0,
+        task_index=int(unique_tasks[0]),
+    )
+
+
+def _read_window_label_metadata(
+    dataset_root: pathlib.Path, *, objective: Literal["binary", "progress"]
+) -> tuple[int | None, float | None]:
+    """Reads the optional tail-window label contract a label script wrote.
+
+    Returns ``(window_frames, ramp_start)``. Both are ``None`` when the
+    dataset's ``meta/info.json`` has no ``window_seconds`` key, meaning it
+    uses the legacy last-2-frames / full-episode-linear labels. This keeps
+    the window width/shape a property of the dataset itself rather than a
+    separate training-config value that could drift out of sync with what
+    the dataset was actually generated with.
+    """
+
+    info_path = dataset_root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"dataset metadata not found: {info_path}")
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    window_seconds = info.get("window_seconds")
+    if window_seconds is None:
+        return None, None
+    fps = float(info["fps"])
+    if fps <= 0:
+        raise ValueError(f"dataset fps must be positive, got {fps}")
+    window_frames = round(float(window_seconds) * fps)
+    if window_frames <= 0:
+        raise ValueError(f"window_seconds={window_seconds} at fps={fps} rounds to a non-positive window_frames")
+    if objective != "progress":
+        return window_frames, None
+    if "ramp_start" not in info:
+        raise ValueError(f"{dataset_root} declares window_seconds but is missing ramp_start for a progress dataset")
+    return window_frames, float(info["ramp_start"])
+
+
 def prepare_completion_data(
     dataset_metadata: Any,
     *,
@@ -570,16 +753,37 @@ def prepare_completion_data(
         val_groups=val_groups,
         test_groups=test_groups,
     )
+    window_frames, ramp_start = _read_window_label_metadata(root, objective=objective)
     audits: dict[int, EpisodeAudit] = {}
     for episode_id in episode_ids:
         episode_metadata = dataset_metadata.episodes[episode_id]
-        audit_fn = audit_episode_parquet if objective == "binary" else audit_progress_episode_parquet
-        audits[episode_id] = audit_fn(
-            parquet_paths[episode_id],
-            episode_id=episode_id,
-            expected_length=int(episode_metadata["length"]),
-            label_key=label_key,
-        )
+        expected_length = int(episode_metadata["length"])
+        if window_frames is None:
+            audit_fn = audit_episode_parquet if objective == "binary" else audit_progress_episode_parquet
+            audits[episode_id] = audit_fn(
+                parquet_paths[episode_id],
+                episode_id=episode_id,
+                expected_length=expected_length,
+                label_key=label_key,
+            )
+        elif objective == "binary":
+            audits[episode_id] = audit_episode_parquet(
+                parquet_paths[episode_id],
+                episode_id=episode_id,
+                expected_length=expected_length,
+                label_key=label_key,
+                window_frames=window_frames,
+            )
+        else:
+            assert ramp_start is not None
+            audits[episode_id] = audit_window_progress_episode_parquet(
+                parquet_paths[episode_id],
+                episode_id=episode_id,
+                expected_length=expected_length,
+                label_key=label_key,
+                window_frames=window_frames,
+                ramp_start=ramp_start,
+            )
 
     if objective == "progress":
         return CompletionDataInfo(

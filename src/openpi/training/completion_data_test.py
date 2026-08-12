@@ -308,3 +308,116 @@ def test_existing_manifest_rejects_dataset_drift(tmp_path):
 
     with pytest.raises(ValueError, match="episode IDs do not match"):
         completion_data.load_or_create_split_manifest(path, range(48), repo_id="org/breakfast")
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "window_frames", "expected"),
+    [
+        (5, 3, [0.0, 0.0, 1.0, 1.0, 1.0]),
+        (3, 3, [1.0, 1.0, 1.0]),
+        (1, 1, [1.0]),
+    ],
+)
+def test_window_completion_targets_flat_over_trailing_window(frame_count, window_frames, expected):
+    targets = completion_data.make_window_completion_targets(frame_count, window_frames)
+
+    assert targets.dtype == np.float32
+    np.testing.assert_array_equal(targets, np.asarray(expected, dtype=np.float32))
+
+
+def test_window_completion_targets_rejects_episode_shorter_than_window():
+    with pytest.raises(ValueError, match="shorter than window_frames"):
+        completion_data.make_window_completion_targets(2, 3)
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "window_frames", "ramp_start", "expected"),
+    [
+        (5, 3, 0.5, [0.0, 0.0, 0.5, 0.75, 1.0]),
+        (3, 3, 0.5, [0.5, 0.75, 1.0]),
+        (1, 1, 0.5, [1.0]),
+        (4, 4, 0.0, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]),
+    ],
+)
+def test_window_progress_targets_ramp_over_trailing_window(frame_count, window_frames, ramp_start, expected):
+    targets = completion_data.make_window_progress_targets(frame_count, window_frames, ramp_start)
+
+    assert targets.dtype == np.float32
+    np.testing.assert_allclose(targets, np.asarray(expected, dtype=np.float32), atol=1e-6)
+    assert targets[-1] == np.float32(1.0)
+
+
+def test_window_progress_targets_rejects_episode_shorter_than_window():
+    with pytest.raises(ValueError, match="shorter than window_frames"):
+        completion_data.make_window_progress_targets(2, 3, 0.5)
+
+
+@pytest.mark.parametrize("bad_ramp_start", [-0.1, 1.0, 1.5])
+def test_window_progress_targets_rejects_ramp_start_outside_unit_interval(bad_ramp_start):
+    with pytest.raises(ValueError, match="ramp_start"):
+        completion_data.make_window_progress_targets(5, 3, bad_ramp_start)
+
+
+def test_episode_audit_accepts_custom_window_frames(tmp_path):
+    path = tmp_path / "episode_000040.parquet"
+    _write_episode(path, 40, [0, 0, 1, 1, 1])
+
+    audit = completion_data.audit_episode_parquet(path, episode_id=40, expected_length=5, window_frames=3)
+
+    assert audit.positive_count == 3
+    assert audit.negative_count == 2
+
+
+def test_episode_audit_with_custom_window_frames_rejects_early_positive(tmp_path):
+    path = tmp_path / "episode_000041.parquet"
+    _write_episode(path, 41, [0, 1, 1, 1, 1])
+
+    with pytest.raises(ValueError, match=r"episode 41.*before its last 3 frames"):
+        completion_data.audit_episode_parquet(path, episode_id=41, expected_length=5, window_frames=3)
+
+
+def test_episode_audit_with_custom_window_frames_exempts_shorter_episode(tmp_path):
+    path = tmp_path / "episode_000042.parquet"
+    _write_episode(path, 42, [0, 0])
+
+    audit = completion_data.audit_episode_parquet(path, episode_id=42, expected_length=2, window_frames=3)
+
+    assert audit.positive_count == 0
+    assert audit.negative_count == 2
+
+
+def test_window_progress_episode_audit_accepts_partial_window(tmp_path):
+    path = tmp_path / "episode_000050.parquet"
+    labels = completion_data.make_window_progress_targets(5, 3, 0.5)
+    _write_progress_episode(path, 50, labels)
+
+    audit = completion_data.audit_window_progress_episode_parquet(
+        path, episode_id=50, expected_length=5, window_frames=3, ramp_start=0.5
+    )
+
+    assert audit.frame_count == 5
+    assert audit.task_index == 17
+
+
+def test_window_progress_episode_audit_accepts_whole_episode_as_window(tmp_path):
+    path = tmp_path / "episode_000051.parquet"
+    labels = completion_data.make_window_progress_targets(3, 3, 0.5)
+    _write_progress_episode(path, 51, labels)
+
+    audit = completion_data.audit_window_progress_episode_parquet(
+        path, episode_id=51, expected_length=3, window_frames=3, ramp_start=0.5
+    )
+
+    assert audit.frame_count == 3
+
+
+def test_window_progress_episode_audit_rejects_mismatched_ramp(tmp_path):
+    path = tmp_path / "episode_000052.parquet"
+    # Written with the wrong ramp_start relative to what the audit expects.
+    labels = completion_data.make_window_progress_targets(5, 3, 0.8)
+    _write_progress_episode(path, 52, labels)
+
+    with pytest.raises(ValueError, match=r"episode 52.*tail-window ramp"):
+        completion_data.audit_window_progress_episode_parquet(
+            path, episode_id=52, expected_length=5, window_frames=3, ramp_start=0.5
+        )

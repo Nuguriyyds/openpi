@@ -95,3 +95,50 @@ def test_write_meta_adds_float32_progress_feature(tmp_path):
     info = json.loads((destination / "info.json").read_text())
     assert info["features"]["progress"] == label_progress.PROGRESS_FEATURE
     assert (destination / "episodes.jsonl").read_text() == '{"episode_index":0,"length":1}\n'
+
+
+def test_make_window_progress_labels():
+    labels = label_progress.make_window_progress_labels(5, 3, 0.5)
+
+    assert labels.dtype == np.float32
+    np.testing.assert_allclose(labels, np.asarray([0.0, 0.0, 0.5, 0.75, 1.0], dtype=np.float32), atol=1e-6)
+
+
+def test_check_episode_lengths_fit_window_reports_offending_episodes():
+    with pytest.raises(ValueError, match=r"episode\(s\) are shorter than window_frames=10.*3:5"):
+        label_progress.check_episode_lengths_fit_window({1: 20, 3: 5, 7: 15}, 10)
+
+
+def test_check_episode_lengths_fit_window_accepts_when_all_long_enough():
+    label_progress.check_episode_lengths_fit_window({1: 20, 3: 15, 7: 30}, 10)
+
+
+def test_process_parquet_writes_window_ramp_labels(tmp_path):
+    source = tmp_path / "episode_000010.parquet"
+    destination = tmp_path / "out" / source.name
+    _write_source_episode(source, 10, 5)
+
+    result = label_progress.process_parquet(
+        source, destination, 5, force=False, resume=False, window_frames=3, ramp_start=0.5
+    )
+    output = pq.read_table(destination)
+
+    assert result == {"skipped": 0, "written": 1}
+    np.testing.assert_allclose(
+        output["progress"].combine_chunks().to_numpy(),
+        np.asarray([0.0, 0.0, 0.5, 0.75, 1.0], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_process_parquet_resume_validates_window_ramp_labels(tmp_path):
+    source = tmp_path / "episode_000011.parquet"
+    destination = tmp_path / "out" / source.name
+    _write_source_episode(source, 11, 5)
+
+    label_progress.process_parquet(source, destination, 5, force=False, resume=False, window_frames=3, ramp_start=0.5)
+    resumed = label_progress.process_parquet(
+        source, destination, 5, force=False, resume=True, window_frames=3, ramp_start=0.5
+    )
+
+    assert resumed == {"skipped": 1, "written": 0}
