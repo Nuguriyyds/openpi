@@ -75,7 +75,6 @@ def test_progress_configs_use_frozen_head_huber_and_stratified_sampling():
         assert not progress_config.completion.balanced_sampling
         assert not progress_config.completion.uses_focal_loss
         assert progress_config.completion.bce_pos_weight_override is None
-        assert progress_config.completion.huber_delta == 0.1
         assert progress_config.model.completion_head.enabled
         assert progress_config.model.completion_head.dropout_rate == 0.0
         assert isinstance(progress_config.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
@@ -89,6 +88,19 @@ def test_progress_configs_use_frozen_head_huber_and_stratified_sampling():
     assert full.batch_size == overfit.batch_size == 64
     assert overfit.completion.train_episode_limit == 20
     assert full.completion.train_episode_limit is None
+
+    # The overfit diagnostic intentionally diverges from the full run: a
+    # larger huber_delta keeps gradients from saturating on the typically
+    # large errors seen when memorizing a tiny 20-episode set, a higher
+    # peak/decay LR and more steps give it room to converge, and zero weight
+    # decay removes regularization that would otherwise fight overfitting on
+    # purpose.
+    assert full.completion.huber_delta == 0.1
+    assert overfit.completion.huber_delta == 0.5
+    assert overfit.completion.weight_decay == 0.0
+    assert overfit.completion.peak_lr == 1e-4
+    assert overfit.completion.decay_lr == 1e-5
+    assert overfit.num_train_steps == 2_000
 
 
 @pytest.mark.parametrize(
