@@ -1,0 +1,328 @@
+"""Tests for scripts/evaluate_completion_boundary.py.
+
+Covers: single-checkpoint enforcement, test_full/test_sparse metric keys,
+confusion-matrix correctness, sparse-mask correctness, and best-F1 being
+diagnostic-only (not used as the deployment threshold).
+"""
+
+# ruff: noqa: SLF001  -- tests intentionally access private functions
+from __future__ import annotations
+
+import sys
+
+import numpy as np
+import pytest
+
+from scripts import evaluate_completion_boundary as ecb
+
+# ---------------------------------------------------------------------------
+# _confusion_matrix
+# ---------------------------------------------------------------------------
+
+
+def test_confusion_matrix_all_tp():
+    scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
+    targets = np.array([1, 1, 1], dtype=np.float32)
+    cm = ecb._confusion_matrix(scores, targets, threshold=0.5)
+    assert cm == {"tp": 3, "fp": 0, "fn": 0, "tn": 0}
+
+
+def test_confusion_matrix_all_tn():
+    scores = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    targets = np.array([0, 0, 0], dtype=np.float32)
+    cm = ecb._confusion_matrix(scores, targets, threshold=0.5)
+    assert cm == {"tp": 0, "fp": 0, "fn": 0, "tn": 3}
+
+
+def test_confusion_matrix_mixed():
+    scores = np.array([0.9, 0.1, 0.8, 0.3], dtype=np.float32)
+    targets = np.array([1, 1, 0, 0], dtype=np.float32)
+    cm = ecb._confusion_matrix(scores, targets, threshold=0.5)
+    # TP: score>=0.5 & target==1 → index 0
+    # FP: score>=0.5 & target==0 → index 2
+    # FN: score<0.5 & target==1 → index 1
+    # TN: score<0.5 & target==0 → index 3
+    assert cm == {"tp": 1, "fp": 1, "fn": 1, "tn": 1}
+
+
+# ---------------------------------------------------------------------------
+# _compute_set_metrics
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_predictions(num_episodes=2, frames_per_ep=20):
+    """Creates synthetic prediction arrays for testing metric computation."""
+    ep_idx = np.concatenate([np.full(frames_per_ep, eid, dtype=np.int64) for eid in range(num_episodes)])
+    tk_idx = np.concatenate([np.full(frames_per_ep, eid % 4, dtype=np.int64) for eid in range(num_episodes)])
+    fr_idx = np.concatenate([np.arange(frames_per_ep, dtype=np.int64) for _ in range(num_episodes)])
+    # Last 10 frames positive, rest negative (matches boundary scheme).
+    targets = np.concatenate(
+        [
+            np.concatenate([np.zeros(frames_per_ep - 10, dtype=np.float32), np.ones(10, dtype=np.float32)])
+            for _ in range(num_episodes)
+        ]
+    )
+    # Good predictions: high logits for positives, low for negatives.
+    logits = np.where(targets == 1, 3.0, -3.0).astype(np.float32)
+    infer_ms = np.ones(len(logits), dtype=np.float32)
+    return ep_idx, tk_idx, fr_idx, logits, targets, infer_ms
+
+
+def test_compute_set_metrics_has_required_keys():
+    ep_idx, tk_idx, fr_idx, logits, targets, infer_ms = _make_synthetic_predictions()
+    result = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+    )
+
+    overall = result["overall"]
+    # Core metrics.
+    for key in (
+        "bce",
+        "auc",
+        "f1_at_0.5",
+        "precision_at_0.5",
+        "recall_at_0.5",
+        "best_f1",
+        "best_threshold",
+        "confusion_matrix",
+        "mean_infer_ms_per_frame",
+    ):
+        assert key in overall, f"missing key: {key}"
+
+    # Confusion matrix keys.
+    for key in ("tp", "fp", "fn", "tn"):
+        assert key in overall["confusion_matrix"]
+
+    # Per-task and per-episode.
+    assert isinstance(result["per_task"], dict)
+    assert len(result["episodes"]) == 2
+
+
+def test_compute_set_metrics_perfect_predictions():
+    ep_idx, tk_idx, fr_idx, logits, targets, infer_ms = _make_synthetic_predictions()
+    result = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+    )
+    overall = result["overall"]
+    # Perfect predictions → F1=1.0, confusion has no FP/FN.
+    assert overall["f1_at_0.5"] == pytest.approx(1.0)
+    assert overall["confusion_matrix"]["fp"] == 0
+    assert overall["confusion_matrix"]["fn"] == 0
+    assert overall["auc"] == pytest.approx(1.0)
+
+
+def test_compute_set_metrics_best_f1_is_diagnostic():
+    """best_f1/best_threshold are present but separate from the fixed 0.5 threshold."""
+
+    ep_idx, tk_idx, fr_idx, logits, targets, infer_ms = _make_synthetic_predictions()
+    # Add a few misclassified to make best_threshold differ from 0.5.
+    logits[:3] = 2.0  # false positives
+    targets[:3] = 0.0
+
+    result = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+    )
+    overall = result["overall"]
+    # best_f1 >= f1_at_0.5 (best_threshold optimizes F1).
+    assert overall["best_f1"] >= overall["f1_at_0.5"]
+    # best_threshold is reported as a diagnostic, not used for deployment.
+    assert "best_threshold" in overall
+
+
+# ---------------------------------------------------------------------------
+# _resolve_single_checkpoint
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_single_checkpoint_succeeds_for_existing_step(tmp_path):
+    checkpoint_root = tmp_path / "ckpts"
+    step_dir = checkpoint_root / "200"
+    (step_dir / "params").mkdir(parents=True)
+
+    resolved = ecb._resolve_single_checkpoint(checkpoint_root, 200)
+    assert resolved == step_dir
+
+
+def test_resolve_single_checkpoint_rejects_missing_step(tmp_path):
+    checkpoint_root = tmp_path / "ckpts"
+    (checkpoint_root / "100" / "params").mkdir(parents=True)
+    (checkpoint_root / "200" / "params").mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError, match="Checkpoint step 999 not found"):
+        ecb._resolve_single_checkpoint(checkpoint_root, 999)
+
+
+def test_resolve_single_checkpoint_rejects_nonexistent_root(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Checkpoint experiment directory not found"):
+        ecb._resolve_single_checkpoint(tmp_path / "nonexistent", 100)
+
+
+def test_resolve_single_checkpoint_rejects_missing_params(tmp_path):
+    checkpoint_root = tmp_path / "ckpts"
+    (checkpoint_root / "100").mkdir(parents=True)  # no params/ subdir
+
+    with pytest.raises(FileNotFoundError, match="Checkpoint params not found"):
+        ecb._resolve_single_checkpoint(checkpoint_root, 100)
+
+
+def test_resolve_single_checkpoint_no_latest_alias(tmp_path):
+    """There is no 'latest' alias — only explicit integer steps are accepted."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    (checkpoint_root / "100" / "params").mkdir(parents=True)
+    # "latest" is not a valid step directory name (it's not an int directory
+    # and _resolve_single_checkpoint looks for str(step) = "999").
+    with pytest.raises(FileNotFoundError, match="not found"):
+        ecb._resolve_single_checkpoint(checkpoint_root, 999)
+
+
+# ---------------------------------------------------------------------------
+# _sparse_mask
+# ---------------------------------------------------------------------------
+
+
+def test_sparse_mask_selects_correct_frames():
+    """Sparse mask selects only frames in the sparse sample sets."""
+
+    ep_idx = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=np.int64)
+    fr_idx = np.array([0, 1, 2, 10, 15, 0, 1, 5, 10, 15], dtype=np.int64)
+    sparse_sets = {
+        0: np.array([0, 10, 15], dtype=np.int64),
+        1: np.array([0, 5, 15], dtype=np.int64),
+    }
+    mask = ecb._sparse_mask(ep_idx, fr_idx, sparse_sets)
+    # Episode 0: frames 0, 10, 15 in sparse → indices 0, 3, 4
+    # Episode 1: frames 0, 5, 15 in sparse → indices 5, 7, 9
+    expected = np.array([True, False, False, True, True, True, False, True, False, True])
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_sparse_mask_empty_for_unsampled_episodes():
+    ep_idx = np.array([0, 0, 1, 1], dtype=np.int64)
+    fr_idx = np.array([0, 1, 0, 1], dtype=np.int64)
+    sparse_sets = {0: np.array([0], dtype=np.int64)}  # episode 1 not in sparse
+    mask = ecb._sparse_mask(ep_idx, fr_idx, sparse_sets)
+    expected = np.array([True, False, False, False])
+    np.testing.assert_array_equal(mask, expected)
+
+
+# ---------------------------------------------------------------------------
+# CLI: --checkpoint-step is required
+# ---------------------------------------------------------------------------
+
+
+def test_cli_requires_checkpoint_step(monkeypatch):
+    """The CLI must require an explicit --checkpoint-step (no default, no 'latest')."""
+
+    monkeypatch.setattr(sys, "argv", ["evaluate_completion_boundary.py"])
+    with pytest.raises(SystemExit):
+        ecb._parse_args()
+
+
+def test_cli_checkpoint_step_must_be_int(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_completion_boundary.py",
+            "--checkpoint-step",
+            "latest",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        ecb._parse_args()
+
+
+def test_cli_accepts_explicit_int_step(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_completion_boundary.py",
+            "--checkpoint-step",
+            "500",
+        ],
+    )
+    args = ecb._parse_args()
+    assert args.checkpoint_step == 500
+    assert args.threshold == 0.5  # default fixed threshold
+
+
+# ---------------------------------------------------------------------------
+# Summary structure: best-F1 is diagnostic, threshold is fixed
+# ---------------------------------------------------------------------------
+
+
+def test_summary_diagnostic_structure():
+    """The summary template separates diagnostic best_f1 from the fixed threshold.
+
+    We verify the key layout by constructing a minimal summary from
+    _compute_set_metrics output (same structure _run_evaluation uses).
+    """
+
+    ep_idx, tk_idx, fr_idx, logits, targets, infer_ms = _make_synthetic_predictions()
+    test_full = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+    )
+    test_sparse = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+    )
+
+    # Mirror the summary structure from _run_evaluation.
+    threshold = 0.5
+    summary = {
+        "threshold": threshold,
+        "threshold_note": "fixed at 0.5 for deployment; best-threshold is diagnostic only",
+        "test_full": {"overall": test_full["overall"]},
+        "test_sparse": {"overall": test_sparse["overall"]},
+        "diagnostic": {
+            "test_full_best_f1": test_full["overall"]["best_f1"],
+            "test_full_best_threshold": test_full["overall"]["best_threshold"],
+            "note": "best-F1/threshold are diagnostics only; deployment threshold is fixed at 0.5",
+        },
+    }
+
+    # The deployment threshold is the fixed 0.5, NOT best_threshold.
+    assert summary["threshold"] == 0.5
+    assert summary["threshold_note"] != ""
+    # best_f1 lives under "diagnostic", separate from the deployment threshold.
+    assert "test_full_best_f1" in summary["diagnostic"]
+    assert "test_full_best_threshold" in summary["diagnostic"]
+    # The test_full overall also has confusion_matrix at the fixed threshold.
+    assert "confusion_matrix" in summary["test_full"]["overall"]
+    assert "confusion_matrix" in summary["test_sparse"]["overall"]

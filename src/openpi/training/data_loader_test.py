@@ -4,6 +4,7 @@ import types
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from openpi.models import pi0_config
 from openpi.training import completion
@@ -313,3 +314,152 @@ def test_s1_prepares_split_without_auditing_completion_labels(tmp_path, monkeypa
         )
         _data_loader.prepare_completion_data(config)
         assert captured[-1] is expected_audit
+
+
+# ---------------------------------------------------------------------------
+#  BoundaryCompletionSampler tests
+# ---------------------------------------------------------------------------
+
+
+def _make_boundary_audit(
+    episode_id: int,
+    group_position: int,
+    *,
+    original_length: int = 15,
+) -> completion_data.BoundaryEpisodeAudit:
+    """Builds a minimal valid BoundaryEpisodeAudit for sampler tests.
+
+    Subtasks 1-3 have ``original_length + 5`` frames (5 copy frames); subtask 4
+    has ``original_length`` frames.  The last 10 frames are positive.
+    """
+
+    is_subtask4 = group_position == 3
+    copy_n = 0 if is_subtask4 else 5
+    new_length = original_length + copy_n
+    completion = np.zeros(new_length, dtype=np.int8)
+    completion[-10:] = 1
+    is_copy = np.zeros(new_length, dtype=np.int8)
+    source_frame = np.arange(new_length, dtype=np.int64)
+    source_episode = np.full(new_length, episode_id, dtype=np.int64)
+    if not is_subtask4:
+        is_copy[original_length:] = 1
+        source_frame[original_length:] = np.arange(copy_n, dtype=np.int64)
+        source_episode[original_length:] = episode_id + 1
+    return completion_data.BoundaryEpisodeAudit(
+        episode_id=episode_id,
+        group_position=group_position,
+        task_index=group_position,
+        frame_count=new_length,
+        positive_count=10,
+        negative_count=new_length - 10,
+        boundary_copy_count=copy_n,
+        is_subtask4=is_subtask4,
+        completion=completion,
+        source_episode_indices=source_episode,
+        source_frame_indices=source_frame,
+        is_boundary_copy=is_copy,
+    )
+
+
+def test_boundary_sampler_sample_set_composition():
+    """Sample set = all positives + stride-grid ordinary negatives + forced
+    first-5 negatives (subtasks 2/3/4 only)."""
+
+    audits = {
+        0: _make_boundary_audit(0, group_position=0),  # subtask 1: no forced
+        1: _make_boundary_audit(1, group_position=1),  # subtask 2: forced first-5
+    }
+    sampler = _data_loader.BoundaryCompletionSampler(
+        (0, 1),
+        audits,
+        batch_size=8,
+        seed=42,
+        stride=15,
+        forced_first_n=5,
+    )
+
+    sample_set = sampler.sample_set
+    # Episode 0 (20 frames, offset 0): positives 10-19, ordinary {0}, no forced.
+    ep0_expected = {0, *range(10, 20)}
+    # Episode 1 (20 frames, offset 20): positives 30-39, ordinary {20}, forced {20..24}.
+    ep1_expected = {20, *range(21, 25), *range(30, 40)}
+    expected = ep0_expected | ep1_expected
+    assert set(sample_set.tolist()) == expected
+    # No duplicates.
+    assert len(sample_set) == len(np.unique(sample_set))
+
+
+def test_boundary_sampler_steps_per_epoch_and_padded_last_batch():
+    audits = {0: _make_boundary_audit(0, group_position=0)}
+    batch_size = 8
+    sampler = _data_loader.BoundaryCompletionSampler(
+        (0,),
+        audits,
+        batch_size=batch_size,
+        seed=42,
+    )
+    # Sample set = {0, 10..19} = 11 indices → steps = ceil(11/8) = 2.
+    assert sampler.steps_per_epoch == 2
+    assert sampler.num_samples == 11
+
+    indices = list(sampler)
+    # Total yielded = steps * batch_size = 16 (padded).
+    assert len(indices) == 2 * batch_size
+    # Every batch is full-sized.
+    # All original 11 samples appear at least once.
+    unique_yielded = set(indices)
+    assert set(sampler.sample_set.tolist()).issubset(unique_yielded)
+
+
+def test_boundary_sampler_is_deterministic_same_seed():
+    audits = {
+        0: _make_boundary_audit(0, group_position=0),
+        1: _make_boundary_audit(1, group_position=1),
+    }
+    s1 = _data_loader.BoundaryCompletionSampler((0, 1), audits, batch_size=8, seed=99)
+    s2 = _data_loader.BoundaryCompletionSampler((0, 1), audits, batch_size=8, seed=99)
+    assert list(s1) == list(s2)
+
+
+def test_boundary_sampler_different_seed_different_order():
+    audits = {0: _make_boundary_audit(0, group_position=0)}
+    s1 = _data_loader.BoundaryCompletionSampler((0,), audits, batch_size=8, seed=1)
+    s2 = _data_loader.BoundaryCompletionSampler((0,), audits, batch_size=8, seed=2)
+    assert list(s1) != list(s2)
+
+
+def test_boundary_sampler_resume_fast_forwards_and_continues():
+    """set_epoch + set_skip_batches reconstructs the same epoch and skips
+    already-consumed batches."""
+
+    audits = {0: _make_boundary_audit(0, group_position=0)}
+    batch_size = 4
+    full_sampler = _data_loader.BoundaryCompletionSampler((0,), audits, batch_size=batch_size, seed=7)
+    full_indices = list(full_sampler)
+
+    # Simulate resume after 1 batch of epoch 0.
+    resume_sampler = _data_loader.BoundaryCompletionSampler((0,), audits, batch_size=batch_size, seed=7)
+    resume_sampler.set_epoch(0)
+    resume_sampler.set_skip_batches(1)
+    resumed = list(resume_sampler)
+
+    # Remaining batches should match the tail of the full epoch.
+    expected_tail = full_indices[batch_size:]
+    assert resumed == expected_tail
+
+
+def test_boundary_sampler_multi_epoch_advances():
+    """Iterating twice yields two different epoch shuffles (auto-advance)."""
+
+    audits = {0: _make_boundary_audit(0, group_position=0)}
+    sampler = _data_loader.BoundaryCompletionSampler((0,), audits, batch_size=8, seed=5)
+    epoch0 = list(sampler)
+    epoch1 = list(sampler)
+    # Same sample set, different shuffle (extremely likely with different epoch seeds).
+    assert set(epoch0) == set(epoch1)
+    assert epoch0 != epoch1
+
+
+def test_boundary_sampler_rejects_empty_episodes():
+    with pytest.raises(ValueError, match="at least one episode"):
+        _data_loader.BoundaryCompletionSampler((), {}, batch_size=8, seed=42)

@@ -136,11 +136,14 @@ def test_staged_completion_requires_manifest():
         )
 
 
-def test_completion_training_requires_validation_groups():
-    with pytest.raises(ValueError, match="val_groups must be positive"):
-        completion_training.CompletionTrainingConfig(val_groups=0)
+def test_completion_training_allows_zero_val_groups():
+    """val_groups=0 is valid (disables val for boundary scheme); negative is rejected."""
 
+    assert completion_training.CompletionTrainingConfig(val_groups=0).val_groups == 0
     assert completion_training.CompletionTrainingConfig(test_groups=0).test_groups == 0
+
+    with pytest.raises(ValueError, match="val_groups must be non-negative"):
+        completion_training.CompletionTrainingConfig(val_groups=-1)
 
 
 @pytest.mark.parametrize(

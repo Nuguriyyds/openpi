@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import json
 import logging
 import platform
 from typing import Any
@@ -587,6 +588,45 @@ def evaluate_completion(
     raise ValueError(f"unsupported completion objective: {objective!r}")
 
 
+def compute_epoch_total_steps(steps_per_epoch: int, epochs: int) -> int:
+    """Total optimizer steps for epoch-based boundary training.
+
+    ``epochs`` is already validated to 1 or 2 by ``CompletionTrainingConfig``;
+    this function re-validates so it can be unit-tested independently.
+    """
+
+    if steps_per_epoch <= 0:
+        raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
+    if epochs not in (1, 2):
+        raise ValueError(f"epochs must be 1 or 2, got {epochs}")
+    return steps_per_epoch * epochs
+
+
+def should_save_epoch_checkpoint(
+    completed_steps: int,
+    *,
+    steps_per_epoch: int,
+    total_steps: int,
+    save_interval: int = 200,
+) -> bool:
+    """Whether to checkpoint after ``completed_steps`` optimizer steps.
+
+    Saves at every ``save_interval`` completed steps, at each epoch boundary, and
+    at the final step. ``completed_steps`` is the *completed* step count (==
+    ``train_state.step`` after the update), so the checkpoint directory name
+    matches the state it holds -- no off-by-one between the dir name and the
+    restored ``step`` on resume.
+    """
+
+    if completed_steps <= 0:
+        return False
+    if completed_steps >= total_steps:
+        return True
+    if completed_steps % steps_per_epoch == 0:
+        return True
+    return save_interval > 0 and completed_steps % save_interval == 0
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -646,7 +686,39 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
     )
-    if trains_completion_head:
+
+    # Epoch-based boundary training: derive the real step budget from the
+    # boundary sampler and override num_train_steps so the LR schedule, the
+    # training loop, and the checkpoint logic all use the actual epoch total.
+    is_epoch_based = config.completion.is_epoch_based
+    steps_per_epoch: int | None = None
+    total_steps = config.num_train_steps
+    eval_checkpoint_step: int | None = None
+    if is_epoch_based:
+        boundary_sampler = data_loader.boundary_sampler
+        if boundary_sampler is None:
+            raise ValueError(
+                "epoch-based completion training (config.completion.epochs set) requires the "
+                "boundary sampler; ensure boundary_sampling=True and a boundary-labeled dataset"
+            )
+        steps_per_epoch = boundary_sampler.steps_per_epoch
+        assert config.completion.epochs is not None
+        total_steps = compute_epoch_total_steps(steps_per_epoch, config.completion.epochs)
+        config = dataclasses.replace(config, num_train_steps=total_steps)
+        eval_checkpoint_step = config.completion.eval_checkpoint_step or steps_per_epoch
+        logging.info(
+            "Epoch-based boundary training: steps_per_epoch=%d epochs=%d total_steps=%d "
+            "eval_checkpoint_step=%d train_samples=%d",
+            steps_per_epoch,
+            config.completion.epochs,
+            total_steps,
+            eval_checkpoint_step,
+            boundary_sampler.num_samples,
+        )
+
+    # The val split is disabled for boundary training (val_groups=0); the merged
+    # test split is evaluated only offline, never during training.
+    if trains_completion_head and config.completion.val_groups > 0:
         val_data_loader = _data_loader.create_data_loader(
             config,
             split="val",
@@ -663,6 +735,34 @@ def main(config: _config.TrainConfig):
                 shuffle=False,
                 natural_train_eval=True,
             )
+
+    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    jax.block_until_ready(train_state)
+    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+
+    if resuming:
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    start_step = int(train_state.step)
+
+    # For epoch-based training, restore the sampler to the correct epoch and
+    # fast-forward past already-consumed batches *before* the first batch is
+    # drawn, so a resumed run continues the exact deterministic sequence.
+    if is_epoch_based:
+        assert steps_per_epoch is not None
+        boundary_sampler = data_loader.boundary_sampler
+        assert boundary_sampler is not None
+        resume_epoch = start_step // steps_per_epoch
+        skip_batches = start_step % steps_per_epoch
+        boundary_sampler.set_epoch(resume_epoch)
+        boundary_sampler.set_skip_batches(skip_batches)
+        logging.info(
+            "Boundary sampler resume: start_step=%d epoch=%d skip_batches=%d",
+            start_step,
+            resume_epoch,
+            skip_batches,
+        )
+
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -673,13 +773,6 @@ def main(config: _config.TrainConfig):
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
-
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
-
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     if uses_completion_data:
         audit_model = nnx.merge(train_state.model_def, train_state.params)
@@ -719,8 +812,52 @@ def main(config: _config.TrainConfig):
                     "dataset/effective_pos_weight": pos_weight,
                 }
             )
+        if is_epoch_based:
+            boundary_audits = completion_data_info.boundary_episode_audits or {}
+            train_ids = completion_data_info.manifest.episode_ids("train")
+            sampled_positive = sum(boundary_audits[eid].positive_count for eid in train_ids if eid in boundary_audits)
+            boundary_copy_positive = sum(
+                boundary_audits[eid].boundary_copy_count for eid in train_ids if eid in boundary_audits
+            )
+            assert data_loader.boundary_sampler is not None
+            sampled_total = data_loader.boundary_sampler.num_samples
+            sampled_negative = sampled_total - sampled_positive
+            dataset_metrics.update(
+                {
+                    "dataset/steps_per_epoch": steps_per_epoch,
+                    "dataset/total_steps": total_steps,
+                    "dataset/epochs": config.completion.epochs,
+                    "dataset/eval_checkpoint_step": eval_checkpoint_step,
+                    "dataset/train_sampled_positive_count": sampled_positive,
+                    "dataset/train_sampled_negative_count": sampled_negative,
+                    "dataset/train_sampled_pos_neg_ratio": (
+                        sampled_negative / sampled_positive if sampled_positive > 0 else 0.0
+                    ),
+                    "dataset/boundary_copy_positive_count": boundary_copy_positive,
+                }
+            )
         logging.info("Completion dataset metrics: %s", dataset_metrics)
         wandb.log(dataset_metrics, step=0)
+
+    # Predetermine the single test checkpoint (1-epoch end by default) before any
+    # training metric exists, so test data can never influence checkpoint choice.
+    if is_epoch_based:
+        assert eval_checkpoint_step is not None
+        eval_ckpt_path = epath.Path(config.checkpoint_dir) / "eval_checkpoint.json"
+        eval_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_ckpt_path.write_text(
+            json.dumps(
+                {
+                    "eval_checkpoint_step": eval_checkpoint_step,
+                    "steps_per_epoch": steps_per_epoch,
+                    "total_steps": total_steps,
+                    "epochs": config.completion.epochs,
+                }
+            ),
+            encoding="utf-8",
+        )
+        wandb.log({"checkpoint/eval_step": eval_checkpoint_step}, step=0)
+        logging.info("Predetermined eval checkpoint step: %d", eval_checkpoint_step)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config, pos_weight=pos_weight),
@@ -729,17 +866,16 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
     pcompletion_eval_step = None
-    if trains_completion_head:
+    if trains_completion_head and config.completion.val_groups > 0:
         pcompletion_eval_step = jax.jit(
             completion_eval_step,
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         )
 
-    start_step = int(train_state.step)
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
+        range(start_step, total_steps),
         initial=start_step,
-        total=config.num_train_steps,
+        total=total_steps,
         dynamic_ncols=True,
     )
 
@@ -753,12 +889,21 @@ def main(config: _config.TrainConfig):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            if is_epoch_based:
+                log_payload = dict(reduced_info)
+                log_payload["train/epoch"] = step // steps_per_epoch if steps_per_epoch else 0
+                log_payload["train/step"] = step
+                wandb.log(log_payload, step=step)
+            else:
+                wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
 
-        if trains_completion_head and (
-            (step + 1) % config.completion.val_interval == 0 or step == config.num_train_steps - 1
+        if (
+            not is_epoch_based
+            and trains_completion_head
+            and config.completion.val_groups > 0
+            and ((step + 1) % config.completion.val_interval == 0 or step == total_steps - 1)
         ):
             assert pcompletion_eval_step is not None
             assert val_data_loader is not None
@@ -814,7 +959,17 @@ def main(config: _config.TrainConfig):
                 )
                 wandb.log(train_eval_metrics, step=step)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        if is_epoch_based:
+            completed = int(train_state.step)
+            if should_save_epoch_checkpoint(
+                completed,
+                steps_per_epoch=steps_per_epoch if steps_per_epoch is not None else 1,
+                total_steps=total_steps,
+                save_interval=config.save_interval,
+            ):
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, completed)
+                wandb.log({"checkpoint/saved_step": completed}, step=step)
+        elif (step % config.save_interval == 0 and step > start_step) or step == total_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")

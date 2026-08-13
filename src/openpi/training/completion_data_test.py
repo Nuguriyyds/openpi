@@ -75,12 +75,24 @@ def test_invalid_episode_layout_has_clear_error(episode_ids, message):
         completion_data.create_split_manifest(episode_ids, repo_id="org/breakfast")
 
 
-def test_split_manifest_requires_validation_groups():
-    with pytest.raises(ValueError, match="val_groups must be positive"):
+def test_split_manifest_allows_zero_val_groups():
+    """val_groups=0 is valid (disables val); val_groups<0 is rejected."""
+
+    manifest = completion_data.create_split_manifest(
+        range(48),
+        repo_id="org/breakfast",
+        val_groups=0,
+        test_groups=10,
+    )
+    assert len(manifest.episode_ids("val")) == 0
+    assert len(manifest.episode_ids("test")) == 40
+    assert len(manifest.episode_ids("train")) == 8
+
+    with pytest.raises(ValueError, match="val_groups must be non-negative"):
         completion_data.create_split_manifest(
-            range(24),
+            range(48),
             repo_id="org/breakfast",
-            val_groups=0,
+            val_groups=-1,
             test_groups=5,
         )
 
@@ -448,3 +460,251 @@ def test_window_progress_episode_audit_rejects_nonzero_label_on_shorter_episode(
         completion_data.audit_window_progress_episode_parquet(
             path, episode_id=53, expected_length=1, window_frames=15, ramp_start=0.8
         )
+
+
+# ---------------------------------------------------------------------------
+#  Boundary scheme tests
+# ---------------------------------------------------------------------------
+
+_BOUNDARY_GROUP_IDS = (0, 1, 2, 3)
+
+
+def _write_boundary_episode(
+    path,
+    episode_id: int,
+    group_position: int,
+    *,
+    original_length: int = 20,
+    copy_frames: int | None = None,
+    completion_override=None,
+    source_episode_override=None,
+    is_copy_override=None,
+    task_index_override=None,
+):
+    """Writes a synthetic boundary parquet for one episode.
+
+    Default behavior produces a *valid* boundary episode.  Override parameters
+    inject deliberate errors for rejection tests.
+    """
+
+    is_subtask4 = group_position == 3
+    copy_n = 0 if is_subtask4 else (copy_frames if copy_frames is not None else 5)
+    new_length = original_length + copy_n
+    task_index = task_index_override if task_index_override is not None else group_position
+
+    completion = np.zeros(new_length, dtype=np.float32)
+    completion[-10:] = 1.0
+    if completion_override is not None:
+        completion = np.asarray(completion_override, dtype=np.float32)
+
+    source_ep = np.full(new_length, episode_id, dtype=np.int64)
+    source_fr = np.arange(new_length, dtype=np.int64)
+    is_copy = np.zeros(new_length, dtype=np.int8)
+    if not is_subtask4 and copy_n > 0:
+        source_ep[original_length:] = episode_id + 1
+        source_fr[original_length:] = np.arange(copy_n, dtype=np.int64)
+        is_copy[original_length:] = 1
+
+    if source_episode_override is not None:
+        source_ep = np.asarray(source_episode_override, dtype=np.int64)
+    if is_copy_override is not None:
+        is_copy = np.asarray(is_copy_override, dtype=np.int8)
+
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": pa.array([episode_id] * new_length, type=pa.int64()),
+                "frame_index": pa.array(np.arange(new_length, dtype=np.int64), type=pa.int64()),
+                "task_index": pa.array([task_index] * new_length, type=pa.int64()),
+                "completion": pa.array(completion, type=pa.float32()),
+                "source_episode_index": pa.array(source_ep, type=pa.int64()),
+                "source_frame_index": pa.array(source_fr, type=pa.int64()),
+                "is_boundary_copy": pa.array(is_copy, type=pa.int8()),
+            }
+        ),
+        path,
+    )
+    return new_length
+
+
+def test_boundary_audit_accepts_valid_subtask1(tmp_path):
+    path = tmp_path / "episode_000000.parquet"
+    new_len = _write_boundary_episode(path, 0, group_position=0)
+
+    audit = completion_data.audit_boundary_completion_episode_parquet(
+        path,
+        episode_id=0,
+        expected_length=new_len,
+        group_episode_ids=_BOUNDARY_GROUP_IDS,
+        group_position=0,
+    )
+    assert audit.positive_count == 10
+    assert audit.negative_count == new_len - 10
+    assert audit.boundary_copy_count == 5
+    assert audit.is_subtask4 is False
+
+
+def test_boundary_audit_accepts_valid_subtask4(tmp_path):
+    path = tmp_path / "episode_000003.parquet"
+    new_len = _write_boundary_episode(path, 3, group_position=3)
+
+    audit = completion_data.audit_boundary_completion_episode_parquet(
+        path,
+        episode_id=3,
+        expected_length=new_len,
+        group_episode_ids=_BOUNDARY_GROUP_IDS,
+        group_position=3,
+    )
+    assert audit.positive_count == 10
+    assert audit.boundary_copy_count == 0
+    assert audit.is_subtask4 is True
+
+
+def test_boundary_audit_rejects_non_binary_labels(tmp_path):
+    path = tmp_path / "episode_000000.parquet"
+    new_len = _write_boundary_episode(
+        path,
+        0,
+        group_position=0,
+        completion_override=np.array([0] * 15 + [0.5] + [1] * 9, dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="outside 0/1"):
+        completion_data.audit_boundary_completion_episode_parquet(
+            path,
+            episode_id=0,
+            expected_length=new_len,
+            group_episode_ids=_BOUNDARY_GROUP_IDS,
+            group_position=0,
+        )
+
+
+def test_boundary_audit_rejects_wrong_positive_count(tmp_path):
+    """Positives must occupy exactly the last 10 frames; 9 positives (one of the
+    last 10 flipped to 0) is rejected because the structural check fires before
+    the redundant positive-count backstop."""
+
+    path = tmp_path / "episode_000000.parquet"
+    new_len = _write_boundary_episode(
+        path,
+        0,
+        group_position=0,
+        completion_override=np.array([0] * 16 + [1] * 9, dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="last 10 frames"):
+        completion_data.audit_boundary_completion_episode_parquet(
+            path,
+            episode_id=0,
+            expected_length=new_len,
+            group_episode_ids=_BOUNDARY_GROUP_IDS,
+            group_position=0,
+        )
+
+
+def test_boundary_audit_rejects_cross_group_copy(tmp_path):
+    """Copy frames sourced from an episode outside the task group must fail.
+
+    The specific ``source from next episode`` check fires before the redundant
+    cross-group backstop, so we match that message — the intent (rejecting an
+    out-of-group source) is the same.
+    """
+
+    path = tmp_path / "episode_000000.parquet"
+    new_len = _write_boundary_episode(path, 0, group_position=0)
+    # Tamper: set copy-frame source to episode 99 (outside group 0-3).
+    table = pq.read_table(path)
+    src = table["source_episode_index"].to_numpy().copy()
+    src[-5:] = 99
+    table = table.set_column(
+        table.column_names.index("source_episode_index"),
+        "source_episode_index",
+        pa.array(src, type=pa.int64()),
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match="source from next episode"):
+        completion_data.audit_boundary_completion_episode_parquet(
+            path,
+            episode_id=0,
+            expected_length=new_len,
+            group_episode_ids=_BOUNDARY_GROUP_IDS,
+            group_position=0,
+        )
+
+
+def test_boundary_audit_rejects_subtask4_with_copy_frames(tmp_path):
+    path = tmp_path / "episode_000003.parquet"
+    # Subtask 4 must have no copies; inject copies on the trailing rows to
+    # trigger rejection.  (_write_boundary_episode normally refuses to add
+    # copies for subtask 4, so we override is_boundary_copy directly.)
+    new_len = _write_boundary_episode(
+        path,
+        3,
+        group_position=3,
+        is_copy_override=np.array([0] * 15 + [1] * 5, dtype=np.int8),
+    )
+
+    with pytest.raises(ValueError, match="subtask 4.*no boundary copies"):
+        completion_data.audit_boundary_completion_episode_parquet(
+            path,
+            episode_id=3,
+            expected_length=new_len,
+            group_episode_ids=_BOUNDARY_GROUP_IDS,
+            group_position=3,
+        )
+
+
+def test_boundary_train_sample_indices_positive_ordinary_and_forced(tmp_path):
+    """Sampling keeps all positives, every-15-frame ordinary negatives, and
+    forced first-5 negatives for subtasks 2/3/4."""
+
+    path = tmp_path / "episode_000001.parquet"
+    # Subtask 2 (group_position=1): 20 original + 5 copy = 25 frames.
+    new_len = _write_boundary_episode(path, 1, group_position=1)
+    audit = completion_data.audit_boundary_completion_episode_parquet(
+        path,
+        episode_id=1,
+        expected_length=new_len,
+        group_episode_ids=_BOUNDARY_GROUP_IDS,
+        group_position=1,
+    )
+
+    positives, ordinary, forced = completion_data.boundary_train_sample_indices(
+        audit,
+        stride=15,
+        forced_first_n=5,
+    )
+    # All 10 positives kept.
+    assert len(positives) == 10
+    # Ordinary negatives: source_frame % 15 == 0, non-copy, completion==0.
+    # source_frame for original frames = 0..19; on grid: 0, 15 → but 0 is also
+    # a forced negative.  Ordinary grid excludes forced set; dedup happens later.
+    assert len(ordinary) >= 1
+    # Forced negatives: first 5 original frames of subtask 2/3/4.
+    assert len(forced) == 5
+    assert set(forced.tolist()) == {0, 1, 2, 3, 4}
+
+    # Deduped sample set.
+    sample_set = completion_data.build_boundary_train_sample_set(
+        audit,
+        stride=15,
+        forced_first_n=5,
+    )
+    assert len(sample_set) == len(np.unique(sample_set))
+    # All positives in the sample set.
+    assert set(positives.tolist()).issubset(set(sample_set.tolist()))
+
+
+def test_boundary_train_sample_indices_subtask1_has_no_forced_negatives(tmp_path):
+    """Subtask 1 (group_position=0) has no forced first-5 negatives."""
+
+    path = tmp_path / "episode_000000.parquet"
+    new_len = _write_boundary_episode(path, 0, group_position=0)
+    audit = completion_data.audit_boundary_completion_episode_parquet(
+        path,
+        episode_id=0,
+        expected_length=new_len,
+        group_episode_ids=_BOUNDARY_GROUP_IDS,
+        group_position=0,
+    )
+    _, _, forced = completion_data.boundary_train_sample_indices(audit, stride=15, forced_first_n=5)
+    assert len(forced) == 0

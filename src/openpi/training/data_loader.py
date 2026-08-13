@@ -320,6 +320,106 @@ class ProgressStratifiedSampler(torch.utils.data.Sampler[int]):
         return self._batch_count * self._batch_size
 
 
+class BoundaryCompletionSampler(torch.utils.data.Sampler[int]):
+    """Deterministic per-epoch sampler for the boundary completion scheme.
+
+    Builds a fixed training sample set per episode (all positives + every
+    ``negative_stride`` ordinary negative on the source-frame grid + forced
+    first-frame negatives of subtasks 2/3/4), concatenates them across the
+    selected train episodes into one global sample set ``S`` of dataset-local
+    indices, and each epoch yields ``S`` fully shuffled and split into full
+    batches. The final short batch is deterministically padded by repeating the
+    first samples of the epoch so every original sample is visited at least once
+    per epoch and every batch is full-sized (required for device sharding).
+
+    Sampling is fully deterministic given ``(seed, epoch)``: resume reconstructs
+    the same epoch sequence and fast-forwards past already-consumed batches.
+    """
+
+    def __init__(
+        self,
+        episode_ids: Sequence[int],
+        boundary_audits: typing.Mapping[int, _completion_data.BoundaryEpisodeAudit],
+        *,
+        batch_size: int,
+        seed: int,
+        stride: int = 15,
+        forced_first_n: int = 5,
+    ):
+        if batch_size <= 0:
+            raise ValueError("boundary completion sampling requires batch_size > 0")
+        if not episode_ids:
+            raise ValueError("boundary completion sampling requires at least one episode")
+
+        sample_sets: list[np.ndarray] = []
+        offset = 0
+        for raw_episode_id in episode_ids:
+            episode_id = int(raw_episode_id)
+            audit = boundary_audits[episode_id]
+            local = _completion_data.build_boundary_train_sample_set(
+                audit, stride=stride, forced_first_n=forced_first_n
+            )
+            sample_sets.append(local.astype(np.int64) + offset)
+            offset += audit.frame_count
+
+        sample_set = np.concatenate(sample_sets) if sample_sets else np.empty(0, dtype=np.int64)
+        if sample_set.size == 0:
+            raise ValueError("boundary completion sampling produced an empty sample set")
+        if np.unique(sample_set).size != sample_set.size:
+            raise ValueError("boundary completion sample set contains duplicate indices")
+
+        self._sample_set = sample_set
+        self._batch_size = batch_size
+        self._steps_per_epoch = max(1, int(np.ceil(sample_set.size / batch_size)))
+        self._seed = seed
+        self._epoch = 0
+        self._skip_batches = 0
+
+    @property
+    def num_samples(self) -> int:
+        return int(self._sample_set.size)
+
+    @property
+    def steps_per_epoch(self) -> int:
+        return self._steps_per_epoch
+
+    @property
+    def sample_set(self) -> np.ndarray:
+        return self._sample_set
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def set_skip_batches(self, skip_batches: int) -> None:
+        """Fast-forward past ``skip_batches`` batches on the next ``__iter__`` (resume)."""
+
+        if skip_batches < 0:
+            raise ValueError("skip_batches must be non-negative")
+        self._skip_batches = int(skip_batches)
+
+    def _epoch_indices(self, epoch: int) -> np.ndarray:
+        rng = np.random.default_rng(self._seed + epoch)
+        shuffled = rng.permutation(self._sample_set)
+        total = self._steps_per_epoch * self._batch_size
+        if shuffled.size < total:
+            pad = total - shuffled.size
+            shuffled = np.concatenate([shuffled, shuffled[:pad]])
+        return shuffled
+
+    def __iter__(self) -> Iterator[int]:
+        shuffled = self._epoch_indices(self._epoch)
+        self._epoch += 1
+        start = self._skip_batches * self._batch_size
+        self._skip_batches = 0
+        if start >= shuffled.size:
+            return
+        for i in range(start, shuffled.size, self._batch_size):
+            yield from (int(index) for index in shuffled[i : i + self._batch_size])
+
+    def __len__(self) -> int:
+        return (self._steps_per_epoch - self._skip_batches) * self._batch_size
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -641,6 +741,19 @@ def create_data_loader(
             and completion_data_info is not None
             else None
         ),
+        boundary_sampling_config=(
+            config.completion
+            if split == "train" and config.completion.uses_boundary_sampling and not natural_train_eval
+            else None
+        ),
+        boundary_episode_audits=(
+            completion_data_info.boundary_episode_audits
+            if split == "train"
+            and config.completion.uses_boundary_sampling
+            and not natural_train_eval
+            and completion_data_info is not None
+            else None
+        ),
     )
 
 
@@ -662,6 +775,8 @@ def create_torch_data_loader(
     completion_sampling_config: _completion.CompletionTrainingConfig | None = None,
     progress_sampling_config: _completion.CompletionTrainingConfig | None = None,
     completion_episode_audits: typing.Mapping[int, _completion_data.EpisodeAudit] | None = None,
+    boundary_sampling_config: _completion.CompletionTrainingConfig | None = None,
+    boundary_episode_audits: typing.Mapping[int, _completion_data.BoundaryEpisodeAudit] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -741,6 +856,30 @@ def create_torch_data_loader(
             sampler.episode_pool_sizes,
         )
 
+    boundary_sampler = None
+    if boundary_sampling_config is not None:
+        if sampler is not None:
+            raise ValueError("boundary completion sampling cannot be combined with another sampler")
+        if boundary_episode_audits is None or data_config.episodes is None:
+            raise ValueError("boundary completion sampling requires boundary episode audits")
+        sampler = BoundaryCompletionSampler(
+            data_config.episodes,
+            boundary_episode_audits,
+            batch_size=local_batch_size,
+            seed=seed,
+            stride=boundary_sampling_config.negative_stride,
+            forced_first_n=boundary_sampling_config.boundary_copy_frames,
+        )
+        boundary_sampler = sampler
+        logging.info(
+            "Boundary completion sampler: num_samples=%d steps_per_epoch=%d batch=%d stride=%d "
+            "(deterministic shuffle per epoch; last batch padded)",
+            sampler.num_samples,
+            sampler.steps_per_epoch,
+            local_batch_size,
+            boundary_sampling_config.negative_stride,
+        )
+
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
         dataset,
@@ -754,6 +893,7 @@ def create_torch_data_loader(
         framework=framework,
         repeat=repeat,
         drop_last=drop_last,
+        boundary_sampler=boundary_sampler,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -817,6 +957,7 @@ class TorchDataLoader:
         framework: str = "jax",
         repeat: bool = True,
         drop_last: bool = True,
+        boundary_sampler: BoundaryCompletionSampler | None = None,
     ):
         """Create a PyTorch data loader.
 
@@ -849,6 +990,7 @@ class TorchDataLoader:
             )
         self._num_batches = num_batches
         self._repeat = repeat
+        self._boundary_sampler = boundary_sampler
         # Validation must keep every frame, including a final short batch. A
         # data-sharded JAX array still requires that batch to divide evenly
         # across devices, so pad it here and trim the repeated rows in the
@@ -880,6 +1022,10 @@ class TorchDataLoader:
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
+
+    @property
+    def boundary_sampler(self) -> BoundaryCompletionSampler | None:
+        return self._boundary_sampler
 
     def __iter__(self):
         num_items = 0
@@ -989,6 +1135,14 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    @property
+    def boundary_sampler(self) -> BoundaryCompletionSampler | None:
+        """The boundary completion sampler, if this loader was built with one."""
+
+        if isinstance(self._data_loader, TorchDataLoader):
+            return self._data_loader.boundary_sampler
+        return None
 
     def __iter__(self):
         for batch in self._data_loader:

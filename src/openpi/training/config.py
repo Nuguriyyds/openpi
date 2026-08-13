@@ -1358,6 +1358,88 @@ _CONFIGS = [
         fsdp_devices=2,
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
+    # Strict binary completion-detection scheme with cross-subtask boundary
+    # copies. The labeled dataset (produced by scripts/label_completion_boundary.py)
+    # appends the next subtask's first 5 frames to each subtask 1/2/3 episode
+    # (relabelled with the current subtask's task_index, completion=1), giving a
+    # "same observation / different prompt / opposite label" contrast against the
+    # next subtask's original first-5 frames (completion=0). Subtask 4 is labeled
+    # on its own last 10 frames and never crosses the group boundary.
+    #
+    # Training uses plain unweighted BCE (pos_weight=1.0, no focal loss), the
+    # deterministic BoundaryCompletionSampler (all positives + every-15-frame
+    # ordinary negatives + forced first-5 negatives of subtasks 2/3/4), and is
+    # epoch-based (default 1 epoch; --completion.epochs 2 allowed). The val split
+    # is disabled (val_groups=0): the old val+test groups merge into a single
+    # 40-episode test split evaluated only offline, never during training.
+    TrainConfig(
+        name="pi05_agilex_breakfast_frozen_head_s2_completion_boundary",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="agilex_make_breakfast_subtask_730_frozen_head_completion_boundary",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/models/wyt/data",
+            ),
+        ),
+        training_time_rtc=_ttrtc.TrainingTimeRTCConfig(
+            enabled=True,
+            simulated_delay=5,
+            delay_sampling="exponential",
+            clean_timestep=0.0,
+            loss_normalization="reference",
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            label_key="completion",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/"
+                "agilex_make_breakfast_subtask_730_frozen_head_completion_boundary.json"
+            ),
+            split_manifest_repo_id="agilex_make_breakfast_subtask_730_frozen_head_completion_boundary",
+            split_seed=42,
+            episodes_per_group=4,
+            val_groups=0,
+            test_groups=10,
+            val_interval=1_000,
+            warmup_steps=50,
+            peak_lr=3e-5,
+            decay_lr=3e-6,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+            focal_gamma=0.0,
+            bce_pos_weight_override=1.0,
+            boundary_sampling=True,
+            negative_stride=15,
+            boundary_copy_frames=5,
+            epochs=1,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(enabled=True),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_frozen_head_s1_action/s1_action/49999/params",
+            missing_regex=r"completion_head/.*",
+        ),
+        num_train_steps=2_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        batch_size=64,
+        num_workers=4,
+        log_interval=100,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=2,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
     #
     # Fine-tuning Aloha configs.
     #
