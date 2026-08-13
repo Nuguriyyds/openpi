@@ -988,6 +988,13 @@ def main(config: _config.TrainConfig):
                         if dst.exists():
                             dst.rmtree()
                         shutil.copytree(str(src), str(dst))
+                        # Write a step marker inside the protected copy so the
+                        # evaluator can verify it matches the requested step
+                        # (P1-A: prevent the protected copy from masquerading
+                        # as a different step).
+                        (dst / "_protected_step.json").write_text(
+                            json.dumps({"step": completed}), encoding="utf-8"
+                        )
                         logging.info("Protected eval checkpoint copy: %s -> %s", src, dst)
         elif (step % config.save_interval == 0 and step > start_step) or step == total_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

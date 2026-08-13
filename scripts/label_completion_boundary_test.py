@@ -285,8 +285,8 @@ def test_write_boundary_meta_patches_info_and_episodes(tmp_path):
 
 
 def test_write_boundary_meta_skips_stale_stats_files(tmp_path):
-    """P1-3: stats.json, episodes_stats.jsonl, and stats/ must not be copied
-    (they describe the old dataset and would be stale)."""
+    """P1-B: stats.json, episodes_stats.jsonl, and stats/ must not be copied
+    (they are recomputed from final data by compute_boundary_stats)."""
 
     src_root = tmp_path / "src"
     dst_root = tmp_path / "dst"
@@ -311,13 +311,68 @@ def test_write_boundary_meta_skips_stale_stats_files(tmp_path):
     )
 
     dst_meta = dst_root / "meta"
-    # Stale stats files must NOT exist in the output.
+    # Stale stats files must NOT exist after write_boundary_meta (they are
+    # recomputed later by compute_boundary_stats).
     assert not (dst_meta / "stats.json").exists()
     assert not (dst_meta / "episodes_stats.jsonl").exists()
     assert not (dst_meta / "stats").exists()
     # But episodes.jsonl and info.json should be present (patched).
     assert (dst_meta / "info.json").exists()
     assert (dst_meta / "episodes.jsonl").exists()
+
+
+def test_compute_boundary_stats_writes_valid_stats(tmp_path):
+    """P1-B: compute_boundary_stats produces episodes_stats.jsonl + stats.json
+    with correct frame counts from the boundary parquet data."""
+
+    src_root = tmp_path / "src"
+    dst_root = tmp_path / "dst"
+    num_episodes = 4
+    _make_source_dataset(src_root, num_episodes=num_episodes)
+    new_lengths = _process_all_parquets(src_root, dst_root, num_episodes=num_episodes)
+    total_frames = sum(new_lengths.values())
+    lcb.write_boundary_meta(
+        src_root / "meta",
+        dst_root / "meta",
+        new_lengths=new_lengths,
+        total_frames=total_frames,
+        fps=FPS,
+    )
+
+    # Compute stats.
+    lcb.compute_boundary_stats(
+        dst_root,
+        src_root / "meta",
+        new_lengths=new_lengths,
+        chunks_size=CHUNKS_SIZE,
+        video_keys=[VIDEO_KEY],
+    )
+
+    dst_meta = dst_root / "meta"
+    # Both stats files must exist.
+    assert (dst_meta / "stats.json").exists()
+    assert (dst_meta / "episodes_stats.jsonl").exists()
+
+    # Verify stats.json: each feature has min/max/mean/std/count.
+    global_stats = json.loads((dst_meta / "stats.json").read_text())
+    for feat_name in ("frame_index", "task_index", "completion", "is_boundary_copy"):
+        assert feat_name in global_stats, f"missing feature in stats: {feat_name}"
+        feat_stats = global_stats[feat_name]
+        for key in ("min", "max", "mean", "std", "count"):
+            assert key in feat_stats, f"missing key '{key}' in stats for {feat_name}"
+        # Count must match total frames.
+        assert int(feat_stats["count"][0]) == total_frames
+
+    # Verify episodes_stats.jsonl: one line per episode, correct episode_index.
+    lines = (dst_meta / "episodes_stats.jsonl").read_text().strip().splitlines()
+    assert len(lines) == num_episodes
+    for i, line in enumerate(lines):
+        record = json.loads(line)
+        assert record["episode_index"] == i
+        assert "stats" in record
+        # Each episode's count should match its new length.
+        for feat_stats in record["stats"].values():
+            assert int(feat_stats["count"][0]) == new_lengths[i]
 
 
 def test_full_audit_and_label_audit_json(tmp_path):
@@ -425,7 +480,7 @@ def test_cross_group_copy_triggers_audit_failure(tmp_path):
 
 def test_video_extension_matches_parquet_rows(tmp_path):
     """Extended videos for subtasks 1/2/3 have original + 5 frames; subtask 4
-    videos are copied unchanged."""
+    videos are re-encoded (lossless) to match the same encoding pipeline (P1-D)."""
 
     src_root = tmp_path / "src"
     dst_root = tmp_path / "dst"

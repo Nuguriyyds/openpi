@@ -9,7 +9,10 @@ threshold is fixed at 0.5; best-F1 / best-threshold are reported as
 Only one checkpoint is evaluated — there is no multi-checkpoint iteration and
 no ``latest`` alias.  The checkpoint step must be specified explicitly and must
 match the step preregistered in ``eval_checkpoint.json`` (written during
-training), unless ``--allow-unregistered-checkpoint`` is passed.
+training).  Bypassing preregistration is forbidden to prevent test-set model
+selection.  When the managed step directory was deleted by ``max_to_keep=1``,
+the protected ``eval_checkpoint/`` copy is used, but only if its
+``_protected_step.json`` marker matches the requested step (P1-A).
 """
 
 from __future__ import annotations
@@ -254,7 +257,8 @@ def _resolve_single_checkpoint(checkpoint_root: Path, step: int) -> Path:
 
     Checks the managed ``<step>/`` directory first, then falls back to the
     protected ``eval_checkpoint/`` copy (written by train.py when epochs>1 to
-    survive max_to_keep=1 cleanup).
+    survive max_to_keep=1 cleanup).  When falling back, the protected copy's
+    ``_protected_step.json`` marker must match the requested step (P1-A).
     """
 
     if not checkpoint_root.is_dir():
@@ -262,9 +266,23 @@ def _resolve_single_checkpoint(checkpoint_root: Path, step: int) -> Path:
     checkpoint_dir = checkpoint_root / str(step)
     if checkpoint_dir.is_dir() and (checkpoint_dir / "params").is_dir():
         return checkpoint_dir
-    # Fall back to protected copy (P1-1).
+    # Fall back to protected copy (P1-1), but verify the step marker (P1-A).
     protected = checkpoint_root / "eval_checkpoint"
     if protected.is_dir() and (protected / "params").is_dir():
+        marker_path = protected / "_protected_step.json"
+        if not marker_path.is_file():
+            raise FileNotFoundError(
+                f"Protected eval_checkpoint copy exists at {protected} but has no "
+                f"_protected_step.json marker. Cannot verify it matches requested step {step}."
+            )
+        marker = _read_json(marker_path)
+        protected_step = int(marker["step"])
+        if protected_step != step:
+            raise ValueError(
+                f"Protected eval_checkpoint copy is for step {protected_step}, not {step}. "
+                f"The requested step was deleted by the checkpoint manager (max_to_keep=1) "
+                f"and the protected copy does not match."
+            )
         LOGGER.info("Using protected eval_checkpoint copy (managed step %d may have been cleaned up)", step)
         return protected
     available = sorted(p.name for p in checkpoint_root.iterdir() if p.is_dir() and p.name.isdigit())
@@ -286,42 +304,33 @@ def _load_predictions(path: Path) -> dict[str, np.ndarray]:
 def _verify_eval_checkpoint_binding(
     checkpoint_root: Path,
     requested_step: int,
-    *,
-    allow_unregistered: bool,
 ) -> dict[str, Any]:
-    """P1-2: Binds the requested checkpoint step to the preregistered step.
+    """P1-2 + P1-A: Binds the requested checkpoint step to the preregistered step.
 
-    Reads ``eval_checkpoint.json`` from the checkpoint directory.  If it exists,
-    the requested step must match the preregistered step (unless
-    ``allow_unregistered`` is True).  If it does not exist,
-    ``allow_unregistered`` must be True.
+    Reads ``eval_checkpoint.json`` from the checkpoint directory.  The file
+    must exist (training must have preregistered the eval checkpoint) and the
+    requested step must match the preregistered step.  There is no override —
+    bypassing preregistration is forbidden to prevent test-set model selection.
     """
 
     eval_ckpt_path = checkpoint_root / "eval_checkpoint.json"
     if not eval_ckpt_path.is_file():
-        if not allow_unregistered:
-            raise FileNotFoundError(
-                f"No eval_checkpoint.json found in {checkpoint_root}. "
-                "The checkpoint step was not preregistered during training. "
-                "Pass --allow-unregistered-checkpoint to override (records the override in results)."
-            )
-        return {"preregistered": False, "step": requested_step, "override_reason": "no eval_checkpoint.json"}
+        raise FileNotFoundError(
+            f"No eval_checkpoint.json found in {checkpoint_root}. "
+            "The checkpoint step was not preregistered during training. "
+            "Bypassing preregistration is forbidden — the eval checkpoint must be "
+            "predetermined before training to prevent test-set model selection."
+        )
 
     eval_info = _read_json(eval_ckpt_path)
     preregistered_step = int(eval_info["eval_checkpoint_step"])
     if requested_step != preregistered_step:
-        if not allow_unregistered:
-            raise ValueError(
-                f"Requested checkpoint step {requested_step} does not match the preregistered "
-                f"eval checkpoint step {preregistered_step} (from {eval_ckpt_path}). "
-                "Pass --allow-unregistered-checkpoint to override (records the override in results)."
-            )
-        return {
-            "preregistered": False,
-            "step": requested_step,
-            "preregistered_step": preregistered_step,
-            "override_reason": f"requested {requested_step} != preregistered {preregistered_step}",
-        }
+        raise ValueError(
+            f"Requested checkpoint step {requested_step} does not match the preregistered "
+            f"eval checkpoint step {preregistered_step} (from {eval_ckpt_path}). "
+            "Bypassing preregistration is forbidden — the eval checkpoint must be "
+            "predetermined before training to prevent test-set model selection."
+        )
     return {"preregistered": True, "step": preregistered_step}
 
 
@@ -346,11 +355,10 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
 
     checkpoint_root = (args.checkpoint_base / args.config_name / args.exp_name).resolve()
 
-    # P1-2: Bind to the preregistered eval checkpoint.
+    # P1-2 + P1-A: Bind to the preregistered eval checkpoint (no bypass).
     eval_binding = _verify_eval_checkpoint_binding(
         checkpoint_root,
         args.checkpoint_step,
-        allow_unregistered=args.allow_unregistered_checkpoint,
     )
 
     checkpoint_dir = _resolve_single_checkpoint(checkpoint_root, args.checkpoint_step)
@@ -512,13 +520,8 @@ def _parse_args() -> argparse.Namespace:
         "--checkpoint-step",
         type=int,
         required=True,
-        help="Single explicit checkpoint step to evaluate (no 'latest', no multi-checkpoint).",
-    )
-    parser.add_argument(
-        "--allow-unregistered-checkpoint",
-        action="store_true",
-        help="Allow evaluating a checkpoint not preregistered in eval_checkpoint.json. "
-        "Records the override in results. Use with caution — test data must not be used for model selection.",
+        help="Single explicit checkpoint step to evaluate (no 'latest', no multi-checkpoint). "
+        "Must match the step preregistered in eval_checkpoint.json during training.",
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)

@@ -367,8 +367,9 @@ def test_epoch_based_wandb_log_has_no_val_or_test_keys():
 
 
 def test_epoch_based_protects_eval_checkpoint():
-    """AST guard (P1-1): when ``completed == eval_checkpoint_step`` and epochs>1,
-    train.main must copy the checkpoint to a protected ``eval_checkpoint/`` dir,
+    """AST guard (P1-1 + P1-A): when ``completed == eval_checkpoint_step`` and
+    epochs>1, train.main must copy the checkpoint to a protected
+    ``eval_checkpoint/`` dir **with a step marker** (``_protected_step.json``),
     and at training end must assert the eval checkpoint still exists."""
 
     source_text = textwrap.dedent(inspect.getsource(train.main))
@@ -397,6 +398,14 @@ def test_epoch_based_protects_eval_checkpoint():
     ]
     assert eval_checkpoint_strings, "expected 'eval_checkpoint' string literal in train.main"
 
-    # 3. The end-of-training assertion references the checkpoint manager
+    # 3. P1-A: A _protected_step.json marker is written inside the protected copy.
+    protected_step_strings = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "_protected_step" in node.value
+    ]
+    assert protected_step_strings, "expected '_protected_step.json' marker in train.main"
+
+    # 4. The end-of-training assertion references the checkpoint manager
     #    (max_to_keep=1) as the deletion cause.
     assert "max_to_keep" in source_text or "checkpoint manager" in source_text.lower()
