@@ -338,9 +338,24 @@ def extend_episode_video(
     dst_video: pathlib.Path,
     copy_frames: int,
 ) -> None:
-    """Extends ``current_video`` with the first ``copy_frames`` frames of ``next_video``."""
+    """Extends ``current_video`` with the first ``copy_frames`` frames of ``next_video``.
+
+    Writes to a ``.tmp`` path first and verifies the frame count before
+    atomically renaming, so a failed ffmpeg never leaves a truncated file at
+    the final path (P1-4).
+
+    Note (P2-1): Both the current video and the appended frames are re-encoded
+    with CRF 20 (lossy).  The same source observation appears in two different
+    encodings: as a copy frame in the previous subtask's extended video
+    (re-encoded here) and as an original frame in its own video (copied as-is
+    for subtask 4, or re-encoded for subtasks 1-3).  Pixel-level consistency
+    between the positive (copy) and negative (original first-5) contrast pair
+    is therefore not guaranteed.  This is an accepted limitation of the
+    boundary scheme; it does not affect label correctness.
+    """
 
     filter_complex = f"[1:v]trim=end_frame={copy_frames},setpts=PTS-STARTPTS[n5];[0:v][n5]concat=n=2:v=1:a=0[outv]"
+    tmp_video = dst_video.with_suffix(".mp4.tmp")
     cmd = [
         "ffmpeg",
         "-y",
@@ -352,6 +367,8 @@ def extend_episode_video(
         filter_complex,
         "-map",
         "[outv]",
+        "-f",
+        "mp4",
         "-c:v",
         "libx264",
         "-preset",
@@ -361,11 +378,15 @@ def extend_episode_video(
         "-an",
         "-pix_fmt",
         "yuv420p",
-        str(dst_video),
+        str(tmp_video),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
+        # Clean up partial output.
+        if tmp_video.exists():
+            tmp_video.unlink()
         raise RuntimeError(f"ffmpeg failed for {current_video.name} + {next_video.name}: {result.stderr[-500:]}")
+    os.replace(tmp_video, dst_video)
 
 
 def process_episode_videos(
@@ -378,8 +399,13 @@ def process_episode_videos(
     copy_n: int,
     *,
     force: bool,
+    expected_length: int,
 ) -> dict:
-    """Copies or extends all camera videos for one episode."""
+    """Copies or extends all camera videos for one episode.
+
+    After writing each video, verifies the frame count matches
+    ``expected_length`` using ffprobe (P1-4).
+    """
 
     for key in video_keys:
         src_video = get_episode_video_path(src_root, episode_id, key, chunks_size)
@@ -397,7 +423,18 @@ def process_episode_videos(
                 raise FileNotFoundError(f"next video not found: {next_video}")
             extend_episode_video(src_video, next_video, dst_video, copy_n)
         else:
-            shutil.copy2(src_video, dst_video)
+            tmp_video = dst_video.with_suffix(".mp4.tmp")
+            shutil.copy2(src_video, tmp_video)
+            os.replace(tmp_video, dst_video)
+
+        # Verify frame count (P1-4).
+        nb = count_video_frames(dst_video)
+        if nb != expected_length:
+            dst_video.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"video frame count mismatch for episode {episode_id} key {key}: "
+                f"video {nb} frames != expected {expected_length}"
+            )
     return {"ok": 1}
 
 
@@ -411,6 +448,7 @@ def _process_video_worker(args: tuple) -> dict:
         chunks_size,
         copy_n,
         force,
+        expected_length,
     ) = args
     try:
         return process_episode_videos(
@@ -422,6 +460,7 @@ def _process_video_worker(args: tuple) -> dict:
             chunks_size=chunks_size,
             copy_n=copy_n,
             force=force,
+            expected_length=expected_length,
         )
     except Exception as exc:
         return {"error": str(exc), "episode": episode_id}
@@ -432,6 +471,12 @@ def _process_video_worker(args: tuple) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# P1-3: LeRobot stats files computed from data.  These become stale after
+# frame copies and must NOT be copied as-is.  The training pipeline recomputes
+# them on first use.
+_STATS_FILES_TO_SKIP = {"stats.json", "episodes_stats.jsonl", "stats"}
+
+
 def write_boundary_meta(
     src_meta: pathlib.Path,
     dst_meta: pathlib.Path,
@@ -440,11 +485,20 @@ def write_boundary_meta(
     total_frames: int,
     fps: float,
 ) -> None:
-    """Copies ``meta/`` and patches ``info.json`` + ``episodes.jsonl``."""
+    """Copies ``meta/`` and patches ``info.json`` + ``episodes.jsonl``.
+
+    Stats files (``stats.json``, ``episodes_stats.jsonl``, ``stats/``) are
+    deliberately skipped — they describe the *original* frame distribution and
+    become stale after boundary copies.  The training pipeline recomputes them
+    on first use.
+    """
 
     dst_meta.mkdir(parents=True, exist_ok=True)
     for item in src_meta.iterdir():
         if item.name == "info.json":
+            continue
+        # P1-3: Skip stale stats files.
+        if item.name in _STATS_FILES_TO_SKIP:
             continue
         dst_item = dst_meta / item.name
         if item.is_file():
@@ -817,6 +871,7 @@ def main() -> None:
                     chunks_size,
                     copy_n,
                     args.force,
+                    new_lengths[eid],
                 )
             )
 
@@ -834,19 +889,8 @@ def main() -> None:
             print(f"    episode_{eid:06d}: {table.num_rows} rows")
         return
 
-    # --- 1. Write meta/ ---
-    print("\n[1/4] Writing meta/ ...")
-    write_boundary_meta(
-        src_root / "meta",
-        dst_root / "meta",
-        new_lengths=new_lengths,
-        total_frames=total_frames,
-        fps=fps,
-    )
-    print(f"  Patched info.json (label_scheme=boundary, total_frames={total_frames})")
-
-    # --- 2. Process parquet files ---
-    print(f"\n[2/4] Processing {len(parquet_jobs)} parquet files with {args.workers} worker(s) ...")
+    # --- 1. Process parquet files ---
+    print(f"\n[1/4] Processing {len(parquet_jobs)} parquet files with {args.workers} worker(s) ...")
     total_written = 0
     total_skipped = 0
     errors: list[dict] = []
@@ -875,11 +919,11 @@ def main() -> None:
             print(f"    episode {err.get('episode', '?')}: {err.get('error', '?')}")
         sys.exit(1)
 
-    # --- 3. Process videos ---
+    # --- 2. Process videos ---
     if args.skip_videos:
-        print("\n[3/4] Skipping videos (--skip-videos)")
+        print("\n[2/4] Skipping videos (--skip-videos)")
     else:
-        print(f"\n[3/4] Processing {len(video_jobs)} video episodes with {args.workers} worker(s) ...")
+        print(f"\n[2/4] Processing {len(video_jobs)} video episodes with {args.workers} worker(s) ...")
         vid_errors: list[dict] = []
         if args.workers <= 1:
             for item in tqdm.tqdm(video_jobs, desc="Processing videos"):
@@ -903,6 +947,19 @@ def main() -> None:
                 print(f"    episode {err.get('episode', '?')}: {err.get('error', '?')}")
             sys.exit(1)
         print("  Done.")
+
+    # --- 3. Write meta/ ---
+    # Written after parquet + videos so that a failure during data generation
+    # does not leave a half-finished dataset that looks valid (P1-4).
+    print("\n[3/4] Writing meta/ ...")
+    write_boundary_meta(
+        src_root / "meta",
+        dst_root / "meta",
+        new_lengths=new_lengths,
+        total_frames=total_frames,
+        fps=fps,
+    )
+    print(f"  Patched info.json (label_scheme=boundary, total_frames={total_frames})")
 
     # --- 4. Audit + label_audit.json ---
     print("\n[4/4] Auditing dataset ...")

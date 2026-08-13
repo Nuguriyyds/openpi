@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import platform
+import shutil
 from typing import Any
 
 import etils.epath as epath
@@ -969,11 +970,41 @@ def main(config: _config.TrainConfig):
             ):
                 _checkpoints.save_state(checkpoint_manager, train_state, data_loader, completed)
                 wandb.log({"checkpoint/saved_step": completed}, step=step)
+                # P1: Protect the predetermined eval checkpoint from max_to_keep=1
+                # cleanup.  When epochs>1 the checkpoint manager may delete the
+                # epoch-1 checkpoint after the epoch-2 checkpoint is saved (if the
+                # step is not a multiple of keep_period).  We copy it to a separate
+                # directory the manager does not manage.
+                if (
+                    eval_checkpoint_step is not None
+                    and completed == eval_checkpoint_step
+                    and config.completion.epochs is not None
+                    and config.completion.epochs > 1
+                ):
+                    checkpoint_manager.wait_until_finished()
+                    src = epath.Path(config.checkpoint_dir) / str(completed)
+                    dst = epath.Path(config.checkpoint_dir) / "eval_checkpoint"
+                    if src.is_dir():
+                        if dst.exists():
+                            dst.rmtree()
+                        shutil.copytree(str(src), str(dst))
+                        logging.info("Protected eval checkpoint copy: %s -> %s", src, dst)
         elif (step % config.save_interval == 0 and step > start_step) or step == total_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+
+    # P1: Assert the predetermined eval checkpoint survived training.
+    if is_epoch_based and eval_checkpoint_step is not None:
+        eval_ckpt_managed = epath.Path(config.checkpoint_dir) / str(eval_checkpoint_step)
+        eval_ckpt_protected = epath.Path(config.checkpoint_dir) / "eval_checkpoint"
+        if not eval_ckpt_managed.is_dir() and not eval_ckpt_protected.is_dir():
+            raise FileNotFoundError(
+                f"Predetermined eval checkpoint (step {eval_checkpoint_step}) was deleted by the "
+                f"checkpoint manager (max_to_keep=1) and no protected copy exists. "
+                f"This should not happen — please report this bug."
+            )
 
 
 if __name__ == "__main__":

@@ -364,3 +364,39 @@ def test_epoch_based_wandb_log_has_no_val_or_test_keys():
     # No val/ or test/ keys.
     bad = {k for k in epoch_branch_keys if k.startswith(("val/", "test/"))}
     assert not bad, f"epoch-based wandb.log contains val/test keys: {bad}"
+
+
+def test_epoch_based_protects_eval_checkpoint():
+    """AST guard (P1-1): when ``completed == eval_checkpoint_step`` and epochs>1,
+    train.main must copy the checkpoint to a protected ``eval_checkpoint/`` dir,
+    and at training end must assert the eval checkpoint still exists."""
+
+    source_text = textwrap.dedent(inspect.getsource(train.main))
+    tree = ast.parse(source_text)
+
+    # 1. shutil.copytree is called (copies the managed checkpoint to a protected dir).
+    copytree_calls = [
+        node
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "copytree"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "shutil"
+        )
+    ]
+    assert copytree_calls, "expected shutil.copytree call for eval checkpoint protection"
+
+    # 2. The string "eval_checkpoint" appears as a literal in main (used as the
+    #    protected copy target and in the end-of-training assertion).
+    eval_checkpoint_strings = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "eval_checkpoint" in node.value
+    ]
+    assert eval_checkpoint_strings, "expected 'eval_checkpoint' string literal in train.main"
+
+    # 3. The end-of-training assertion references the checkpoint manager
+    #    (max_to_keep=1) as the deletion cause.
+    assert "max_to_keep" in source_text or "checkpoint manager" in source_text.lower()

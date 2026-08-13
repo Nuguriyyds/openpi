@@ -8,6 +8,7 @@ diagnostic-only (not used as the deployment threshold).
 # ruff: noqa: SLF001  -- tests intentionally access private functions
 from __future__ import annotations
 
+import json
 import sys
 
 import numpy as np
@@ -150,6 +151,53 @@ def test_compute_set_metrics_best_f1_is_diagnostic():
     assert "best_threshold" in overall
 
 
+def test_compute_set_metrics_sparse_nullifies_time_metrics():
+    """P1-5: sparse view must nullify time-delay metrics and add a note."""
+
+    ep_idx, tk_idx, fr_idx, logits, targets, infer_ms = _make_synthetic_predictions()
+    result = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+        report_time_metrics=False,
+    )
+    overall = result["overall"]
+    # Time-delay keys must be None.
+    for key in ecb._TIME_METRIC_KEYS:
+        assert key not in overall or overall[key] is None, f"{key} should be None for sparse view"
+    # Must have the explanatory note.
+    assert "time_metrics_note" in overall
+    # Per-task time metrics also nullified.
+    for task_metrics in result["per_task"].values():
+        for key in ecb._TIME_METRIC_KEYS:
+            assert key not in task_metrics or task_metrics[key] is None
+
+
+def test_compute_set_metrics_full_keeps_time_metrics():
+    """P1-5: full view must keep time-delay metrics (not nullified)."""
+
+    ep_idx, tk_idx, fr_idx, logits, targets, infer_ms = _make_synthetic_predictions()
+    result = ecb._compute_set_metrics(
+        ep_idx,
+        tk_idx,
+        fr_idx,
+        logits,
+        targets,
+        infer_ms,
+        fps=30.0,
+        threshold=0.5,
+        report_time_metrics=True,
+    )
+    overall = result["overall"]
+    # Full view should NOT have the nullification note.
+    assert "time_metrics_note" not in overall
+
+
 # ---------------------------------------------------------------------------
 # _resolve_single_checkpoint
 # ---------------------------------------------------------------------------
@@ -182,7 +230,7 @@ def test_resolve_single_checkpoint_rejects_missing_params(tmp_path):
     checkpoint_root = tmp_path / "ckpts"
     (checkpoint_root / "100").mkdir(parents=True)  # no params/ subdir
 
-    with pytest.raises(FileNotFoundError, match="Checkpoint params not found"):
+    with pytest.raises(FileNotFoundError, match="Checkpoint step 100 not found"):
         ecb._resolve_single_checkpoint(checkpoint_root, 100)
 
 
@@ -195,6 +243,101 @@ def test_resolve_single_checkpoint_no_latest_alias(tmp_path):
     # and _resolve_single_checkpoint looks for str(step) = "999").
     with pytest.raises(FileNotFoundError, match="not found"):
         ecb._resolve_single_checkpoint(checkpoint_root, 999)
+
+
+def test_resolve_single_checkpoint_falls_back_to_protected_copy(tmp_path):
+    """When the managed step dir was cleaned up (max_to_keep=1), fall back to eval_checkpoint/."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    # Simulate: step 200 was deleted by the checkpoint manager, but a protected
+    # copy exists at eval_checkpoint/.
+    (checkpoint_root / "eval_checkpoint" / "params").mkdir(parents=True)
+    resolved = ecb._resolve_single_checkpoint(checkpoint_root, 200)
+    assert resolved == checkpoint_root / "eval_checkpoint"
+
+
+def test_resolve_single_checkpoint_prefers_managed_over_protected(tmp_path):
+    """If both the managed dir and the protected copy exist, prefer the managed dir."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    (checkpoint_root / "200" / "params").mkdir(parents=True)
+    (checkpoint_root / "eval_checkpoint" / "params").mkdir(parents=True)
+    resolved = ecb._resolve_single_checkpoint(checkpoint_root, 200)
+    assert resolved == checkpoint_root / "200"
+
+
+def test_resolve_single_checkpoint_protected_missing_params(tmp_path):
+    """Protected copy without params/ is not a valid fallback."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    (checkpoint_root / "eval_checkpoint").mkdir(parents=True)  # no params/
+    with pytest.raises(FileNotFoundError, match="not found"):
+        ecb._resolve_single_checkpoint(checkpoint_root, 200)
+
+
+# ---------------------------------------------------------------------------
+# _verify_eval_checkpoint_binding
+# ---------------------------------------------------------------------------
+
+
+def test_verify_binding_matches_preregistered(tmp_path):
+    """When the requested step matches eval_checkpoint.json, binding succeeds."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    checkpoint_root.mkdir()
+    (checkpoint_root / "eval_checkpoint.json").write_text(
+        json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8"
+    )
+    result = ecb._verify_eval_checkpoint_binding(checkpoint_root, 500, allow_unregistered=False)
+    assert result["preregistered"] is True
+    assert result["step"] == 500
+
+
+def test_verify_binding_rejects_mismatch(tmp_path):
+    """Mismatched step raises ValueError without override."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    checkpoint_root.mkdir()
+    (checkpoint_root / "eval_checkpoint.json").write_text(
+        json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="does not match the preregistered"):
+        ecb._verify_eval_checkpoint_binding(checkpoint_root, 300, allow_unregistered=False)
+
+
+def test_verify_binding_allows_mismatch_with_override(tmp_path):
+    """Mismatched step is allowed with --allow-unregistered-checkpoint."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    checkpoint_root.mkdir()
+    (checkpoint_root / "eval_checkpoint.json").write_text(
+        json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8"
+    )
+    result = ecb._verify_eval_checkpoint_binding(checkpoint_root, 300, allow_unregistered=True)
+    assert result["preregistered"] is False
+    assert result["step"] == 300
+    assert result["preregistered_step"] == 500
+    assert "override_reason" in result
+
+
+def test_verify_binding_rejects_missing_json(tmp_path):
+    """No eval_checkpoint.json raises FileNotFoundError without override."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    checkpoint_root.mkdir()
+    with pytest.raises(FileNotFoundError, match="No eval_checkpoint.json found"):
+        ecb._verify_eval_checkpoint_binding(checkpoint_root, 500, allow_unregistered=False)
+
+
+def test_verify_binding_allows_missing_json_with_override(tmp_path):
+    """No eval_checkpoint.json is allowed with --allow-unregistered-checkpoint."""
+
+    checkpoint_root = tmp_path / "ckpts"
+    checkpoint_root.mkdir()
+    result = ecb._verify_eval_checkpoint_binding(checkpoint_root, 500, allow_unregistered=True)
+    assert result["preregistered"] is False
+    assert result["step"] == 500
+    assert result["override_reason"] == "no eval_checkpoint.json"
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +409,8 @@ def test_cli_accepts_explicit_int_step(monkeypatch):
     )
     args = ecb._parse_args()
     assert args.checkpoint_step == 500
-    assert args.threshold == 0.5  # default fixed threshold
+    assert args.config_repo_id == "agilex_make_breakfast_subtask_730_frozen_head_completion_boundary"
+    assert args.allow_unregistered_checkpoint is False
 
 
 # ---------------------------------------------------------------------------

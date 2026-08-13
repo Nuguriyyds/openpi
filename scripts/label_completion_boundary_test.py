@@ -284,6 +284,42 @@ def test_write_boundary_meta_patches_info_and_episodes(tmp_path):
         assert rec["length"] == new_lengths[rec["episode_index"]]
 
 
+def test_write_boundary_meta_skips_stale_stats_files(tmp_path):
+    """P1-3: stats.json, episodes_stats.jsonl, and stats/ must not be copied
+    (they describe the old dataset and would be stale)."""
+
+    src_root = tmp_path / "src"
+    dst_root = tmp_path / "dst"
+    _make_source_dataset(src_root, num_episodes=4)
+
+    # Add stale stats files to the source meta.
+    src_meta = src_root / "meta"
+    (src_meta / "stats.json").write_text('{"stale": true}', encoding="utf-8")
+    (src_meta / "episodes_stats.jsonl").write_text('{"stale": true}\n', encoding="utf-8")
+    stats_dir = src_meta / "stats"
+    stats_dir.mkdir()
+    (stats_dir / "observation.state.joint.json").write_text('{"stale": true}', encoding="utf-8")
+
+    new_lengths = _compute_new_lengths(4)
+    total_frames = sum(new_lengths.values())
+    lcb.write_boundary_meta(
+        src_root / "meta",
+        dst_root / "meta",
+        new_lengths=new_lengths,
+        total_frames=total_frames,
+        fps=FPS,
+    )
+
+    dst_meta = dst_root / "meta"
+    # Stale stats files must NOT exist in the output.
+    assert not (dst_meta / "stats.json").exists()
+    assert not (dst_meta / "episodes_stats.jsonl").exists()
+    assert not (dst_meta / "stats").exists()
+    # But episodes.jsonl and info.json should be present (patched).
+    assert (dst_meta / "info.json").exists()
+    assert (dst_meta / "episodes.jsonl").exists()
+
+
 def test_full_audit_and_label_audit_json(tmp_path):
     """End-to-end: generate parquets + meta + audit, verify label_audit.json."""
 
@@ -411,6 +447,7 @@ def test_video_extension_matches_parquet_rows(tmp_path):
             CHUNKS_SIZE,
             copy_n,
             force=True,
+            expected_length=new_lengths[eid],
         )
 
     for eid in range(num_episodes):

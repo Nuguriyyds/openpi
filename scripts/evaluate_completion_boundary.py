@@ -7,7 +7,9 @@ threshold is fixed at 0.5; best-F1 / best-threshold are reported as
 **diagnostics only** and never influence the threshold or checkpoint choice.
 
 Only one checkpoint is evaluated — there is no multi-checkpoint iteration and
-no ``latest`` alias.  The checkpoint step must be specified explicitly.
+no ``latest`` alias.  The checkpoint step must be specified explicitly and must
+match the step preregistered in ``eval_checkpoint.json`` (written during
+training), unless ``--allow-unregistered-checkpoint`` is passed.
 """
 
 from __future__ import annotations
@@ -52,6 +54,23 @@ DEFAULT_DATASET_ROOT = Path(
     "/mnt/data/models/wyt/data/agilex_make_breakfast_subtask_730_frozen_head_completion_boundary"
 )
 
+# P2-3: The deployment threshold is fixed at 0.5.  It is not configurable —
+# best-F1/threshold are diagnostics only and never used for deployment.
+DEPLOYMENT_THRESHOLD = 0.5
+
+# P1-5: Time-delay metrics that are meaningless for the sparse view because
+# they rely on array positions (not real frame_index) to compute crossings.
+_TIME_METRIC_KEYS = {
+    "true_threshold_frame",
+    "predicted_threshold_frame",
+    "detection_delay_frames",
+    "detection_delay_seconds",
+    "mean_detection_delay_frames",
+    "median_detection_delay_frames",
+    "mean_detection_delay_seconds",
+    "median_detection_delay_seconds",
+}
+
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -79,8 +98,14 @@ def _compute_set_metrics(
     *,
     fps: float,
     threshold: float,
+    report_time_metrics: bool = True,
 ) -> dict[str, Any]:
-    """Computes overall + per-task + per-episode metrics for a set of predictions."""
+    """Computes overall + per-task + per-episode metrics for a set of predictions.
+
+    When ``report_time_metrics`` is False (sparse view), time-delay metrics
+    that depend on array positions (not real frame indices) are nullified
+    because the compressed sparse array makes them meaningless.
+    """
 
     scores = _sigmoid(logits)
 
@@ -116,6 +141,17 @@ def _compute_set_metrics(
             "confusion_matrix": _confusion_matrix(scores[tmask], targets[tmask], threshold),
             **_aggregate_episode_metrics(task_rows),
         }
+
+    if not report_time_metrics:
+        note = (
+            "Time-delay metrics are nullified for the sparse view because the "
+            "compressed array makes array-position-based delays meaningless."
+        )
+        for row in [overall, *per_task.values(), *episode_rows]:
+            for key in _TIME_METRIC_KEYS:
+                if key in row:
+                    row[key] = None
+        overall["time_metrics_note"] = note
 
     return {"overall": overall, "per_task": per_task, "episodes": episode_rows}
 
@@ -214,15 +250,25 @@ def _run_checkpoint_worker(args: argparse.Namespace, *, checkpoint_dir: Path, pr
 
 
 def _resolve_single_checkpoint(checkpoint_root: Path, step: int) -> Path:
+    """Resolves the checkpoint directory for ``step``.
+
+    Checks the managed ``<step>/`` directory first, then falls back to the
+    protected ``eval_checkpoint/`` copy (written by train.py when epochs>1 to
+    survive max_to_keep=1 cleanup).
+    """
+
     if not checkpoint_root.is_dir():
         raise FileNotFoundError(f"Checkpoint experiment directory not found: {checkpoint_root}")
     checkpoint_dir = checkpoint_root / str(step)
-    if not checkpoint_dir.is_dir():
-        available = sorted(p.name for p in checkpoint_root.iterdir() if p.is_dir() and p.name.isdigit())
-        raise FileNotFoundError(f"Checkpoint step {step} not found in {checkpoint_root}; available: {available}")
-    if not (checkpoint_dir / "params").is_dir():
-        raise FileNotFoundError(f"Checkpoint params not found: {checkpoint_dir / 'params'}")
-    return checkpoint_dir
+    if checkpoint_dir.is_dir() and (checkpoint_dir / "params").is_dir():
+        return checkpoint_dir
+    # Fall back to protected copy (P1-1).
+    protected = checkpoint_root / "eval_checkpoint"
+    if protected.is_dir() and (protected / "params").is_dir():
+        LOGGER.info("Using protected eval_checkpoint copy (managed step %d may have been cleaned up)", step)
+        return protected
+    available = sorted(p.name for p in checkpoint_root.iterdir() if p.is_dir() and p.name.isdigit())
+    raise FileNotFoundError(f"Checkpoint step {step} not found in {checkpoint_root}; available: {available}")
 
 
 def _load_predictions(path: Path) -> dict[str, np.ndarray]:
@@ -237,6 +283,48 @@ def _load_predictions(path: Path) -> dict[str, np.ndarray]:
         }
 
 
+def _verify_eval_checkpoint_binding(
+    checkpoint_root: Path,
+    requested_step: int,
+    *,
+    allow_unregistered: bool,
+) -> dict[str, Any]:
+    """P1-2: Binds the requested checkpoint step to the preregistered step.
+
+    Reads ``eval_checkpoint.json`` from the checkpoint directory.  If it exists,
+    the requested step must match the preregistered step (unless
+    ``allow_unregistered`` is True).  If it does not exist,
+    ``allow_unregistered`` must be True.
+    """
+
+    eval_ckpt_path = checkpoint_root / "eval_checkpoint.json"
+    if not eval_ckpt_path.is_file():
+        if not allow_unregistered:
+            raise FileNotFoundError(
+                f"No eval_checkpoint.json found in {checkpoint_root}. "
+                "The checkpoint step was not preregistered during training. "
+                "Pass --allow-unregistered-checkpoint to override (records the override in results)."
+            )
+        return {"preregistered": False, "step": requested_step, "override_reason": "no eval_checkpoint.json"}
+
+    eval_info = _read_json(eval_ckpt_path)
+    preregistered_step = int(eval_info["eval_checkpoint_step"])
+    if requested_step != preregistered_step:
+        if not allow_unregistered:
+            raise ValueError(
+                f"Requested checkpoint step {requested_step} does not match the preregistered "
+                f"eval checkpoint step {preregistered_step} (from {eval_ckpt_path}). "
+                "Pass --allow-unregistered-checkpoint to override (records the override in results)."
+            )
+        return {
+            "preregistered": False,
+            "step": requested_step,
+            "preregistered_step": preregistered_step,
+            "override_reason": f"requested {requested_step} != preregistered {preregistered_step}",
+        }
+    return {"preregistered": True, "step": preregistered_step}
+
+
 def _run_evaluation(args: argparse.Namespace) -> Path:
     dataset_root = args.dataset_root.resolve()
     info_path = dataset_root / "meta" / "info.json"
@@ -246,7 +334,25 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     fps = float(dataset_info["fps"])
     chunks_size = int(dataset_info.get("chunks_size", 1000))
 
+    # P2-2: Verify the dataset root matches the config's repo_id under
+    # hf_lerobot_home, so inference data and metadata come from the same dataset.
+    expected_root = (args.hf_lerobot_home.resolve() / args.config_repo_id).resolve()
+    if dataset_root != expected_root:
+        raise ValueError(
+            f"dataset_root ({dataset_root}) does not match "
+            f"hf_lerobot_home / repo_id ({expected_root}). "
+            "Inference data and metadata must come from the same dataset."
+        )
+
     checkpoint_root = (args.checkpoint_base / args.config_name / args.exp_name).resolve()
+
+    # P1-2: Bind to the preregistered eval checkpoint.
+    eval_binding = _verify_eval_checkpoint_binding(
+        checkpoint_root,
+        args.checkpoint_step,
+        allow_unregistered=args.allow_unregistered_checkpoint,
+    )
+
     checkpoint_dir = _resolve_single_checkpoint(checkpoint_root, args.checkpoint_step)
     checkpoint_step = args.checkpoint_step
 
@@ -262,7 +368,8 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     LOGGER.info("Evaluation output: %s", output_dir)
     LOGGER.info("Dataset: %s", dataset_root)
     LOGGER.info("Checkpoint: %s (step %d)", checkpoint_dir, checkpoint_step)
-    LOGGER.info("Threshold: %.2f (fixed; best-F1 is diagnostic only)", args.threshold)
+    LOGGER.info("Threshold: %.2f (fixed; best-F1 is diagnostic only)", DEPLOYMENT_THRESHOLD)
+    LOGGER.info("Eval checkpoint binding: %s", eval_binding)
 
     # --- 1. Run full-frame inference (subprocess) ---
     prediction_file = output_dir / "predictions.npz"
@@ -296,10 +403,12 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         targets,
         infer_ms,
         fps=fps,
-        threshold=args.threshold,
+        threshold=DEPLOYMENT_THRESHOLD,
     )
 
     # --- 4. test_sparse metrics (training-equivalent sampling) ---
+    # P1-5: Time-delay metrics are nullified for the sparse view because the
+    # compressed array makes array-position-based delays meaningless.
     sparse_sets = _build_sparse_sets(
         dataset_root,
         test_ids,
@@ -319,7 +428,8 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         targets[smask],
         infer_ms[smask],
         fps=fps,
-        threshold=args.threshold,
+        threshold=DEPLOYMENT_THRESHOLD,
+        report_time_metrics=False,
     )
 
     # --- 5. Summary ---
@@ -331,7 +441,8 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         "dataset_root": str(dataset_root),
         "checkpoint_dir": str(checkpoint_dir),
         "checkpoint_step": checkpoint_step,
-        "threshold": args.threshold,
+        "eval_checkpoint_binding": eval_binding,
+        "threshold": DEPLOYMENT_THRESHOLD,
         "threshold_note": "fixed at 0.5 for deployment; best-threshold is diagnostic only",
         "test_episode_count": len(test_ids),
         "stride": args.stride,
@@ -387,6 +498,11 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-name", default=DEFAULT_CONFIG_NAME)
+    parser.add_argument(
+        "--config-repo-id",
+        default="agilex_make_breakfast_subtask_730_frozen_head_completion_boundary",
+        help="Dataset repo_id from the training config (used to validate dataset_root).",
+    )
     parser.add_argument("--exp-name", default=DEFAULT_EXP_NAME)
     parser.add_argument("--checkpoint-base", type=Path, default=DEFAULT_CHECKPOINT_BASE)
     parser.add_argument("--evaluation-base", type=Path, default=DEFAULT_EVALUATION_BASE)
@@ -398,15 +514,15 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help="Single explicit checkpoint step to evaluate (no 'latest', no multi-checkpoint).",
     )
+    parser.add_argument(
+        "--allow-unregistered-checkpoint",
+        action="store_true",
+        help="Allow evaluating a checkpoint not preregistered in eval_checkpoint.json. "
+        "Records the override in results. Use with caution — test data must not be used for model selection.",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.5,
-        help="Fixed deployment threshold (default 0.5). Best-threshold is diagnostic only.",
-    )
     parser.add_argument("--stride", type=int, default=15, help="Negative sampling stride for test_sparse.")
     # Hidden args for the subprocess worker.
     parser.add_argument("--worker-checkpoint", type=Path, help=argparse.SUPPRESS)
@@ -415,8 +531,6 @@ def _parse_args() -> argparse.Namespace:
 
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
-    if not 0.0 < args.threshold <= 1.0:
-        parser.error("--threshold must be in (0, 1]")
     if args.stride < 1:
         parser.error("--stride must be at least 1")
     if (args.worker_checkpoint is None) != (args.worker_output is None):
