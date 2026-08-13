@@ -90,6 +90,12 @@ def _evaluation_repack():
 def extract_features(args: argparse.Namespace) -> Path:
     """Runs the frozen prefix + mean-pool over the sampled frames; saves an .npz."""
 
+    # Must be set before the first import of anything under lerobot.common.datasets
+    # -- it resolves the local cache root at import time, not per-call, so setting
+    # it after importing the module (even earlier in this same function) is too late
+    # and silently falls back to the default ~/.cache/huggingface/lerobot root.
+    os.environ["HF_LEROBOT_HOME"] = str(args.hf_lerobot_home.resolve())
+
     import jax
     import jax.numpy as jnp
     import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -99,8 +105,6 @@ def extract_features(args: argparse.Namespace) -> Path:
     from openpi.policies import policy_config
     import flax.nnx as nnx
     from openpi.training import config as training_config
-
-    os.environ["HF_LEROBOT_HOME"] = str(args.hf_lerobot_home.resolve())
 
     config = training_config.get_config(args.config_name)
     checkpoint_dir = args.checkpoint_base / args.config_name / args.exp_name / str(args.checkpoint_step)
