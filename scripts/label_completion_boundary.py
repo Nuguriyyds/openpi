@@ -665,7 +665,7 @@ def write_boundary_meta(
     """Copies ``meta/`` and patches ``info.json`` + ``episodes.jsonl``.
 
     Source stats are copied only as bootstrap metadata so LeRobot can open the
-    staged dataset. They are replaced by :func:`recompute_lerobot_stats` before
+    staged dataset. They are replaced by :func:`compute_boundary_stats` before
     the dataset is audited or published.
     """
 
@@ -711,46 +711,8 @@ def write_boundary_meta(
     os.replace(tmp, episodes_path)
 
 
-def recompute_lerobot_stats(dataset_root: pathlib.Path, repo_id: str) -> None:
-    """Recomputes per-episode and aggregate LeRobot stats from final data/video."""
-
-    # Lazy imports keep dry-run and lightweight parquet tests independent of the
-    # full LeRobot runtime.
-    from lerobot.common.datasets.compute_stats import aggregate_stats  # noqa: PLC0415
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset  # noqa: PLC0415
-    from lerobot.common.datasets.utils import serialize_dict  # noqa: PLC0415
-    from lerobot.common.datasets.v21.convert_stats import convert_episode_stats  # noqa: PLC0415
-
-    dataset = LeRobotDataset(repo_id, root=dataset_root)
-    episode_ids = sorted(int(episode_id) for episode_id in dataset.meta.episodes)
-    recomputed: dict[int, dict] = {}
-    for episode_id in tqdm.tqdm(episode_ids, desc="Recomputing episode stats"):
-        convert_episode_stats(dataset, episode_id)
-        recomputed[episode_id] = dataset.meta.episodes_stats[episode_id]
-
-    episodes_stats_path = dataset_root / "meta" / "episodes_stats.jsonl"
-    episodes_tmp = episodes_stats_path.with_suffix(".jsonl.tmp")
-    with episodes_tmp.open("w", encoding="utf-8") as stream:
-        for episode_id in episode_ids:
-            record = {"episode_index": episode_id, "stats": serialize_dict(recomputed[episode_id])}
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-    os.replace(episodes_tmp, episodes_stats_path)
-
-    aggregate = serialize_dict(aggregate_stats(list(recomputed.values())))
-    stats_path = dataset_root / "meta" / "stats.json"
-    stats_tmp = stats_path.with_suffix(".json.tmp")
-    stats_tmp.write_text(json.dumps(aggregate, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(stats_tmp, stats_path)
-
-    # A legacy stats directory, if present in the source metadata, must not
-    # survive because it describes the pre-boundary dataset.
-    legacy_stats_dir = dataset_root / "meta" / "stats"
-    if legacy_stats_dir.is_dir():
-        shutil.rmtree(legacy_stats_dir)
-
-
 # ---------------------------------------------------------------------------
-# Stats recomputation (P1-B)
+# Lightweight stats recomputation (P1-B)
 # ---------------------------------------------------------------------------
 
 
@@ -806,11 +768,13 @@ def compute_boundary_stats(
     chunks_size: int,
     video_keys: list[str],
 ) -> None:
-    """P1-B: Computes and writes LeRobot stats from the boundary parquet files.
+    """P1-B: Computes and writes LeRobot stats without decoding videos.
 
     For non-video features, stats are computed from the parquet data.  For
     video features (pixel data not in parquet), the source dataset's per-episode
-    stats are reused with the count updated to the new episode length.
+    stats are reused with the count updated to the new episode length.  The
+    training config loads normalization assets from the original dataset, so
+    derived video stats are metadata only and do not affect model inputs.
 
     Writes ``meta/episodes_stats.jsonl`` (v2.1) and ``meta/stats.json`` (global
     aggregate).  Deletes any residual ``stats/`` directory.
@@ -1471,9 +1435,15 @@ def _generate_in_staging(
     )
     print(f"  Patched info.json (label_scheme=boundary, total_frames={total_frames})")
 
-    print("\n[4/5] Recomputing LeRobot episode and aggregate stats ...")
-    recompute_lerobot_stats(staging_root, dst_root.name)
-    print("  Recomputed meta/episodes_stats.jsonl and meta/stats.json.")
+    print("\n[4/5] Computing lightweight parquet stats ...")
+    compute_boundary_stats(
+        staging_root,
+        src_root / "meta",
+        new_lengths=new_lengths,
+        chunks_size=chunks_size,
+        video_keys=video_keys,
+    )
+    print("  Written meta/episodes_stats.jsonl and meta/stats.json without decoding videos.")
 
     # --- 5. Audit + label_audit.json ---
     print("\n[5/5] Auditing dataset ...")
