@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 import dataclasses
 import json
 import os
@@ -722,6 +722,17 @@ def _read_label_scheme(dataset_root: pathlib.Path) -> str | None:
     return scheme
 
 
+def _read_boundary_excluded_episode_ids(dataset_root: pathlib.Path) -> tuple[int, ...]:
+    info_path = dataset_root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    raw = info.get("boundary_excluded_episode_indices", [])
+    if not isinstance(raw, list) or any(not isinstance(value, int) for value in raw):
+        raise ValueError(f"invalid boundary_excluded_episode_indices in {info_path}: {raw!r}")
+    if len(set(raw)) != len(raw):
+        raise ValueError(f"duplicate boundary_excluded_episode_indices in {info_path}: {raw!r}")
+    return tuple(raw)
+
+
 def audit_boundary_completion_episode_parquet(
     parquet_path: str | os.PathLike[str],
     *,
@@ -730,6 +741,7 @@ def audit_boundary_completion_episode_parquet(
     group_episode_ids: Sequence[int],
     group_position: int,
     label_key: str = "completion",
+    excluded_episode_ids: Collection[int] = (),
 ) -> BoundaryEpisodeAudit:
     """Audits one episode of the boundary completion scheme.
 
@@ -815,70 +827,92 @@ def audit_boundary_completion_episode_parquet(
         raise ValueError(f"episode {episode_id} is_boundary_copy contains values outside 0/1")
     copy_mask = copy_values.astype(bool)
 
-    if expected_length < BOUNDARY_TOTAL_POSITIVES:
+    excluded = {int(value) for value in excluded_episode_ids}
+    is_excluded = episode_id in excluded
+    is_subtask4 = group_position == BOUNDARY_GROUP - 1
+    copy_source_episode = next(
+        (int(candidate) for candidate in group_episode_ids[group_position + 1 :] if int(candidate) not in excluded),
+        None,
+    )
+    expected_copy_count = 0 if is_subtask4 or is_excluded or copy_source_episode is None else BOUNDARY_COPY_FRAMES
+    expected_positive_count = (
+        0 if is_excluded else (BOUNDARY_SUBTASK4_TAIL if is_subtask4 else BOUNDARY_POSITIVE_TAIL + expected_copy_count)
+    )
+    original_length = expected_length - expected_copy_count
+    required_tail = BOUNDARY_SUBTASK4_TAIL if is_subtask4 else BOUNDARY_POSITIVE_TAIL
+    if is_excluded and original_length >= required_tail:
         raise ValueError(
-            f"episode {episode_id} has only {expected_length} frames; the boundary scheme requires at least "
-            f"{BOUNDARY_TOTAL_POSITIVES} frames to hold {BOUNDARY_TOTAL_POSITIVES} positives"
+            f"episode {episode_id} is marked excluded but has {original_length} source frames, enough for tail {required_tail}"
         )
-    early_positive_rows = np.flatnonzero(numeric_labels[:-BOUNDARY_TOTAL_POSITIVES] != 0).tolist()
+    if not is_excluded and original_length < required_tail:
+        raise ValueError(
+            f"episode {episode_id} has only {original_length} source frames and must be listed in "
+            "boundary_excluded_episode_indices"
+        )
+
+    prefix_length = expected_length - expected_positive_count
+    early_positive_rows = np.flatnonzero(numeric_labels[:prefix_length] != 0).tolist()
     if early_positive_rows:
         raise ValueError(
-            f"episode {episode_id} must have {label_key}=0 before its last {BOUNDARY_TOTAL_POSITIVES} frames; "
+            f"episode {episode_id} must have {label_key}=0 before its last {expected_positive_count} frames; "
             f"offending frames {early_positive_rows}"
         )
     final_bad_rows = (
-        np.flatnonzero(numeric_labels[-BOUNDARY_TOTAL_POSITIVES:] != 1) + expected_length - BOUNDARY_TOTAL_POSITIVES
+        np.flatnonzero(numeric_labels[prefix_length:] != 1) + prefix_length
+        if expected_positive_count
+        else np.empty(0, dtype=np.int64)
     ).tolist()
     if final_bad_rows:
         raise ValueError(
-            f"episode {episode_id} must have {label_key}=1 on exactly its last {BOUNDARY_TOTAL_POSITIVES} frames; "
+            f"episode {episode_id} must have {label_key}=1 on exactly its last {expected_positive_count} frames; "
             f"offending frames {final_bad_rows}"
         )
     positive_count = int(np.sum(numeric_labels))
-    if positive_count != BOUNDARY_TOTAL_POSITIVES:
+    if positive_count != expected_positive_count:
         raise ValueError(
-            f"episode {episode_id} must have exactly {BOUNDARY_TOTAL_POSITIVES} positives, got {positive_count}"
+            f"episode {episode_id} must have exactly {expected_positive_count} positives, got {positive_count}"
         )
 
-    is_subtask4 = group_position == BOUNDARY_GROUP - 1
     source_episode = source_episode.astype(np.int64)
     source_frame = source_frame.astype(np.int64)
-    if is_subtask4:
+    if expected_copy_count == 0:
         if np.any(copy_mask):
-            raise ValueError(f"episode {episode_id} (subtask 4) must contain no boundary copies")
+            reason = "subtask 4" if is_subtask4 else "excluded boundary"
+            raise ValueError(f"episode {episode_id} ({reason}) must contain no boundary copies")
         boundary_copy_count = 0
         if not np.all(source_episode == episode_id):
             bad = np.flatnonzero(source_episode != episode_id).tolist()
-            raise ValueError(f"episode {episode_id} (subtask 4) source_episode_index must be self at rows {bad}")
+            raise ValueError(f"episode {episode_id} source_episode_index must be self at rows {bad}")
         if not np.array_equal(source_frame, frame_values.astype(np.int64)):
-            raise ValueError(f"episode {episode_id} (subtask 4) source_frame_index must equal frame_index")
+            raise ValueError(f"episode {episode_id} source_frame_index must equal frame_index")
     else:
-        next_episode = int(group_episode_ids[group_position + 1])
-        if int(np.sum(copy_mask)) != BOUNDARY_COPY_FRAMES:
+        assert copy_source_episode is not None
+        if int(np.sum(copy_mask)) != expected_copy_count:
             raise ValueError(
                 f"episode {episode_id} (subtask {group_position + 1}) must have exactly "
-                f"{BOUNDARY_COPY_FRAMES} boundary copies, got {int(np.sum(copy_mask))}"
+                f"{expected_copy_count} boundary copies, got {int(np.sum(copy_mask))}"
             )
-        if not np.array_equal(copy_mask[-BOUNDARY_COPY_FRAMES:], np.ones(BOUNDARY_COPY_FRAMES, dtype=bool)):
+        if not np.array_equal(copy_mask[-expected_copy_count:], np.ones(expected_copy_count, dtype=bool)):
             raise ValueError(
                 f"episode {episode_id} boundary copies must occupy exactly the last {BOUNDARY_COPY_FRAMES} rows"
             )
-        if np.any(copy_mask[:-BOUNDARY_COPY_FRAMES]):
+        if np.any(copy_mask[:-expected_copy_count]):
             raise ValueError(f"episode {episode_id} boundary copies must be confined to the trailing rows")
-        if not np.all(source_episode[copy_mask] == next_episode):
-            raise ValueError(f"episode {episode_id} boundary copies must source from next episode {next_episode}")
-        if not np.array_equal(source_frame[copy_mask], np.arange(BOUNDARY_COPY_FRAMES, dtype=np.int64)):
+        if not np.all(source_episode[copy_mask] == copy_source_episode):
             raise ValueError(
-                f"episode {episode_id} boundary copies must source frame indices 0..{BOUNDARY_COPY_FRAMES - 1}"
+                f"episode {episode_id} boundary copies must source from next valid episode {copy_source_episode}"
+            )
+        if not np.array_equal(source_frame[copy_mask], np.arange(expected_copy_count, dtype=np.int64)):
+            raise ValueError(
+                f"episode {episode_id} boundary copies must source frame indices 0..{expected_copy_count - 1}"
             )
         # Copy frames keep the current subtask's task_index (already verified single task_index).
         non_copy = ~copy_mask
         if not np.all(source_episode[non_copy] == episode_id):
             raise ValueError(f"episode {episode_id} non-copy frames must source from self")
-        original_length = expected_length - BOUNDARY_COPY_FRAMES
         if not np.array_equal(source_frame[non_copy], np.arange(original_length, dtype=np.int64)):
             raise ValueError(f"episode {episode_id} non-copy source_frame_index must be 0..{original_length - 1}")
-        boundary_copy_count = BOUNDARY_COPY_FRAMES
+        boundary_copy_count = expected_copy_count
 
     # No copy may cross a task-group boundary.
     group_id_set = {int(episode) for episode in group_episode_ids}
@@ -1050,6 +1084,7 @@ def prepare_completion_data(
     window_frames, ramp_start = _read_window_label_metadata(root, objective=objective)
     label_scheme = _read_label_scheme(root)
     is_boundary_scheme = label_scheme == BOUNDARY_LABEL_SCHEME and objective == "binary"
+    boundary_excluded_episode_ids = _read_boundary_excluded_episode_ids(root) if is_boundary_scheme else ()
 
     if is_boundary_scheme:
         # The boundary scheme needs each episode's 4-episode task group to verify
@@ -1079,6 +1114,7 @@ def prepare_completion_data(
                 group_episode_ids=group_episode_ids,
                 group_position=group_position,
                 label_key=label_key,
+                excluded_episode_ids=boundary_excluded_episode_ids,
             )
             boundary_audits[episode_id] = boundary_audit
             audits[episode_id] = EpisodeAudit(

@@ -560,6 +560,59 @@ def test_boundary_audit_accepts_valid_subtask4(tmp_path):
     assert audit.is_subtask4 is True
 
 
+def test_boundary_audit_accepts_one_frame_excluded_episode_as_all_negative(tmp_path):
+    path = tmp_path / "episode_002797.parquet"
+    new_len = _write_boundary_episode(
+        path,
+        2797,
+        group_position=1,
+        original_length=1,
+        copy_frames=0,
+        completion_override=[0.0],
+    )
+
+    audit = completion_data.audit_boundary_completion_episode_parquet(
+        path,
+        episode_id=2797,
+        expected_length=new_len,
+        group_episode_ids=(2796, 2797, 2798, 2799),
+        group_position=1,
+        excluded_episode_ids={2797},
+    )
+
+    assert audit.positive_count == 0
+    assert audit.negative_count == 1
+    assert audit.boundary_copy_count == 0
+
+
+def test_boundary_audit_skips_excluded_episode_and_copies_next_valid_episode(tmp_path):
+    path = tmp_path / "episode_002796.parquet"
+    source_episodes = np.full(25, 2796, dtype=np.int64)
+    source_episodes[-5:] = 2798
+    new_len = _write_boundary_episode(
+        path,
+        2796,
+        group_position=0,
+        original_length=20,
+        copy_frames=5,
+        source_episode_override=source_episodes,
+    )
+
+    audit = completion_data.audit_boundary_completion_episode_parquet(
+        path,
+        episode_id=2796,
+        expected_length=new_len,
+        group_episode_ids=(2796, 2797, 2798, 2799),
+        group_position=0,
+        excluded_episode_ids={2797},
+    )
+
+    assert audit.positive_count == 10
+    assert audit.negative_count == 15
+    assert audit.boundary_copy_count == 5
+    assert set(audit.source_episode_indices[-5:].tolist()) == {2798}
+
+
 def test_boundary_audit_rejects_non_binary_labels(tmp_path):
     path = tmp_path / "episode_000000.parquet"
     new_len = _write_boundary_episode(
@@ -621,7 +674,7 @@ def test_boundary_audit_rejects_cross_group_copy(tmp_path):
     )
     pq.write_table(table, path)
 
-    with pytest.raises(ValueError, match="source from next episode"):
+    with pytest.raises(ValueError, match="source from next valid episode"):
         completion_data.audit_boundary_completion_episode_parquet(
             path,
             episode_id=0,
@@ -643,7 +696,7 @@ def test_boundary_audit_rejects_subtask4_with_copy_frames(tmp_path):
         is_copy_override=np.array([0] * 15 + [1] * 5, dtype=np.int8),
     )
 
-    with pytest.raises(ValueError, match="subtask 4.*no boundary copies"):
+    with pytest.raises(ValueError, match=r"subtask 4.*no boundary copies"):
         completion_data.audit_boundary_completion_episode_parquet(
             path,
             episode_id=3,

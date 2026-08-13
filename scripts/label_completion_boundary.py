@@ -251,6 +251,9 @@ def process_boundary_parquet(
     next_src_path: pathlib.Path | None,
     global_offset: int,
     old_length: int,
+    copy_n: int,
+    copy_source_episode_id: int | None,
+    positive_count: int,
     fps: float,
     force: bool,
 ) -> dict[str, int]:
@@ -271,13 +274,12 @@ def process_boundary_parquet(
         if col in table.column_names:
             table = table.drop([col])
 
-    is_subtask4 = group_position == GROUP_SIZE - 1
-    copy_n = 0 if is_subtask4 else COPY_FRAMES
     new_length = num_rows + copy_n
 
     # Append copy rows (next episode's first copy_n rows) for subtasks 1/2/3.
     if copy_n > 0:
         assert next_src_path is not None
+        assert copy_source_episode_id is not None
         next_table = pq.read_table(next_src_path)
         if next_table.num_rows < copy_n:
             raise ValueError(
@@ -309,15 +311,16 @@ def process_boundary_parquet(
 
     # --- Build boundary label columns ---
     completion = np.zeros(new_length, dtype=np.float32)
-    completion[-TOTAL_POSITIVES:] = 1.0  # last 10 = 1 for every episode
+    if positive_count:
+        completion[-positive_count:] = 1.0
 
     source_episode = np.full(new_length, episode_id, dtype=np.int64)
     source_frame = np.arange(new_length, dtype=np.int64)
     is_copy = np.zeros(new_length, dtype=np.int8)
 
     if copy_n > 0:
-        next_episode_id = episode_id + 1
-        source_episode[num_rows:] = next_episode_id
+        assert copy_source_episode_id is not None
+        source_episode[num_rows:] = copy_source_episode_id
         source_frame[num_rows:] = np.arange(copy_n, dtype=np.int64)
         is_copy[num_rows:] = 1
 
@@ -353,6 +356,9 @@ def _process_parquet_worker(args: tuple) -> dict:
         next_src_path,
         global_offset,
         old_length,
+        copy_n,
+        copy_source_episode_id,
+        positive_count,
         fps,
         force,
     ) = args
@@ -366,6 +372,9 @@ def _process_parquet_worker(args: tuple) -> dict:
             next_src_path=pathlib.Path(next_src_path) if next_src_path else None,
             global_offset=global_offset,
             old_length=old_length,
+            copy_n=copy_n,
+            copy_source_episode_id=copy_source_episode_id,
+            positive_count=positive_count,
             fps=fps,
             force=force,
         )
@@ -596,20 +605,24 @@ def verify_boundary_contrast_pixels(
     *,
     episode_ids: list[int],
     old_lengths: dict[int, int],
+    copy_counts: dict[int, int],
+    copy_source_episode_ids: dict[int, int | None],
     video_keys: list[str],
     chunks_size: int,
 ) -> None:
     """Proves every positive copy and original negative decode identically."""
 
     for episode_id in episode_ids:
-        if episode_id % GROUP_SIZE == GROUP_SIZE - 1:
+        copy_count = copy_counts[episode_id]
+        if copy_count == 0:
             continue
-        next_episode_id = episode_id + 1
+        next_episode_id = copy_source_episode_ids[episode_id]
+        assert next_episode_id is not None
         for key in video_keys:
             current = get_episode_video_path(root, episode_id, key, chunks_size)
             following = get_episode_video_path(root, next_episode_id, key, chunks_size)
-            positive_hashes = decoded_frame_hashes(current, old_lengths[episode_id], COPY_FRAMES)
-            negative_hashes = decoded_frame_hashes(following, 0, COPY_FRAMES)
+            positive_hashes = decoded_frame_hashes(current, old_lengths[episode_id], copy_count)
+            negative_hashes = decoded_frame_hashes(following, 0, copy_count)
             if positive_hashes != negative_hashes:
                 raise RuntimeError(
                     f"Decoded boundary contrast mismatch: episode {episode_id} -> {next_episode_id}, key {key}"
@@ -628,6 +641,7 @@ def write_boundary_meta(
     new_lengths: dict[int, int],
     total_frames: int,
     fps: float,
+    excluded_episode_ids: set[int] | tuple[int, ...] = (),
 ) -> None:
     """Copies ``meta/`` and patches ``info.json`` + ``episodes.jsonl``.
 
@@ -656,6 +670,7 @@ def write_boundary_meta(
     info["boundary_copy_frames"] = COPY_FRAMES
     info["positive_tail"] = POSITIVE_TAIL
     info["subtask4_tail"] = SUBTASK4_TAIL
+    info["boundary_excluded_episode_indices"] = sorted(excluded_episode_ids)
     info.pop("window_seconds", None)
 
     info_path = dst_meta / "info.json"
@@ -906,15 +921,17 @@ def audit_boundary_dataset(
     verify_frames: bool,
     stride: int = 15,
     forced_first_n: int = COPY_FRAMES,
+    excluded_episode_ids: set[int] | None = None,
 ) -> dict:
     """Audits the generated dataset and returns the ``label_audit`` dict.
 
-    Raises ``SystemExit`` on any audit failure (non-0/1 labels, subtask positives
-    != 10, count inconsistency, or cross-group copy), reporting the failing
-    episode id and length.
+    Raises ``SystemExit`` on any audit failure (non-0/1 labels, unexpected
+    positive counts, count inconsistency, or cross-group copy), reporting the
+    failing episode id and length.
     """
 
     episode_ids = sorted(new_lengths.keys())
+    excluded_episode_ids = set() if excluded_episode_ids is None else set(excluded_episode_ids)
     groups = build_task_groups(episode_ids, episodes_per_group=episodes_per_group, minimum_groups=1)
     group_of: dict[int, tuple[tuple[int, ...], int]] = {}
     for group in groups:
@@ -934,6 +951,7 @@ def audit_boundary_dataset(
                 expected_length=new_lengths[eid],
                 group_episode_ids=group_ep_ids,
                 group_position=pos,
+                excluded_episode_ids=excluded_episode_ids,
             )
         except Exception as exc:
             failures.append({"episode_id": eid, "length": new_lengths[eid], "error": str(exc)})
@@ -1020,7 +1038,19 @@ def audit_boundary_dataset(
     consistency = {
         "total_frames_equals_pos_plus_neg": (train_pos + train_neg + test_pos + test_neg + val_pos + val_neg)
         == total_frames,
-        "per_episode_positive_all_10": all(audits[eid].positive_count == TOTAL_POSITIVES for eid in episode_ids),
+        "per_episode_positive_matches_boundary_rule": all(
+            audits[eid].positive_count
+            == (
+                0
+                if eid in excluded_episode_ids
+                else (
+                    SUBTASK4_TAIL
+                    if audits[eid].group_position == GROUP_SIZE - 1
+                    else POSITIVE_TAIL + audits[eid].boundary_copy_count
+                )
+            )
+            for eid in episode_ids
+        ),
         "no_val_episodes": len(val_ids) == 0,
         "parquet_video_match": True,
         "index_contiguous": True,
@@ -1109,6 +1139,7 @@ def audit_boundary_dataset(
         "per_subtask_positive_counts": per_subtask_pos,
         "boundary_copy_positive_count": boundary_copy_pos,
         "original_first5_negative_count": first5_neg,
+        "excluded_episode_indices": sorted(excluded_episode_ids),
         "per_episode": per_episode,
         "consistency": consistency,
     }
@@ -1181,24 +1212,37 @@ def main() -> None:
     if episode_ids != list(range(len(episode_ids))):
         parser.error("boundary generation requires contiguous zero-based episode indices")
 
+    # Episodes too short to contain their required positive tail are retained
+    # as all-negative exception episodes. Earlier subtasks skip them and copy
+    # from the next valid episode within the same four-episode task group.
+    excluded_episode_ids = {
+        eid
+        for eid in episode_ids
+        if episode_lengths[eid] < (SUBTASK4_TAIL if eid % GROUP_SIZE == GROUP_SIZE - 1 else POSITIVE_TAIL)
+    }
+    copy_counts: dict[int, int] = {}
+    copy_source_episode_ids: dict[int, int | None] = {}
+    positive_counts: dict[int, int] = {}
+
     # --- Compute new lengths + global offsets ---
     new_lengths: dict[int, int] = {}
     for eid in episode_ids:
         pos = eid % GROUP_SIZE
         old = episode_lengths[eid]
-        if pos < GROUP_SIZE - 1:
-            if old < POSITIVE_TAIL:
-                parser.error(
-                    f"episode {eid} (subtask {pos + 1}) has only {old} frames; "
-                    f"need >= {POSITIVE_TAIL} for the boundary tail"
-                )
-            new_lengths[eid] = old + COPY_FRAMES
-        else:
-            if old < SUBTASK4_TAIL:
-                parser.error(
-                    f"episode {eid} (subtask 4) has only {old} frames; need >= {SUBTASK4_TAIL} for the boundary tail"
-                )
-            new_lengths[eid] = old
+        is_excluded = eid in excluded_episode_ids
+        group_end = eid - pos + GROUP_SIZE
+        copy_source_episode_id = next(
+            (candidate for candidate in range(eid + 1, group_end) if candidate not in excluded_episode_ids),
+            None,
+        )
+        copy_n = 0 if pos == GROUP_SIZE - 1 or is_excluded or copy_source_episode_id is None else COPY_FRAMES
+        positive_tail = 0 if is_excluded else (SUBTASK4_TAIL if pos == GROUP_SIZE - 1 else POSITIVE_TAIL)
+        copy_counts[eid] = copy_n
+        copy_source_episode_ids[eid] = copy_source_episode_id if copy_n else None
+        positive_counts[eid] = positive_tail + copy_n
+        new_lengths[eid] = old + copy_n
+    if excluded_episode_ids:
+        print(f"All-negative excluded episodes: {sorted(excluded_episode_ids)}")
     total_frames = sum(new_lengths.values())
 
     global_offsets: dict[int, int] = {}
@@ -1231,8 +1275,10 @@ def main() -> None:
         src_path = get_episode_data_path(src_root, eid, chunks_size)
         dst_path = get_episode_data_path(staging_root, eid, chunks_size)
         next_src_path: pathlib.Path | None = None
-        if pos < GROUP_SIZE - 1:
-            next_src_path = get_episode_data_path(src_root, eid + 1, chunks_size)
+        if copy_counts[eid] > 0:
+            copy_source_episode_id = copy_source_episode_ids[eid]
+            assert copy_source_episode_id is not None
+            next_src_path = get_episode_data_path(src_root, copy_source_episode_id, chunks_size)
         parquet_jobs.append(
             (
                 str(src_path),
@@ -1243,6 +1289,9 @@ def main() -> None:
                 str(next_src_path) if next_src_path else None,
                 global_offsets[eid],
                 episode_lengths[eid],
+                copy_counts[eid],
+                copy_source_episode_ids[eid],
+                positive_counts[eid],
                 fps,
                 False,
             )
@@ -1253,8 +1302,8 @@ def main() -> None:
     if not args.skip_videos:
         for eid in episode_ids:
             pos = eid % GROUP_SIZE
-            copy_n = 0 if pos == GROUP_SIZE - 1 else COPY_FRAMES
-            next_eid = eid + 1 if pos < GROUP_SIZE - 1 else None
+            copy_n = copy_counts[eid]
+            next_eid = copy_source_episode_ids[eid]
             video_jobs.append(
                 (
                     str(src_root),
@@ -1300,6 +1349,9 @@ def main() -> None:
             video_keys=video_keys,
             episode_ids=episode_ids,
             episode_lengths=episode_lengths,
+            copy_counts=copy_counts,
+            copy_source_episode_ids=copy_source_episode_ids,
+            excluded_episode_ids=excluded_episode_ids,
             args=args,
         )
         assert cleanup_staging is not None
@@ -1326,6 +1378,9 @@ def _generate_in_staging(
     video_keys: list[str],
     episode_ids: list[int],
     episode_lengths: dict[int, int],
+    copy_counts: dict[int, int],
+    copy_source_episode_ids: dict[int, int | None],
+    excluded_episode_ids: set[int],
     args: argparse.Namespace,
 ) -> None:
     """Generates the entire dataset in ``staging_root``, audits, then publishes."""
@@ -1394,6 +1449,8 @@ def _generate_in_staging(
         staging_root,
         episode_ids=episode_ids,
         old_lengths=episode_lengths,
+        copy_counts=copy_counts,
+        copy_source_episode_ids=copy_source_episode_ids,
         video_keys=video_keys,
         chunks_size=chunks_size,
     )
@@ -1409,6 +1466,7 @@ def _generate_in_staging(
         new_lengths=new_lengths,
         total_frames=total_frames,
         fps=fps,
+        excluded_episode_ids=excluded_episode_ids,
     )
     print(f"  Patched info.json (label_scheme=boundary, total_frames={total_frames})")
 
@@ -1431,6 +1489,7 @@ def _generate_in_staging(
         repo_id=dst_root.name,
         verify_frames=not args.skip_frame_verification,
         stride=args.stride,
+        excluded_episode_ids=excluded_episode_ids,
     )
 
     audit_path = staging_root / "label_audit.json"

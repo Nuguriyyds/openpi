@@ -157,6 +157,9 @@ def _process_all_parquets(src_root: pathlib.Path, dst_root: pathlib.Path, num_ep
             next_src_path=next_src_path,
             global_offset=global_offset,
             old_length=FRAMES_PER_EP,
+            copy_n=0 if pos == 3 else lcb.COPY_FRAMES,
+            copy_source_episode_id=None if pos == 3 else eid + 1,
+            positive_count=lcb.TOTAL_POSITIVES,
             fps=FPS,
             force=True,
         )
@@ -429,7 +432,7 @@ def test_full_audit_and_label_audit_json(tmp_path):
         assert count == num_groups * lcb.TOTAL_POSITIVES
 
     # Per-episode: every episode must have exactly 10 positives.
-    assert audit["consistency"]["per_episode_positive_all_10"] is True
+    assert audit["consistency"]["per_episode_positive_matches_boundary_rule"] is True
 
     # Total frames == pos + neg across all splits.
     total_pos = audit["train_full"]["positive"] + audit["test_full"]["positive"]
@@ -533,6 +536,8 @@ def test_video_extension_matches_parquet_rows(tmp_path):
         dst_root,
         episode_ids=list(range(num_episodes)),
         old_lengths=dict.fromkeys(range(num_episodes), FRAMES_PER_EP),
+        copy_counts={eid: 0 if eid % 4 == 3 else lcb.COPY_FRAMES for eid in range(num_episodes)},
+        copy_source_episode_ids={eid: None if eid % 4 == 3 else eid + 1 for eid in range(num_episodes)},
         video_keys=[VIDEO_KEY],
         chunks_size=CHUNKS_SIZE,
     )

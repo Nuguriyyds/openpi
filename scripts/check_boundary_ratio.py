@@ -41,36 +41,38 @@ def _build_split(
     if episode_ids != list(range(len(episode_ids))):
         raise ValueError("Boundary generation requires episode IDs to be contiguous and start at 0")
     if len(episode_ids) % episodes_per_group:
-        raise ValueError(
-            f"Episode count {len(episode_ids)} is not divisible by group size {episodes_per_group}"
-        )
+        raise ValueError(f"Episode count {len(episode_ids)} is not divisible by group size {episodes_per_group}")
     groups = [
-        episode_ids[start : start + episodes_per_group]
-        for start in range(0, len(episode_ids), episodes_per_group)
+        episode_ids[start : start + episodes_per_group] for start in range(0, len(episode_ids), episodes_per_group)
     ]
     if len(groups) <= test_groups:
         raise ValueError(f"Need at least one train group after reserving {test_groups} test groups")
     random.Random(seed).shuffle(groups)
     test = groups[:test_groups]
     train = groups[test_groups:]
-    positions = {
-        episode_id: position
-        for group in groups
-        for position, episode_id in enumerate(group)
-    }
-    return [episode for group in train for episode in group], [episode for group in test for episode in group], positions
+    positions = {episode_id: position for group in groups for position, episode_id in enumerate(group)}
+    return (
+        [episode for group in train for episode in group],
+        [episode for group in test for episode in group],
+        positions,
+    )
 
 
-def _episode_counts(length: int, group_position: int, *, stride: int, forced_first_n: int) -> dict[str, int]:
+def _episode_counts(
+    length: int,
+    group_position: int,
+    *,
+    excluded: bool,
+    has_copy_source: bool,
+    stride: int,
+    forced_first_n: int,
+) -> dict[str, int]:
     # Subtasks 1-3: five original tail positives plus five copied positives.
     # Subtask 4: ten original tail positives and no copies.
     positive_original_tail = 5 if group_position < 3 else 10
-    if length < positive_original_tail:
-        raise ValueError(
-            f"Source episode length {length} is shorter than its required positive tail {positive_original_tail}"
-        )
-
-    negative_source_indices = set(range(0, length - positive_original_tail))
+    copy_count = 5 if group_position < 3 and not excluded and has_copy_source else 0
+    positive_count = 0 if excluded else positive_original_tail + copy_count
+    negative_source_indices = set(range(length if excluded else length - positive_original_tail))
     ordinary_negative = {index for index in negative_source_indices if index % stride == 0}
     forced_negative = (
         {index for index in range(forced_first_n) if index in negative_source_indices}
@@ -80,9 +82,9 @@ def _episode_counts(length: int, group_position: int, *, stride: int, forced_fir
     sampled_negative = ordinary_negative | forced_negative
 
     return {
-        "full_positive": 10,
+        "full_positive": positive_count,
         "full_negative": len(negative_source_indices),
-        "sampled_positive": 10,
+        "sampled_positive": positive_count,
         "sampled_negative": len(sampled_negative),
         "ordinary_negative": len(ordinary_negative),
         "forced_negative_added": len(forced_negative - ordinary_negative),
@@ -139,10 +141,21 @@ def main() -> None:
         test_groups=args.test_groups,
         seed=args.seed,
     )
+    excluded_episode_ids = {
+        episode_id for episode_id in episode_ids if lengths[episode_id] < (10 if positions[episode_id] == 3 else 5)
+    }
     counts = {
         episode_id: _episode_counts(
             lengths[episode_id],
             positions[episode_id],
+            excluded=episode_id in excluded_episode_ids,
+            has_copy_source=any(
+                candidate not in excluded_episode_ids
+                for candidate in range(
+                    episode_id + 1,
+                    episode_id - positions[episode_id] + args.episodes_per_group,
+                )
+            ),
             stride=args.stride,
             forced_first_n=args.forced_first_n,
         )
@@ -159,6 +172,7 @@ def main() -> None:
             "negative_stride": args.stride,
             "forced_first_n": args.forced_first_n,
         },
+        "excluded_episode_indices": sorted(excluded_episode_ids),
         "train": _summarize(train_ids, counts),
         "test": _summarize(test_ids, counts),
         "all": _summarize(episode_ids, counts),
