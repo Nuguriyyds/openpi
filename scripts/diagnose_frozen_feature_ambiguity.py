@@ -10,7 +10,12 @@ sample of frames drawn from many episodes, it:
      present in the frozen representation itself, not what one particular
      head happened to extract from it.
   2. For every frame, finds its nearest neighbor (by cosine distance) among
-     frames from OTHER episodes.
+     frames from OTHER episodes OF THE SAME TASK (same ``task_index`` --
+     LeRobot's ``tasks`` table is a global, deduplicated prompt lookup, so
+     this is a real "same subtask" restriction, not a per-group slot number).
+     The task is always known at inference time (it's the prompt), so this
+     is the fair test: given the task, can one frame's progress be told
+     apart, not "can progress be told apart without even knowing the task".
   3. Reports how often "this frame looks nearly identical to that frame"
      coincides with "but their true labels are very different". If that
      happens often among the closest pairs, no head -- this one or a bigger
@@ -161,6 +166,7 @@ def extract_features(args: argparse.Namespace) -> Path:
     rng = jax.random.key(args.seed)
     episode_indices: list[int] = []
     frame_indices: list[int] = []
+    task_indices: list[int] = []
     targets: list[float] = []
     features: list[np.ndarray] = []
 
@@ -168,14 +174,14 @@ def extract_features(args: argparse.Namespace) -> Path:
     for batch_start in range(0, len(frame_specs), args.batch_size):
         batch_specs = frame_specs[batch_start : batch_start + args.batch_size]
         transformed_items: list[dict[str, Any]] = []
-        batch_metadata: list[tuple[int, int, float]] = []
+        batch_metadata: list[tuple[int, int, int, float]] = []
         for episode_index, local_frame_index, dataset_index in batch_specs:
             sample = dict(dataset[dataset_index])
             task_index = _scalar(sample["task_index"])
             sample["prompt"] = tasks[task_index]
             target = float(np.asarray(sample[label_key]).reshape(-1)[0])
             transformed_items.append(policy._input_transform(sample))  # noqa: SLF001
-            batch_metadata.append((episode_index, local_frame_index, target))
+            batch_metadata.append((episode_index, local_frame_index, task_index, target))
         valid_count = len(transformed_items)
         while len(transformed_items) < args.batch_size:
             transformed_items.append(jax.tree.map(lambda value: np.array(value, copy=True), transformed_items[-1]))
@@ -185,9 +191,10 @@ def extract_features(args: argparse.Namespace) -> Path:
         )
         observation = model_api.Observation.from_dict(batched_inputs)
         pooled = np.asarray(jax.block_until_ready(compute_fn(state, rng, observation)))
-        for index, (episode_index, local_frame_index, target) in enumerate(batch_metadata):
+        for index, (episode_index, local_frame_index, task_index, target) in enumerate(batch_metadata):
             episode_indices.append(episode_index)
             frame_indices.append(local_frame_index)
+            task_indices.append(task_index)
             targets.append(target)
             features.append(pooled[index])
         if (batch_start // args.batch_size) % 10 == 0:
@@ -200,6 +207,7 @@ def extract_features(args: argparse.Namespace) -> Path:
         output_path,
         episode_index=np.asarray(episode_indices, dtype=np.int32),
         frame_index=np.asarray(frame_indices, dtype=np.int32),
+        task_index=np.asarray(task_indices, dtype=np.int32),
         target=np.asarray(targets, dtype=np.float32),
         feature=np.asarray(features, dtype=np.float32),
         label_key=label_key,
@@ -209,11 +217,19 @@ def extract_features(args: argparse.Namespace) -> Path:
 
 
 def analyze(npz_path: Path, *, top_k: int) -> None:
-    """Nearest-cross-episode-neighbor analysis: does 'looks the same' imply 'similar label'?"""
+    """Nearest-same-task-neighbor analysis: does 'looks the same' imply 'similar label'?
+
+    Restricted to pairs sharing ``task_index`` (a global, deduplicated LeRobot
+    task identity, not a per-group slot number) so this measures the fair
+    question -- given the task is known, as it always is at inference time
+    via the prompt, can a single frame's progress still be told apart -- not
+    the easier-to-fail, less relevant "without even knowing the task" version.
+    """
 
     with np.load(npz_path, allow_pickle=False) as values:
         episode_index = values["episode_index"]
         frame_index = values["frame_index"]
+        task_index = values["task_index"]
         target = values["target"].astype(np.float64)
         feature = values["feature"].astype(np.float64)
 
@@ -223,8 +239,10 @@ def analyze(npz_path: Path, *, top_k: int) -> None:
     distance = 1.0 - similarity
     n = distance.shape[0]
     same_episode = episode_index[:, None] == episode_index[None, :]
+    different_task = task_index[:, None] != task_index[None, :]
     np.fill_diagonal(same_episode, True)
     distance[same_episode] = np.inf
+    distance[different_task] = np.inf
 
     nearest_index = np.argmin(distance, axis=1)
     nearest_distance_full = distance[np.arange(n), nearest_index]
@@ -238,10 +256,12 @@ def analyze(npz_path: Path, *, top_k: int) -> None:
     order = np.argsort(nearest_distance)
 
     correlation = np.corrcoef(nearest_distance, label_gap)[0, 1]
-    print(f"\nFrames analyzed: {n}")
+    print(f"\nFrames analyzed: {n} ({len(np.unique(task_index))} distinct task_index values)")
+    print(f"Frames with a same-task neighbor in another episode: {finite.sum()}")
     print(f"Correlation(nearest-neighbor distance, |label gap|) = {correlation:.3f}")
     print("(near 0 or negative => 'looks the same' does NOT predict 'similar label';")
-    print(" the frozen representation does not disambiguate the target on its own)\n")
+    print(" the frozen representation does not disambiguate the target on its own,")
+    print(" even when the task is already known)\n")
 
     print("Label gap by closeness percentile (closest pairs first):")
     for fraction in (0.01, 0.05, 0.10, 0.25, 0.50, 1.00):
@@ -260,8 +280,9 @@ def analyze(npz_path: Path, *, top_k: int) -> None:
         i = original_index[rank]
         neighbor = neighbor_original_index[rank]
         print(
-            f"  episode {episode_index[i]} frame {frame_index[i]} (target={target[i]:.3f})  <->  "
-            f"episode {episode_index[neighbor]} frame {frame_index[neighbor]} (target={target[neighbor]:.3f})  "
+            f"  task {task_index[i]}: episode {episode_index[i]} frame {frame_index[i]} "
+            f"(target={target[i]:.3f})  <->  episode {episode_index[neighbor]} frame {frame_index[neighbor]} "
+            f"(target={target[neighbor]:.3f})  "
             f"distance={nearest_distance[rank]:.4f}  gap={label_gap[rank]:.3f}"
         )
 
