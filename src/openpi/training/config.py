@@ -1369,9 +1369,9 @@ _CONFIGS = [
     # Training uses plain unweighted BCE (pos_weight=1.0, no focal loss), the
     # deterministic BoundaryCompletionSampler (all positives + every-15-frame
     # ordinary negatives + forced first-5 negatives of subtasks 2/3/4), and is
-    # epoch-based (default 1 epoch; --completion.epochs 2 allowed). The val split
-    # is disabled (val_groups=0): the old val+test groups merge into a single
-    # 40-episode test split evaluated only offline, never during training.
+    # run for a predeclared 3000 optimizer steps (about 2.17 data passes). The
+    # val split is disabled (val_groups=0): the old val+test groups merge into a
+    # single 40-episode test split evaluated only offline, never during training.
     TrainConfig(
         name="pi05_agilex_breakfast_frozen_head_s2_completion_boundary",
         model=pi0_config.Pi0Config(
@@ -1419,7 +1419,8 @@ _CONFIGS = [
             boundary_sampling=True,
             negative_stride=15,
             boundary_copy_frames=5,
-            epochs=1,
+            train_steps=3_000,
+            eval_checkpoint_step=3_000,
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
@@ -1429,7 +1430,7 @@ _CONFIGS = [
             "/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_frozen_head_s1_action/s1_action/49999/params",
             missing_regex=r"completion_head/.*",
         ),
-        num_train_steps=2_000,
+        num_train_steps=3_000,
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.99,
         batch_size=64,

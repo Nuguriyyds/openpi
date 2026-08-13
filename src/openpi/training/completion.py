@@ -68,15 +68,16 @@ class CompletionTrainingConfig:
 
     # Boundary completion scheme. ``boundary_sampling`` selects the deterministic
     # boundary sampler (all positives + every ``negative_stride`` ordinary
-    # negative + forced first-frame negatives of subtasks 2/3/4). ``epochs``
-    # switches the trainer from step-based to epoch-based training: exactly 1 or
-    # 2 epochs are allowed. ``eval_checkpoint_step`` is the *pre-determined*
-    # frozen checkpoint the offline evaluator must test (defaults to the
-    # 1-epoch-end step, computed by the trainer before training starts).
+    # negative + forced first-frame negatives of subtasks 2/3/4). Set exactly
+    # one of ``epochs`` (1 or 2 complete passes) or ``train_steps`` (an explicit
+    # optimizer-step budget that may end partway through an epoch).
+    # ``eval_checkpoint_step`` is the pre-determined frozen checkpoint the
+    # offline evaluator must test.
     boundary_sampling: bool = False
     negative_stride: int = 15
     boundary_copy_frames: int = 5
     epochs: int | None = None
+    train_steps: int | None = None
     eval_checkpoint_step: int | None = None
 
     def __post_init__(self) -> None:
@@ -98,6 +99,10 @@ class CompletionTrainingConfig:
             raise ValueError("completion.val_interval must be positive")
         if self.epochs is not None and self.epochs not in (1, 2):
             raise ValueError(f"completion.epochs must be 1 or 2 when set (got {self.epochs})")
+        if self.train_steps is not None and self.train_steps <= 0:
+            raise ValueError("completion.train_steps must be positive when set")
+        if self.epochs is not None and self.train_steps is not None:
+            raise ValueError("completion.epochs and completion.train_steps are mutually exclusive")
         if self.negative_stride <= 0:
             raise ValueError("completion.negative_stride must be positive")
         if self.boundary_copy_frames <= 0:
@@ -106,12 +111,18 @@ class CompletionTrainingConfig:
             raise ValueError("completion.boundary_sampling is only supported for stage 'head'")
         if self.boundary_sampling and self.objective != "binary":
             raise ValueError("completion.boundary_sampling is only supported for the binary objective")
-        if self.epochs is not None and self.stage != "head":
-            raise ValueError("completion.epochs is only supported for stage 'head'")
-        if self.epochs is not None and not self.boundary_sampling:
-            raise ValueError("completion.epochs currently requires boundary_sampling")
+        if (self.epochs is not None or self.train_steps is not None) and self.stage != "head":
+            raise ValueError("completion epochs/train_steps are only supported for stage 'head'")
+        if (self.epochs is not None or self.train_steps is not None) and not self.boundary_sampling:
+            raise ValueError("completion epochs/train_steps require boundary_sampling")
         if self.eval_checkpoint_step is not None and self.eval_checkpoint_step <= 0:
             raise ValueError("completion.eval_checkpoint_step must be positive when set")
+        if (
+            self.train_steps is not None
+            and self.eval_checkpoint_step is not None
+            and self.eval_checkpoint_step > self.train_steps
+        ):
+            raise ValueError("completion.eval_checkpoint_step cannot exceed completion.train_steps")
         if self.warmup_steps < 0:
             raise ValueError("completion.warmup_steps must be non-negative")
         if self.peak_lr <= 0 or self.decay_lr < 0:
@@ -194,9 +205,9 @@ class CompletionTrainingConfig:
 
     @property
     def is_epoch_based(self) -> bool:
-        """Whether training is epoch-based (boundary scheme) rather than step-based."""
+        """Whether boundary sampling controls the step budget and resume state."""
 
-        return self.epochs is not None
+        return self.epochs is not None or self.train_steps is not None
 
 
 def positive_class_weight(negative_count: int, positive_count: int) -> float:

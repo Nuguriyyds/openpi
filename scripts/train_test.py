@@ -202,6 +202,18 @@ def test_compute_epoch_total_steps_rejects_non_positive_steps_per_epoch():
         train.compute_epoch_total_steps(0, 1)
 
 
+def test_compute_boundary_total_steps_accepts_explicit_partial_epoch_budget():
+    assert train.compute_boundary_total_steps(1385, epochs=None, train_steps=3000) == 3000
+    assert train.compute_boundary_total_steps(1385, epochs=2, train_steps=None) == 2770
+
+
+def test_compute_boundary_total_steps_requires_exactly_one_budget():
+    with pytest.raises(ValueError, match="exactly one"):
+        train.compute_boundary_total_steps(1385, epochs=None, train_steps=None)
+    with pytest.raises(ValueError, match="exactly one"):
+        train.compute_boundary_total_steps(1385, epochs=1, train_steps=3000)
+
+
 def test_should_save_epoch_checkpoint_every_200_and_epoch_end():
     """Saves at multiples of save_interval and at epoch boundaries."""
 
@@ -248,7 +260,10 @@ def test_boundary_config_uses_plain_unweighted_bce():
 
 def test_boundary_config_epoch_and_sampling_settings():
     config = _config.get_config(BOUNDARY_CONFIG_NAME)
-    assert config.completion.epochs == 1
+    assert config.completion.epochs is None
+    assert config.completion.train_steps == 3_000
+    assert config.completion.eval_checkpoint_step == 3_000
+    assert config.num_train_steps == 3_000
     assert config.completion.boundary_sampling is True
     assert config.completion.negative_stride == 15
     assert config.completion.boundary_copy_frames == 5
@@ -258,6 +273,25 @@ def test_boundary_config_epoch_and_sampling_settings():
 def test_boundary_config_rejects_epochs_over_2():
     with pytest.raises(ValueError, match="epochs"):
         _completion.CompletionTrainingConfig(stage="head", boundary_sampling=True, epochs=3)
+
+
+def test_boundary_config_rejects_conflicting_or_invalid_step_budgets():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _completion.CompletionTrainingConfig(
+            stage="head",
+            boundary_sampling=True,
+            epochs=1,
+            train_steps=3000,
+        )
+    with pytest.raises(ValueError, match="train_steps must be positive"):
+        _completion.CompletionTrainingConfig(stage="head", boundary_sampling=True, train_steps=0)
+    with pytest.raises(ValueError, match="cannot exceed"):
+        _completion.CompletionTrainingConfig(
+            stage="head",
+            boundary_sampling=True,
+            train_steps=3000,
+            eval_checkpoint_step=4000,
+        )
 
 
 def test_boundary_config_freezes_all_except_completion_head():
@@ -367,8 +401,8 @@ def test_epoch_based_wandb_log_has_no_val_or_test_keys():
 
 
 def test_epoch_based_protects_eval_checkpoint():
-    """AST guard (P1-1 + P1-A): when ``completed == eval_checkpoint_step`` and
-    epochs>1, train.main must copy the checkpoint to a protected
+    """AST guard (P1-1 + P1-A): when a predeclared eval checkpoint is not the
+    final step, train.main must copy the checkpoint to a protected
     ``eval_checkpoint/`` dir **with a step marker** (``_protected_step.json``),
     and at training end must assert the eval checkpoint still exists."""
 

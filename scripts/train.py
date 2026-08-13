@@ -603,6 +603,24 @@ def compute_epoch_total_steps(steps_per_epoch: int, epochs: int) -> int:
     return steps_per_epoch * epochs
 
 
+def compute_boundary_total_steps(
+    steps_per_epoch: int,
+    *,
+    epochs: int | None,
+    train_steps: int | None,
+) -> int:
+    """Resolves an integer-epoch or explicit-step boundary training budget."""
+
+    if (epochs is None) == (train_steps is None):
+        raise ValueError("exactly one of epochs or train_steps must be set")
+    if train_steps is not None:
+        if train_steps <= 0:
+            raise ValueError("train_steps must be positive")
+        return train_steps
+    assert epochs is not None
+    return compute_epoch_total_steps(steps_per_epoch, epochs)
+
+
 def should_save_epoch_checkpoint(
     completed_steps: int,
     *,
@@ -688,9 +706,9 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
 
-    # Epoch-based boundary training: derive the real step budget from the
-    # boundary sampler and override num_train_steps so the LR schedule, the
-    # training loop, and the checkpoint logic all use the actual epoch total.
+    # Budgeted boundary training: derive steps_per_epoch from the real sampler,
+    # then resolve either an integer-epoch or explicit-step budget. Override
+    # num_train_steps so the LR schedule, loop, and checkpoints agree.
     is_epoch_based = config.completion.is_epoch_based
     steps_per_epoch: int | None = None
     total_steps = config.num_train_steps
@@ -699,19 +717,25 @@ def main(config: _config.TrainConfig):
         boundary_sampler = data_loader.boundary_sampler
         if boundary_sampler is None:
             raise ValueError(
-                "epoch-based completion training (config.completion.epochs set) requires the "
+                "budgeted boundary training (completion.epochs or train_steps set) requires the "
                 "boundary sampler; ensure boundary_sampling=True and a boundary-labeled dataset"
             )
         steps_per_epoch = boundary_sampler.steps_per_epoch
-        assert config.completion.epochs is not None
-        total_steps = compute_epoch_total_steps(steps_per_epoch, config.completion.epochs)
+        total_steps = compute_boundary_total_steps(
+            steps_per_epoch,
+            epochs=config.completion.epochs,
+            train_steps=config.completion.train_steps,
+        )
         config = dataclasses.replace(config, num_train_steps=total_steps)
-        eval_checkpoint_step = config.completion.eval_checkpoint_step or steps_per_epoch
+        eval_checkpoint_step = config.completion.eval_checkpoint_step or (
+            total_steps if config.completion.train_steps is not None else steps_per_epoch
+        )
         logging.info(
-            "Epoch-based boundary training: steps_per_epoch=%d epochs=%d total_steps=%d "
-            "eval_checkpoint_step=%d train_samples=%d",
+            "Boundary training: steps_per_epoch=%d epochs=%s configured_train_steps=%s "
+            "total_steps=%d eval_checkpoint_step=%d train_samples=%d",
             steps_per_epoch,
             config.completion.epochs,
+            config.completion.train_steps,
             total_steps,
             eval_checkpoint_step,
             boundary_sampler.num_samples,
@@ -814,6 +838,7 @@ def main(config: _config.TrainConfig):
                 }
             )
         if is_epoch_based:
+            assert steps_per_epoch is not None
             boundary_audits = completion_data_info.boundary_episode_audits or {}
             train_ids = completion_data_info.manifest.episode_ids("train")
             sampled_positive = sum(boundary_audits[eid].positive_count for eid in train_ids if eid in boundary_audits)
@@ -827,7 +852,7 @@ def main(config: _config.TrainConfig):
                 {
                     "dataset/steps_per_epoch": steps_per_epoch,
                     "dataset/total_steps": total_steps,
-                    "dataset/epochs": config.completion.epochs,
+                    "dataset/effective_epochs": total_steps / steps_per_epoch,
                     "dataset/eval_checkpoint_step": eval_checkpoint_step,
                     "dataset/train_sampled_positive_count": sampled_positive,
                     "dataset/train_sampled_negative_count": sampled_negative,
@@ -837,11 +862,15 @@ def main(config: _config.TrainConfig):
                     "dataset/boundary_copy_positive_count": boundary_copy_positive,
                 }
             )
+            if config.completion.epochs is not None:
+                dataset_metrics["dataset/epochs"] = config.completion.epochs
+            if config.completion.train_steps is not None:
+                dataset_metrics["dataset/configured_train_steps"] = config.completion.train_steps
         logging.info("Completion dataset metrics: %s", dataset_metrics)
         wandb.log(dataset_metrics, step=0)
 
-    # Predetermine the single test checkpoint (1-epoch end by default) before any
-    # training metric exists, so test data can never influence checkpoint choice.
+    # Predetermine the single test checkpoint before any training metric exists,
+    # so test data can never influence checkpoint choice.
     if is_epoch_based:
         assert eval_checkpoint_step is not None
         eval_ckpt_path = epath.Path(config.checkpoint_dir) / "eval_checkpoint.json"
@@ -853,6 +882,8 @@ def main(config: _config.TrainConfig):
                     "steps_per_epoch": steps_per_epoch,
                     "total_steps": total_steps,
                     "epochs": config.completion.epochs,
+                    "train_steps": config.completion.train_steps,
+                    "effective_epochs": total_steps / steps_per_epoch,
                 }
             ),
             encoding="utf-8",
@@ -970,17 +1001,10 @@ def main(config: _config.TrainConfig):
             ):
                 _checkpoints.save_state(checkpoint_manager, train_state, data_loader, completed)
                 wandb.log({"checkpoint/saved_step": completed}, step=step)
-                # P1: Protect the predetermined eval checkpoint from max_to_keep=1
-                # cleanup.  When epochs>1 the checkpoint manager may delete the
-                # epoch-1 checkpoint after the epoch-2 checkpoint is saved (if the
-                # step is not a multiple of keep_period).  We copy it to a separate
-                # directory the manager does not manage.
-                if (
-                    eval_checkpoint_step is not None
-                    and completed == eval_checkpoint_step
-                    and config.completion.epochs is not None
-                    and config.completion.epochs > 1
-                ):
+                # Protect a predetermined non-final eval checkpoint from
+                # max_to_keep cleanup by copying it outside the manager's
+                # numeric checkpoint directories.
+                if eval_checkpoint_step is not None and completed == eval_checkpoint_step and completed < total_steps:
                     checkpoint_manager.wait_until_finished()
                     src = epath.Path(config.checkpoint_dir) / str(completed)
                     dst = epath.Path(config.checkpoint_dir) / "eval_checkpoint" / str(completed)
