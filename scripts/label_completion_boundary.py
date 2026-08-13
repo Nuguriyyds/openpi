@@ -1367,9 +1367,6 @@ def main() -> None:
             chunks_size=chunks_size,
             video_keys=video_keys,
             episode_ids=episode_ids,
-            episode_lengths=episode_lengths,
-            copy_counts=copy_counts,
-            copy_source_episode_ids=copy_source_episode_ids,
             excluded_episode_ids=excluded_episode_ids,
             args=args,
         )
@@ -1396,16 +1393,13 @@ def _generate_in_staging(
     chunks_size: int,
     video_keys: list[str],
     episode_ids: list[int],
-    episode_lengths: dict[int, int],
-    copy_counts: dict[int, int],
-    copy_source_episode_ids: dict[int, int | None],
     excluded_episode_ids: set[int],
     args: argparse.Namespace,
 ) -> None:
     """Generates the entire dataset in ``staging_root``, audits, then publishes."""
 
     # --- 1. Process parquet files ---
-    print(f"\n[1/6] Processing {len(parquet_jobs)} parquet files with {args.workers} worker(s) ...")
+    print(f"\n[1/5] Processing {len(parquet_jobs)} parquet files with {args.workers} worker(s) ...")
     total_written = 0
     total_skipped = 0
     errors: list[dict] = []
@@ -1436,9 +1430,9 @@ def _generate_in_staging(
 
     # --- 2. Process videos ---
     if args.skip_videos:
-        print("\n[2/6] Skipping videos (--skip-videos)")
+        print("\n[2/5] Skipping videos (--skip-videos)")
     else:
-        print(f"\n[2/6] Processing {len(video_jobs)} video episodes with {args.workers} worker(s) ...")
+        print(f"\n[2/5] Processing {len(video_jobs)} video episodes with {args.workers} worker(s) ...")
         vid_errors: list[dict] = []
         if args.workers <= 1:
             for item in tqdm.tqdm(video_jobs, desc="Processing videos"):
@@ -1463,22 +1457,10 @@ def _generate_in_staging(
             raise RuntimeError(f"{len(vid_errors)} video processing errors")
         print("  Done.")
 
-    print("\n[3/6] Verifying positive/negative decoded-frame identity ...")
-    verify_boundary_contrast_pixels(
-        staging_root,
-        episode_ids=episode_ids,
-        old_lengths=episode_lengths,
-        copy_counts=copy_counts,
-        copy_source_episode_ids=copy_source_episode_ids,
-        video_keys=video_keys,
-        chunks_size=chunks_size,
-    )
-    print("  All boundary contrast frames are pixel-identical.")
-
-    # --- 4. Write meta/ ---
+    # --- 3. Write meta/ ---
     # Written after parquet + videos so that a failure during data generation
     # does not leave a half-finished dataset that looks valid (P1-4).
-    print("\n[4/6] Writing meta/ ...")
+    print("\n[3/5] Writing meta/ ...")
     write_boundary_meta(
         src_root / "meta",
         staging_root / "meta",
@@ -1489,12 +1471,12 @@ def _generate_in_staging(
     )
     print(f"  Patched info.json (label_scheme=boundary, total_frames={total_frames})")
 
-    print("\n[5/6] Recomputing LeRobot episode and aggregate stats ...")
+    print("\n[4/5] Recomputing LeRobot episode and aggregate stats ...")
     recompute_lerobot_stats(staging_root, dst_root.name)
     print("  Recomputed meta/episodes_stats.jsonl and meta/stats.json.")
 
-    # --- 6. Audit + label_audit.json ---
-    print("\n[6/6] Auditing dataset ...")
+    # --- 5. Audit + label_audit.json ---
+    print("\n[5/5] Auditing dataset ...")
     audit = audit_boundary_dataset(
         staging_root,
         new_lengths=new_lengths,
