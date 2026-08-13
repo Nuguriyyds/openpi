@@ -23,6 +23,7 @@ per-subtask counts, boundary copy counts, and consistency checks.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import multiprocessing as mp
 import os
@@ -30,6 +31,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import pyarrow as pa
@@ -94,6 +96,26 @@ def read_info(meta_dir: pathlib.Path) -> dict:
     return json.loads((meta_dir / "info.json").read_text(encoding="utf-8"))
 
 
+def publish_staged_dataset(staged_root: pathlib.Path, final_root: pathlib.Path, *, replace: bool) -> None:
+    """Atomically publishes a complete staged dataset, restoring on failure."""
+
+    backup_root = final_root.with_name(f".{final_root.name}.backup-{os.getpid()}")
+    if backup_root.exists():
+        raise FileExistsError(f"Refusing to overwrite stale backup directory: {backup_root}")
+    if final_root.exists():
+        if not replace:
+            raise FileExistsError(f"Output dataset already exists: {final_root}; pass --force to replace it")
+        os.replace(final_root, backup_root)
+    try:
+        os.replace(staged_root, final_root)
+    except BaseException:
+        if backup_root.exists() and not final_root.exists():
+            os.replace(backup_root, final_root)
+        raise
+    if backup_root.exists():
+        shutil.rmtree(backup_root)
+
+
 def get_video_keys(info: dict) -> list[str]:
     return sorted(k for k, v in info.get("features", {}).items() if v.get("dtype") == "video")
 
@@ -151,6 +173,30 @@ def count_video_frames(video_path: pathlib.Path) -> int:
         check=True,
     )
     return int(result.stdout.strip())
+
+
+def read_video_frame_timestamps(video_path: pathlib.Path) -> np.ndarray:
+    """Reads every decoded frame's effective presentation timestamp."""
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "frame=best_effort_timestamp_time",
+        "-of",
+        "csv=p=0",
+        str(video_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe timestamps failed for {video_path}: {result.stderr[-500:]}")
+    return np.asarray(
+        [float(line.split(",", 1)[0]) for line in result.stdout.splitlines() if line.strip()],
+        dtype=np.float64,
+    )
 
 
 def format_ratio(positive: int, negative: int) -> dict:
@@ -337,6 +383,7 @@ def extend_episode_video(
     next_video: pathlib.Path,
     dst_video: pathlib.Path,
     copy_frames: int,
+    fps: float,
 ) -> None:
     """Extends ``current_video`` with the first ``copy_frames`` frames of ``next_video``.
 
@@ -344,15 +391,17 @@ def extend_episode_video(
     atomically renaming, so a failed ffmpeg never leaves a truncated file at
     the final path (P1-4).
 
-    Uses lossless encoding (CRF 0) with all I-frames (``-g 1``) so that the
-    same source frame produces byte-identical output regardless of its
-    position in the concatenated stream.  This guarantees pixel-level
-    consistency between the positive (copy frame) and negative (original
-    first-5) contrast pair — both are decoded from the same source video and
-    re-encoded with the same lossless settings (P1-D).
+    All output episodes use lossless H.264 and a frame-index-derived timeline.
+    Consequently the appended frame and the corresponding original frame in
+    the next output episode decode to identical pixels despite being stored in
+    separate MP4 files.
     """
 
-    filter_complex = f"[1:v]trim=end_frame={copy_frames},setpts=PTS-STARTPTS[n5];[0:v][n5]concat=n=2:v=1:a=0[outv]"
+    filter_complex = (
+        f"[0:v]setpts=N/({fps:.12g}*TB)[cur];"
+        f"[1:v]trim=end_frame={copy_frames},setpts=N/({fps:.12g}*TB)[n5];"
+        "[cur][n5]concat=n=2:v=1:a=0[outv]"
+    )
     tmp_video = dst_video.with_suffix(".mp4.tmp")
     cmd = [
         "ffmpeg",
@@ -371,10 +420,12 @@ def extend_episode_video(
         "libx264",
         "-preset",
         "fast",
-        "-crf",
+        "-qp",
         "0",
         "-g",
         "1",
+        "-r",
+        f"{fps:.12g}",
         "-an",
         "-pix_fmt",
         "yuv420p",
@@ -389,18 +440,8 @@ def extend_episode_video(
     os.replace(tmp_video, dst_video)
 
 
-def reencode_episode_video(
-    src_video: pathlib.Path,
-    dst_video: pathlib.Path,
-) -> None:
-    """Re-encodes a video with the same lossless settings used by
-    :func:`extend_episode_video`.
-
-    This is used for subtask-4 episodes (no copy frames) so that all videos
-    in the boundary dataset go through the same encoding pipeline, ensuring
-    pixel-level consistency between copy frames and their original
-    counterparts (P1-D).
-    """
+def transcode_episode_video(src_video: pathlib.Path, dst_video: pathlib.Path, fps: float) -> None:
+    """Losslessly normalizes a non-extended episode onto the same timeline/codec."""
 
     tmp_video = dst_video.with_suffix(".mp4.tmp")
     cmd = [
@@ -408,16 +449,20 @@ def reencode_episode_video(
         "-y",
         "-i",
         str(src_video),
+        "-vf",
+        f"setpts=N/({fps:.12g}*TB)",
         "-f",
         "mp4",
         "-c:v",
         "libx264",
         "-preset",
         "fast",
-        "-crf",
+        "-qp",
         "0",
         "-g",
         "1",
+        "-r",
+        f"{fps:.12g}",
         "-an",
         "-pix_fmt",
         "yuv420p",
@@ -425,8 +470,7 @@ def reencode_episode_video(
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        if tmp_video.exists():
-            tmp_video.unlink()
+        tmp_video.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg failed for {src_video.name}: {result.stderr[-500:]}")
     os.replace(tmp_video, dst_video)
 
@@ -442,6 +486,7 @@ def process_episode_videos(
     *,
     force: bool,
     expected_length: int,
+    fps: float,
 ) -> dict:
     """Copies or extends all camera videos for one episode.
 
@@ -467,9 +512,9 @@ def process_episode_videos(
             next_video = get_episode_video_path(src_root, next_episode_id, key, chunks_size)
             if not next_video.exists():
                 raise FileNotFoundError(f"next video not found: {next_video}")
-            extend_episode_video(src_video, next_video, dst_video, copy_n)
+            extend_episode_video(src_video, next_video, dst_video, copy_n, fps)
         else:
-            reencode_episode_video(src_video, dst_video)
+            transcode_episode_video(src_video, dst_video, fps)
 
         # Verify frame count (P1-4).
         nb = count_video_frames(dst_video)
@@ -478,6 +523,14 @@ def process_episode_videos(
             raise RuntimeError(
                 f"video frame count mismatch for episode {episode_id} key {key}: "
                 f"video {nb} frames != expected {expected_length}"
+            )
+        pts = read_video_frame_timestamps(dst_video)
+        expected_pts = np.arange(expected_length, dtype=np.float64) / fps
+        if len(pts) != expected_length or not np.allclose(pts, expected_pts, atol=1e-4, rtol=0.0):
+            dst_video.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"video PTS mismatch for episode {episode_id} key {key}: "
+                f"expected frame_index/fps for {expected_length} frames"
             )
     return {"ok": 1}
 
@@ -493,6 +546,7 @@ def _process_video_worker(args: tuple) -> dict:
         copy_n,
         force,
         expected_length,
+        fps,
     ) = args
     try:
         return process_episode_videos(
@@ -505,21 +559,66 @@ def _process_video_worker(args: tuple) -> dict:
             copy_n=copy_n,
             force=force,
             expected_length=expected_length,
+            fps=fps,
         )
     except Exception as exc:
         return {"error": str(exc), "episode": episode_id}
 
 
+def decoded_frame_hashes(video_path: pathlib.Path, start_frame: int, frame_count: int) -> list[str]:
+    """Returns FFmpeg framemd5 payload hashes for a contiguous decoded range."""
+
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"trim=start_frame={start_frame}:end_frame={start_frame + frame_count}",
+        "-f",
+        "framemd5",
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg framemd5 failed for {video_path}: {result.stderr[-500:]}")
+    hashes = [
+        line.rsplit(",", 1)[-1].strip() for line in result.stdout.splitlines() if line and not line.startswith("#")
+    ]
+    if len(hashes) != frame_count:
+        raise RuntimeError(f"Expected {frame_count} decoded hashes from {video_path}, got {len(hashes)}")
+    return hashes
+
+
+def verify_boundary_contrast_pixels(
+    root: pathlib.Path,
+    *,
+    episode_ids: list[int],
+    old_lengths: dict[int, int],
+    video_keys: list[str],
+    chunks_size: int,
+) -> None:
+    """Proves every positive copy and original negative decode identically."""
+
+    for episode_id in episode_ids:
+        if episode_id % GROUP_SIZE == GROUP_SIZE - 1:
+            continue
+        next_episode_id = episode_id + 1
+        for key in video_keys:
+            current = get_episode_video_path(root, episode_id, key, chunks_size)
+            following = get_episode_video_path(root, next_episode_id, key, chunks_size)
+            positive_hashes = decoded_frame_hashes(current, old_lengths[episode_id], COPY_FRAMES)
+            negative_hashes = decoded_frame_hashes(following, 0, COPY_FRAMES)
+            if positive_hashes != negative_hashes:
+                raise RuntimeError(
+                    f"Decoded boundary contrast mismatch: episode {episode_id} -> {next_episode_id}, key {key}"
+                )
+
+
 # ---------------------------------------------------------------------------
 # Meta
 # ---------------------------------------------------------------------------
-
-
-# P1-B: LeRobot stats files must NOT be copied as-is — they describe the
-# original frame distribution and become stale after boundary copies.
-# Instead, compute_boundary_stats() recalculates them from the final parquet
-# data after generation.
-_STATS_FILES_TO_SKIP = {"stats.json", "episodes_stats.jsonl", "stats"}
 
 
 def write_boundary_meta(
@@ -532,17 +631,14 @@ def write_boundary_meta(
 ) -> None:
     """Copies ``meta/`` and patches ``info.json`` + ``episodes.jsonl``.
 
-    Stats files (``stats.json``, ``episodes_stats.jsonl``, ``stats/``) are
-    deliberately skipped here — they are recomputed from the final parquet
-    data by :func:`compute_boundary_stats` after all parquet files are written.
+    Source stats are copied only as bootstrap metadata so LeRobot can open the
+    staged dataset. They are replaced by :func:`recompute_lerobot_stats` before
+    the dataset is audited or published.
     """
 
     dst_meta.mkdir(parents=True, exist_ok=True)
     for item in src_meta.iterdir():
         if item.name == "info.json":
-            continue
-        # P1-3: Skip stale stats files.
-        if item.name in _STATS_FILES_TO_SKIP:
             continue
         dst_item = dst_meta / item.name
         if item.is_file():
@@ -579,6 +675,44 @@ def write_boundary_meta(
             record["length"] = new_lengths[eid]
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
     os.replace(tmp, episodes_path)
+
+
+def recompute_lerobot_stats(dataset_root: pathlib.Path, repo_id: str) -> None:
+    """Recomputes per-episode and aggregate LeRobot stats from final data/video."""
+
+    # Lazy imports keep dry-run and lightweight parquet tests independent of the
+    # full LeRobot runtime.
+    from lerobot.common.datasets.compute_stats import aggregate_stats  # noqa: PLC0415
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset  # noqa: PLC0415
+    from lerobot.common.datasets.utils import serialize_dict  # noqa: PLC0415
+    from lerobot.common.datasets.v21.convert_stats import convert_episode_stats  # noqa: PLC0415
+
+    dataset = LeRobotDataset(repo_id, root=dataset_root)
+    episode_ids = sorted(int(episode_id) for episode_id in dataset.meta.episodes)
+    recomputed: dict[int, dict] = {}
+    for episode_id in tqdm.tqdm(episode_ids, desc="Recomputing episode stats"):
+        convert_episode_stats(dataset, episode_id)
+        recomputed[episode_id] = dataset.meta.episodes_stats[episode_id]
+
+    episodes_stats_path = dataset_root / "meta" / "episodes_stats.jsonl"
+    episodes_tmp = episodes_stats_path.with_suffix(".jsonl.tmp")
+    with episodes_tmp.open("w", encoding="utf-8") as stream:
+        for episode_id in episode_ids:
+            record = {"episode_index": episode_id, "stats": serialize_dict(recomputed[episode_id])}
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(episodes_tmp, episodes_stats_path)
+
+    aggregate = serialize_dict(aggregate_stats(list(recomputed.values())))
+    stats_path = dataset_root / "meta" / "stats.json"
+    stats_tmp = stats_path.with_suffix(".json.tmp")
+    stats_tmp.write_text(json.dumps(aggregate, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(stats_tmp, stats_path)
+
+    # A legacy stats directory, if present in the source metadata, must not
+    # survive because it describes the pre-boundary dataset.
+    legacy_stats_dir = dataset_root / "meta" / "stats"
+    if legacy_stats_dir.is_dir():
+        shutil.rmtree(legacy_stats_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -695,8 +829,7 @@ def compute_boundary_stats(
                 else:
                     continue  # No source stats for this video feature — skip.
                 ep_stats[col_name] = {
-                    k: np.array(v) if k != "count" else np.array([new_len])
-                    for k, v in ft_stats.items()
+                    k: np.array(v) if k != "count" else np.array([new_len]) for k, v in ft_stats.items()
                 }
             elif dtype == "string":
                 continue
@@ -749,8 +882,7 @@ def compute_boundary_stats(
         count = int(feat_stats["count"].flat[0])
         if count != total_frames:
             raise RuntimeError(
-                f"Stats coverage mismatch for feature '{feat_name}': "
-                f"count={count} != total_frames={total_frames}"
+                f"Stats coverage mismatch for feature '{feat_name}': count={count} != total_frames={total_frames}"
             )
 
 
@@ -894,12 +1026,37 @@ def audit_boundary_dataset(
         "index_contiguous": True,
         "timestamp_correct": True,
         "metadata_consistent": True,
+        "stats_consistent": True,
     }
 
     # Verify info.json total_frames.
     info = read_info(dst_root / "meta")
     if info.get("total_frames") != total_frames:
         consistency["metadata_consistent"] = False
+
+    # Verify that stats were recomputed for every episode and include the new
+    # completion field with the exact derived frame counts.
+    stats_path = dst_root / "meta" / "stats.json"
+    episodes_stats_path = dst_root / "meta" / "episodes_stats.jsonl"
+    try:
+        dataset_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        episode_stats_records = [
+            json.loads(line) for line in episodes_stats_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        stats_by_episode = {int(record["episode_index"]): record["stats"] for record in episode_stats_records}
+        if set(stats_by_episode) != set(episode_ids):
+            consistency["stats_consistent"] = False
+        for episode_id in episode_ids:
+            count = stats_by_episode[episode_id]["completion"]["count"]
+            count_value = int(count[0] if isinstance(count, list) else count)
+            if count_value != new_lengths[episode_id]:
+                consistency["stats_consistent"] = False
+        aggregate_count = dataset_stats["completion"]["count"]
+        aggregate_count_value = int(aggregate_count[0] if isinstance(aggregate_count, list) else aggregate_count)
+        if aggregate_count_value != total_frames:
+            consistency["stats_consistent"] = False
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        consistency["stats_consistent"] = False
 
     # Verify global index contiguity + timestamp.
     expected_index = 0
@@ -1000,18 +1157,13 @@ def main() -> None:
         parser.error("--output-root must not be the same as --src-root (original dataset must not be modified).")
     if not (src_root / "meta" / "info.json").is_file():
         parser.error(f"source dataset not found: {src_root / 'meta' / 'info.json'}")
-
-    # P1-C: Generate in a staging directory, then atomically publish.
-    staging_root = dst_root.parent / (dst_root.name + ".staging")
-    if staging_root.exists():
-        print(f"Cleaning up leftover staging directory: {staging_root}")
-        shutil.rmtree(staging_root)
-    if dst_root.exists() and not args.force:
-        parser.error(f"Output directory already exists: {dst_root}. Use --force to overwrite.")
+    if dst_root.exists() and not args.force and not args.dry_run:
+        parser.error(f"output dataset already exists: {dst_root}; pass --force to replace it atomically")
+    if args.skip_videos and not args.dry_run:
+        parser.error("--skip-videos cannot produce a complete publishable dataset; use --dry-run for a preview")
 
     print(f"Source dataset : {src_root}")
     print(f"Output dataset : {dst_root}")
-    print(f"Staging        : {staging_root}")
 
     # --- Load source metadata ---
     info = read_info(src_root / "meta")
@@ -1026,6 +1178,8 @@ def main() -> None:
 
     if len(episode_ids) % GROUP_SIZE != 0:
         parser.error(f"episode count {len(episode_ids)} is not divisible by group size {GROUP_SIZE}")
+    if episode_ids != list(range(len(episode_ids))):
+        parser.error("boundary generation requires contiguous zero-based episode indices")
 
     # --- Compute new lengths + global offsets ---
     new_lengths: dict[int, int] = {}
@@ -1055,6 +1209,20 @@ def main() -> None:
 
     print(f"New total frames: {total_frames} (was {info.get('total_frames')})")
 
+    final_root = dst_root
+    staging_root = final_root
+    cleanup_staging = None
+    if not args.dry_run:
+        final_root.parent.mkdir(parents=True, exist_ok=True)
+        staging_root = pathlib.Path(tempfile.mkdtemp(prefix=f".{final_root.name}.staging-", dir=final_root.parent))
+
+        def cleanup_staging() -> None:
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
+
+        atexit.register(cleanup_staging)
+        print(f"Staging dataset: {staging_root}")
+
     # --- Build parquet jobs ---
     parquet_jobs: list[tuple] = []
     for eid in episode_ids:
@@ -1076,7 +1244,7 @@ def main() -> None:
                 global_offsets[eid],
                 episode_lengths[eid],
                 fps,
-                args.force,
+                False,
             )
         )
 
@@ -1096,8 +1264,9 @@ def main() -> None:
                     video_keys,
                     chunks_size,
                     copy_n,
-                    args.force,
+                    False,
                     new_lengths[eid],
+                    fps,
                 )
             )
 
@@ -1110,7 +1279,7 @@ def main() -> None:
         print("  Would write meta/ (patch info.json + episodes.jsonl)")
         print("  Would compute stats from parquet (episodes_stats.jsonl + stats.json)")
         print("  Would audit + write label_audit.json")
-        print(f"  Would atomically publish: {staging_root} -> {dst_root}")
+        print(f"  Would atomically publish: temporary sibling -> {final_root}")
         # Quick validation on a few files.
         for src_path, _, eid, *_ in parquet_jobs[:3]:
             table = pq.read_table(src_path, columns=["frame_index"])
@@ -1121,7 +1290,7 @@ def main() -> None:
         _generate_in_staging(
             staging_root=staging_root,
             src_root=src_root,
-            dst_root=dst_root,
+            dst_root=final_root,
             parquet_jobs=parquet_jobs,
             video_jobs=video_jobs,
             new_lengths=new_lengths,
@@ -1129,9 +1298,13 @@ def main() -> None:
             fps=fps,
             chunks_size=chunks_size,
             video_keys=video_keys,
+            episode_ids=episode_ids,
+            episode_lengths=episode_lengths,
             args=args,
         )
-    except Exception:
+        assert cleanup_staging is not None
+        atexit.unregister(cleanup_staging)
+    except BaseException:
         # P1-C: Clean up staging directory on any failure.
         print(f"\nGeneration failed — cleaning up staging directory: {staging_root}")
         if staging_root.exists():
@@ -1151,12 +1324,14 @@ def _generate_in_staging(
     fps: float,
     chunks_size: int,
     video_keys: list[str],
+    episode_ids: list[int],
+    episode_lengths: dict[int, int],
     args: argparse.Namespace,
 ) -> None:
     """Generates the entire dataset in ``staging_root``, audits, then publishes."""
 
     # --- 1. Process parquet files ---
-    print(f"\n[1/5] Processing {len(parquet_jobs)} parquet files with {args.workers} worker(s) ...")
+    print(f"\n[1/6] Processing {len(parquet_jobs)} parquet files with {args.workers} worker(s) ...")
     total_written = 0
     total_skipped = 0
     errors: list[dict] = []
@@ -1187,9 +1362,9 @@ def _generate_in_staging(
 
     # --- 2. Process videos ---
     if args.skip_videos:
-        print("\n[2/5] Skipping videos (--skip-videos)")
+        print("\n[2/6] Skipping videos (--skip-videos)")
     else:
-        print(f"\n[2/5] Processing {len(video_jobs)} video episodes with {args.workers} worker(s) ...")
+        print(f"\n[2/6] Processing {len(video_jobs)} video episodes with {args.workers} worker(s) ...")
         vid_errors: list[dict] = []
         if args.workers <= 1:
             for item in tqdm.tqdm(video_jobs, desc="Processing videos"):
@@ -1214,8 +1389,20 @@ def _generate_in_staging(
             raise RuntimeError(f"{len(vid_errors)} video processing errors")
         print("  Done.")
 
-    # --- 3. Write meta/ ---
-    print("\n[3/5] Writing meta/ ...")
+    print("\n[3/6] Verifying positive/negative decoded-frame identity ...")
+    verify_boundary_contrast_pixels(
+        staging_root,
+        episode_ids=episode_ids,
+        old_lengths=episode_lengths,
+        video_keys=video_keys,
+        chunks_size=chunks_size,
+    )
+    print("  All boundary contrast frames are pixel-identical.")
+
+    # --- 4. Write meta/ ---
+    # Written after parquet + videos so that a failure during data generation
+    # does not leave a half-finished dataset that looks valid (P1-4).
+    print("\n[4/6] Writing meta/ ...")
     write_boundary_meta(
         src_root / "meta",
         staging_root / "meta",
@@ -1225,19 +1412,12 @@ def _generate_in_staging(
     )
     print(f"  Patched info.json (label_scheme=boundary, total_frames={total_frames})")
 
-    # --- 4. Compute stats (P1-B) ---
-    print("\n[4/5] Computing stats from parquet data ...")
-    compute_boundary_stats(
-        staging_root,
-        src_root / "meta",
-        new_lengths=new_lengths,
-        chunks_size=chunks_size,
-        video_keys=video_keys,
-    )
-    print("  Written episodes_stats.jsonl + stats.json")
+    print("\n[5/6] Recomputing LeRobot episode and aggregate stats ...")
+    recompute_lerobot_stats(staging_root, dst_root.name)
+    print("  Recomputed meta/episodes_stats.jsonl and meta/stats.json.")
 
-    # --- 5. Audit + label_audit.json ---
-    print("\n[5/5] Auditing dataset ...")
+    # --- 6. Audit + label_audit.json ---
+    print("\n[6/6] Auditing dataset ...")
     audit = audit_boundary_dataset(
         staging_root,
         new_lengths=new_lengths,
@@ -1254,7 +1434,9 @@ def _generate_in_staging(
     )
 
     audit_path = staging_root / "label_audit.json"
-    audit_path.write_text(json.dumps(audit, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    audit_tmp = audit_path.with_suffix(".json.tmp")
+    audit_tmp.write_text(json.dumps(audit, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(audit_tmp, audit_path)
     print(f"\n  label_audit.json written to: {audit_path}")
     print(
         f"  Train: {audit['train_episode_count']} episodes, full {audit['train_full']['ratio']} "
@@ -1268,12 +1450,8 @@ def _generate_in_staging(
     print(f"  Boundary copy positives: {audit['boundary_copy_positive_count']}")
     print(f"  Consistency: {'PASS' if audit['consistency']['all_checks_passed'] else 'FAIL'}")
 
-    # --- Publish: atomically rename staging → final (P1-C) ---
-    if dst_root.exists():
-        print(f"\nRemoving old dataset: {dst_root}")
-        shutil.rmtree(dst_root)
-    os.rename(staging_root, dst_root)
-    print(f"\nDone. Boundary dataset at: {dst_root}")
+    publish_staged_dataset(staging_root, dst_root, replace=args.force)
+    print(f"\nDone. Boundary dataset atomically published at: {dst_root}")
     print(f"  To use it for S2 training, set lerobot_home to: {dst_root.parent}")
     print(f"  and repo_id to: {dst_root.name}")
 

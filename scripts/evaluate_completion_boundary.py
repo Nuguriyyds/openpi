@@ -11,7 +11,7 @@ no ``latest`` alias.  The checkpoint step must be specified explicitly and must
 match the step preregistered in ``eval_checkpoint.json`` (written during
 training).  Bypassing preregistration is forbidden to prevent test-set model
 selection.  When the managed step directory was deleted by ``max_to_keep=1``,
-the protected ``eval_checkpoint/`` copy is used, but only if its
+the protected ``eval_checkpoint/<step>/`` copy is used, but only if its
 ``_protected_step.json`` marker matches the requested step (P1-A).
 """
 
@@ -45,6 +45,7 @@ from evaluate_completion_head import _write_json  # noqa: E402
 
 from openpi.training.completion_data import BOUNDARY_COPY_FRAMES  # noqa: E402
 from openpi.training.completion_data import BOUNDARY_GROUP  # noqa: E402
+from openpi.training.completion_data import SplitManifest  # noqa: E402
 from openpi.training.completion_data import audit_boundary_completion_episode_parquet  # noqa: E402
 from openpi.training.completion_data import build_boundary_train_sample_set  # noqa: E402
 
@@ -221,6 +222,41 @@ def _sparse_mask(
     return mask
 
 
+def _validate_prediction_coverage(
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    *,
+    arrays: tuple[np.ndarray, ...],
+    expected_episode_ids: list[int],
+    episode_lengths: dict[int, int],
+) -> None:
+    """Require exactly one prediction for every expected test frame."""
+
+    expected_count = sum(episode_lengths[eid] for eid in expected_episode_ids)
+    all_arrays = (episode_indices, frame_indices, *arrays)
+    lengths = {len(value) for value in all_arrays}
+    if lengths != {expected_count}:
+        raise ValueError(
+            f"Prediction arrays must all contain {expected_count} test frames; observed lengths={sorted(lengths)}"
+        )
+
+    actual_episode_ids = sorted(int(value) for value in np.unique(episode_indices))
+    if actual_episode_ids != sorted(expected_episode_ids):
+        raise ValueError(
+            f"Prediction episodes do not match the test manifest: "
+            f"expected={sorted(expected_episode_ids)}, actual={actual_episode_ids}"
+        )
+
+    for episode_id in expected_episode_ids:
+        actual_frames = np.sort(frame_indices[episode_indices == episode_id].astype(np.int64, copy=False))
+        expected_frames = np.arange(episode_lengths[episode_id], dtype=np.int64)
+        if not np.array_equal(actual_frames, expected_frames):
+            raise ValueError(
+                f"Episode {episode_id} predictions must cover every frame exactly once; "
+                f"expected {len(expected_frames)} frames, observed {len(actual_frames)}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint worker (subprocess isolation)
 # ---------------------------------------------------------------------------
@@ -266,8 +302,8 @@ def _resolve_single_checkpoint(checkpoint_root: Path, step: int) -> Path:
     checkpoint_dir = checkpoint_root / str(step)
     if checkpoint_dir.is_dir() and (checkpoint_dir / "params").is_dir():
         return checkpoint_dir
-    # Fall back to protected copy (P1-1), but verify the step marker (P1-A).
-    protected = checkpoint_root / "eval_checkpoint"
+    # Fall back to the step-specific protected copy and verify its marker.
+    protected = checkpoint_root / "eval_checkpoint" / str(step)
     if protected.is_dir() and (protected / "params").is_dir():
         marker_path = protected / "_protected_step.json"
         if not marker_path.is_file():
@@ -343,9 +379,15 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     fps = float(dataset_info["fps"])
     chunks_size = int(dataset_info.get("chunks_size", 1000))
 
-    # P2-2: Verify the dataset root matches the config's repo_id under
-    # hf_lerobot_home, so inference data and metadata come from the same dataset.
-    expected_root = (args.hf_lerobot_home.resolve() / args.config_repo_id).resolve()
+    # Resolve the repo_id from the actual training config rather than trusting a
+    # second user-provided string that could disagree with the worker config.
+    from openpi.training import config as training_config  # noqa: PLC0415
+
+    train_config = training_config.get_config(args.config_name)
+    config_repo_id = getattr(train_config.data, "repo_id", None)
+    if not isinstance(config_repo_id, str) or not config_repo_id:
+        raise ValueError(f"Training config {args.config_name!r} has no concrete LeRobot repo_id")
+    expected_root = (args.hf_lerobot_home.resolve() / config_repo_id).resolve()
     if dataset_root != expected_root:
         raise ValueError(
             f"dataset_root ({dataset_root}) does not match "
@@ -399,7 +441,18 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     if not np.all(np.logical_or(targets == 0.0, targets == 1.0)):
         raise ValueError("Completion targets must be binary 0/1")
 
-    test_ids = sorted(np.unique(ep_idx).tolist())
+    manifest = train_config.completion
+    if manifest.split_manifest_path is None:
+        raise ValueError("Boundary evaluation requires completion.split_manifest_path")
+    split_manifest = SplitManifest.from_dict(_read_json(Path(manifest.split_manifest_path)))
+    test_ids = split_manifest.episode_ids("test")
+    _validate_prediction_coverage(
+        ep_idx,
+        fr_idx,
+        arrays=(tk_idx, logits, targets, infer_ms),
+        expected_episode_ids=test_ids,
+        episode_lengths=_read_episodes_lengths(dataset_root / "meta"),
+    )
     LOGGER.info("Test episodes: %d, total frames: %d", len(test_ids), len(logits))
 
     # --- 3. test_full metrics (all frames) ---
@@ -506,11 +559,6 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-name", default=DEFAULT_CONFIG_NAME)
-    parser.add_argument(
-        "--config-repo-id",
-        default="agilex_make_breakfast_subtask_730_frozen_head_completion_boundary",
-        help="Dataset repo_id from the training config (used to validate dataset_root).",
-    )
     parser.add_argument("--exp-name", default=DEFAULT_EXP_NAME)
     parser.add_argument("--checkpoint-base", type=Path, default=DEFAULT_CHECKPOINT_BASE)
     parser.add_argument("--evaluation-base", type=Path, default=DEFAULT_EVALUATION_BASE)

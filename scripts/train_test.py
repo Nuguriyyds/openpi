@@ -406,6 +406,11 @@ def test_epoch_based_protects_eval_checkpoint():
     ]
     assert protected_step_strings, "expected '_protected_step.json' marker in train.main"
 
-    # 4. The end-of-training assertion references the checkpoint manager
+    # 4. The protected directory is namespaced by the actual completed step,
+    # so even a stale copy cannot be resolved as a different checkpoint.
+    assert '"eval_checkpoint" / str(completed)' in source_text
+    assert '"eval_checkpoint" / str(eval_checkpoint_step)' in source_text
+
+    # 5. The end-of-training assertion references the checkpoint manager
     #    (max_to_keep=1) as the deletion cause.
     assert "max_to_keep" in source_text or "checkpoint manager" in source_text.lower()

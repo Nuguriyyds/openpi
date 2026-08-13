@@ -119,6 +119,23 @@ def _compute_new_lengths(num_episodes: int) -> dict[int, int]:
     return new_lengths
 
 
+def _write_fake_recomputed_stats(root: pathlib.Path, new_lengths: dict[int, int]) -> None:
+    records = [
+        {
+            "episode_index": episode_id,
+            "stats": {"completion": {"count": [length]}},
+        }
+        for episode_id, length in sorted(new_lengths.items())
+    ]
+    meta = root / "meta"
+    (meta / "episodes_stats.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    (meta / "stats.json").write_text(
+        json.dumps({"completion": {"count": [sum(new_lengths.values())]}}), encoding="utf-8"
+    )
+
+
 def _process_all_parquets(src_root: pathlib.Path, dst_root: pathlib.Path, num_episodes: int) -> dict[int, int]:
     """Runs ``process_boundary_parquet`` for every episode and returns new lengths."""
     new_lengths = _compute_new_lengths(num_episodes)
@@ -284,9 +301,8 @@ def test_write_boundary_meta_patches_info_and_episodes(tmp_path):
         assert rec["length"] == new_lengths[rec["episode_index"]]
 
 
-def test_write_boundary_meta_skips_stale_stats_files(tmp_path):
-    """P1-B: stats.json, episodes_stats.jsonl, and stats/ must not be copied
-    (they are recomputed from final data by compute_boundary_stats)."""
+def test_write_boundary_meta_copies_bootstrap_stats_for_recomputation(tmp_path):
+    """LeRobot needs source stats to open the staged dataset before recomputation."""
 
     src_root = tmp_path / "src"
     dst_root = tmp_path / "dst"
@@ -311,11 +327,11 @@ def test_write_boundary_meta_skips_stale_stats_files(tmp_path):
     )
 
     dst_meta = dst_root / "meta"
-    # Stale stats files must NOT exist after write_boundary_meta (they are
-    # recomputed later by compute_boundary_stats).
-    assert not (dst_meta / "stats.json").exists()
-    assert not (dst_meta / "episodes_stats.jsonl").exists()
-    assert not (dst_meta / "stats").exists()
+    # These are temporary bootstrap files; recompute_lerobot_stats replaces the
+    # two files and deletes the legacy directory before publication.
+    assert (dst_meta / "stats.json").exists()
+    assert (dst_meta / "episodes_stats.jsonl").exists()
+    assert (dst_meta / "stats").exists()
     # But episodes.jsonl and info.json should be present (patched).
     assert (dst_meta / "info.json").exists()
     assert (dst_meta / "episodes.jsonl").exists()
@@ -391,6 +407,7 @@ def test_full_audit_and_label_audit_json(tmp_path):
         total_frames=total_frames,
         fps=FPS,
     )
+    _write_fake_recomputed_stats(dst_root, new_lengths)
 
     audit = lcb.audit_boundary_dataset(
         dst_root,
@@ -503,6 +520,7 @@ def test_video_extension_matches_parquet_rows(tmp_path):
             copy_n,
             force=True,
             expected_length=new_lengths[eid],
+            fps=FPS,
         )
 
     for eid in range(num_episodes):
@@ -510,3 +528,52 @@ def test_video_extension_matches_parquet_rows(tmp_path):
         assert vpath.exists()
         nb = lcb.count_video_frames(vpath)
         assert nb == new_lengths[eid], f"episode {eid}: video {nb} != parquet {new_lengths[eid]}"
+
+    lcb.verify_boundary_contrast_pixels(
+        dst_root,
+        episode_ids=list(range(num_episodes)),
+        old_lengths=dict.fromkeys(range(num_episodes), FRAMES_PER_EP),
+        video_keys=[VIDEO_KEY],
+        chunks_size=CHUNKS_SIZE,
+    )
+
+
+def test_publish_staged_dataset_replaces_only_after_stage_is_complete(tmp_path):
+    final_root = tmp_path / "dataset"
+    staged_root = tmp_path / ".dataset.staging"
+    final_root.mkdir()
+    (final_root / "old.txt").write_text("old", encoding="utf-8")
+    staged_root.mkdir()
+    (staged_root / "new.txt").write_text("new", encoding="utf-8")
+
+    lcb.publish_staged_dataset(staged_root, final_root, replace=True)
+
+    assert not staged_root.exists()
+    assert not (final_root / "old.txt").exists()
+    assert (final_root / "new.txt").read_text(encoding="utf-8") == "new"
+    assert not list(tmp_path.glob(".dataset.backup-*"))
+
+
+def test_publish_staged_dataset_restores_old_dataset_if_publish_fails(tmp_path, monkeypatch):
+    final_root = tmp_path / "dataset"
+    staged_root = tmp_path / ".dataset.staging"
+    final_root.mkdir()
+    (final_root / "old.txt").write_text("old", encoding="utf-8")
+    staged_root.mkdir()
+    (staged_root / "new.txt").write_text("new", encoding="utf-8")
+    real_replace = lcb.os.replace
+    call_count = 0
+
+    def fail_second_replace(src, dst):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("simulated publish failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(lcb.os, "replace", fail_second_replace)
+    with pytest.raises(OSError, match="simulated publish failure"):
+        lcb.publish_staged_dataset(staged_root, final_root, replace=True)
+
+    assert (final_root / "old.txt").read_text(encoding="utf-8") == "old"
+    assert (staged_root / "new.txt").read_text(encoding="utf-8") == "new"

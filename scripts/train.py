@@ -983,7 +983,7 @@ def main(config: _config.TrainConfig):
                 ):
                     checkpoint_manager.wait_until_finished()
                     src = epath.Path(config.checkpoint_dir) / str(completed)
-                    dst = epath.Path(config.checkpoint_dir) / "eval_checkpoint"
+                    dst = epath.Path(config.checkpoint_dir) / "eval_checkpoint" / str(completed)
                     if src.is_dir():
                         if dst.exists():
                             dst.rmtree()
@@ -992,9 +992,7 @@ def main(config: _config.TrainConfig):
                         # evaluator can verify it matches the requested step
                         # (P1-A: prevent the protected copy from masquerading
                         # as a different step).
-                        (dst / "_protected_step.json").write_text(
-                            json.dumps({"step": completed}), encoding="utf-8"
-                        )
+                        (dst / "_protected_step.json").write_text(json.dumps({"step": completed}), encoding="utf-8")
                         logging.info("Protected eval checkpoint copy: %s -> %s", src, dst)
         elif (step % config.save_interval == 0 and step > start_step) or step == total_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
@@ -1005,7 +1003,7 @@ def main(config: _config.TrainConfig):
     # P1: Assert the predetermined eval checkpoint survived training.
     if is_epoch_based and eval_checkpoint_step is not None:
         eval_ckpt_managed = epath.Path(config.checkpoint_dir) / str(eval_checkpoint_step)
-        eval_ckpt_protected = epath.Path(config.checkpoint_dir) / "eval_checkpoint"
+        eval_ckpt_protected = epath.Path(config.checkpoint_dir) / "eval_checkpoint" / str(eval_checkpoint_step)
         if not eval_ckpt_managed.is_dir() and not eval_ckpt_protected.is_dir():
             raise FileNotFoundError(
                 f"Predetermined eval checkpoint (step {eval_checkpoint_step}) was deleted by the "

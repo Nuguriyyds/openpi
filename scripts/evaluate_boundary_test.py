@@ -251,12 +251,10 @@ def test_resolve_single_checkpoint_falls_back_to_protected_copy(tmp_path):
 
     checkpoint_root = tmp_path / "ckpts"
     # Simulate: step 200 was deleted by the checkpoint manager, but a protected
-    # copy exists at eval_checkpoint/ with a matching step marker.
-    protected = checkpoint_root / "eval_checkpoint"
+    # copy exists at eval_checkpoint/<step>/ with a matching step marker.
+    protected = checkpoint_root / "eval_checkpoint" / "200"
     (protected / "params").mkdir(parents=True)
-    (protected / "_protected_step.json").write_text(
-        json.dumps({"step": 200}), encoding="utf-8"
-    )
+    (protected / "_protected_step.json").write_text(json.dumps({"step": 200}), encoding="utf-8")
     resolved = ecb._resolve_single_checkpoint(checkpoint_root, 200)
     assert resolved == protected
 
@@ -266,11 +264,9 @@ def test_resolve_single_checkpoint_rejects_protected_step_mismatch(tmp_path):
     as the requested step."""
 
     checkpoint_root = tmp_path / "ckpts"
-    protected = checkpoint_root / "eval_checkpoint"
+    protected = checkpoint_root / "eval_checkpoint" / "300"
     (protected / "params").mkdir(parents=True)
-    (protected / "_protected_step.json").write_text(
-        json.dumps({"step": 500}), encoding="utf-8"
-    )
+    (protected / "_protected_step.json").write_text(json.dumps({"step": 500}), encoding="utf-8")
     # Requesting step 300, but the protected copy is for step 500.
     with pytest.raises(ValueError, match="Protected eval_checkpoint copy is for step 500, not 300"):
         ecb._resolve_single_checkpoint(checkpoint_root, 300)
@@ -280,9 +276,9 @@ def test_resolve_single_checkpoint_rejects_protected_without_marker(tmp_path):
     """P1-A: Protected copy without _protected_step.json cannot be verified."""
 
     checkpoint_root = tmp_path / "ckpts"
-    (checkpoint_root / "eval_checkpoint" / "params").mkdir(parents=True)
+    (checkpoint_root / "eval_checkpoint" / "200" / "params").mkdir(parents=True)
     # No _protected_step.json marker.
-    with pytest.raises(FileNotFoundError, match="no _protected_step.json marker"):
+    with pytest.raises(FileNotFoundError, match=r"no _protected_step\.json marker"):
         ecb._resolve_single_checkpoint(checkpoint_root, 200)
 
 
@@ -291,11 +287,9 @@ def test_resolve_single_checkpoint_prefers_managed_over_protected(tmp_path):
 
     checkpoint_root = tmp_path / "ckpts"
     (checkpoint_root / "200" / "params").mkdir(parents=True)
-    protected = checkpoint_root / "eval_checkpoint"
+    protected = checkpoint_root / "eval_checkpoint" / "200"
     (protected / "params").mkdir(parents=True)
-    (protected / "_protected_step.json").write_text(
-        json.dumps({"step": 200}), encoding="utf-8"
-    )
+    (protected / "_protected_step.json").write_text(json.dumps({"step": 200}), encoding="utf-8")
     resolved = ecb._resolve_single_checkpoint(checkpoint_root, 200)
     assert resolved == checkpoint_root / "200"
 
@@ -304,11 +298,9 @@ def test_resolve_single_checkpoint_protected_missing_params(tmp_path):
     """Protected copy without params/ is not a valid fallback."""
 
     checkpoint_root = tmp_path / "ckpts"
-    protected = checkpoint_root / "eval_checkpoint"
+    protected = checkpoint_root / "eval_checkpoint" / "200"
     protected.mkdir(parents=True)  # no params/
-    (protected / "_protected_step.json").write_text(
-        json.dumps({"step": 200}), encoding="utf-8"
-    )
+    (protected / "_protected_step.json").write_text(json.dumps({"step": 200}), encoding="utf-8")
     with pytest.raises(FileNotFoundError, match="not found"):
         ecb._resolve_single_checkpoint(checkpoint_root, 200)
 
@@ -323,9 +315,7 @@ def test_verify_binding_matches_preregistered(tmp_path):
 
     checkpoint_root = tmp_path / "ckpts"
     checkpoint_root.mkdir()
-    (checkpoint_root / "eval_checkpoint.json").write_text(
-        json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8"
-    )
+    (checkpoint_root / "eval_checkpoint.json").write_text(json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8")
     result = ecb._verify_eval_checkpoint_binding(checkpoint_root, 500)
     assert result["preregistered"] is True
     assert result["step"] == 500
@@ -336,9 +326,7 @@ def test_verify_binding_rejects_mismatch(tmp_path):
 
     checkpoint_root = tmp_path / "ckpts"
     checkpoint_root.mkdir()
-    (checkpoint_root / "eval_checkpoint.json").write_text(
-        json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8"
-    )
+    (checkpoint_root / "eval_checkpoint.json").write_text(json.dumps({"eval_checkpoint_step": 500}), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match the preregistered"):
         ecb._verify_eval_checkpoint_binding(checkpoint_root, 300)
 
@@ -348,7 +336,7 @@ def test_verify_binding_rejects_missing_json(tmp_path):
 
     checkpoint_root = tmp_path / "ckpts"
     checkpoint_root.mkdir()
-    with pytest.raises(FileNotFoundError, match="No eval_checkpoint.json found"):
+    with pytest.raises(FileNotFoundError, match=r"No eval_checkpoint\.json found"):
         ecb._verify_eval_checkpoint_binding(checkpoint_root, 500)
 
 
@@ -380,6 +368,33 @@ def test_sparse_mask_empty_for_unsampled_episodes():
     mask = ecb._sparse_mask(ep_idx, fr_idx, sparse_sets)
     expected = np.array([True, False, False, False])
     np.testing.assert_array_equal(mask, expected)
+
+
+def test_prediction_coverage_requires_every_frame_exactly_once():
+    ep_idx = np.array([4, 4, 5, 5, 5], dtype=np.int64)
+    fr_idx = np.array([0, 1, 0, 1, 2], dtype=np.int64)
+    payload = tuple(np.zeros(5) for _ in range(4))
+    ecb._validate_prediction_coverage(
+        ep_idx,
+        fr_idx,
+        arrays=payload,
+        expected_episode_ids=[4, 5],
+        episode_lengths={4: 2, 5: 3},
+    )
+
+
+def test_prediction_coverage_rejects_duplicate_and_missing_frame():
+    ep_idx = np.array([4, 4], dtype=np.int64)
+    fr_idx = np.array([0, 0], dtype=np.int64)
+    payload = tuple(np.zeros(2) for _ in range(4))
+    with pytest.raises(ValueError, match="every frame exactly once"):
+        ecb._validate_prediction_coverage(
+            ep_idx,
+            fr_idx,
+            arrays=payload,
+            expected_episode_ids=[4],
+            episode_lengths={4: 2},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +436,8 @@ def test_cli_accepts_explicit_int_step(monkeypatch):
     )
     args = ecb._parse_args()
     assert args.checkpoint_step == 500
-    assert args.config_repo_id == "agilex_make_breakfast_subtask_730_frozen_head_completion_boundary"
+    assert not hasattr(args, "config_repo_id")
+    assert not hasattr(args, "allow_unregistered_checkpoint")
 
 
 # ---------------------------------------------------------------------------
