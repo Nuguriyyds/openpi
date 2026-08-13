@@ -387,6 +387,36 @@ def _process_parquet_worker(args: tuple) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def run_ffmpeg_to_local_then_publish(command: list[str], dst_video: pathlib.Path, description: str) -> None:
+    """Runs ffmpeg on a local temporary file, then copies the closed MP4 to storage.
+
+    OSS/FUSE mounts commonly support sequential file copies but not the seek and
+    rewrite operations that the MP4 muxer performs when it finalizes ``moov``
+    metadata.  Encoding directly under such a mount therefore fails only after
+    all frames have been processed.  System temporary storage (normally
+    ``/tmp`` on Linux) is seekable; only the completed file is copied to the
+    dataset mount.
+    """
+
+    fd, local_name = tempfile.mkstemp(prefix="boundary-video-", suffix=".mp4")
+    os.close(fd)
+    local_video = pathlib.Path(local_name)
+    mounted_tmp = dst_video.with_suffix(".mp4.tmp")
+    mounted_tmp.unlink(missing_ok=True)
+    try:
+        result = subprocess.run([*command, str(local_video)], capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"ffmpeg exited with status {result.returncode} without stderr"
+            raise RuntimeError(f"ffmpeg failed for {description}: {detail}")
+        if not local_video.is_file() or local_video.stat().st_size == 0:
+            raise RuntimeError(f"ffmpeg produced no output for {description}")
+        shutil.copyfile(local_video, mounted_tmp)
+        os.replace(mounted_tmp, dst_video)
+    finally:
+        local_video.unlink(missing_ok=True)
+        mounted_tmp.unlink(missing_ok=True)
+
+
 def extend_episode_video(
     current_video: pathlib.Path,
     next_video: pathlib.Path,
@@ -403,7 +433,9 @@ def extend_episode_video(
     All output episodes use lossless H.264 and a frame-index-derived timeline.
     Consequently the appended frame and the corresponding original frame in
     the next output episode decode to identical pixels despite being stored in
-    separate MP4 files.
+    separate MP4 files.  Inter-frame prediction is intentionally left enabled:
+    ``-qp 0`` is still lossless, while forcing every frame to be an I-frame
+    makes this dataset several times larger without improving decoded pixels.
     """
 
     filter_complex = (
@@ -411,9 +443,11 @@ def extend_episode_video(
         f"[1:v]trim=end_frame={copy_frames},setpts=N/({fps:.12g}*TB)[n5];"
         "[cur][n5]concat=n=2:v=1:a=0[outv]"
     )
-    tmp_video = dst_video.with_suffix(".mp4.tmp")
     cmd = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-y",
         "-i",
         str(current_video),
@@ -431,30 +465,23 @@ def extend_episode_video(
         "fast",
         "-qp",
         "0",
-        "-g",
-        "1",
         "-r",
         f"{fps:.12g}",
         "-an",
         "-pix_fmt",
         "yuv420p",
-        str(tmp_video),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        # Clean up partial output.
-        if tmp_video.exists():
-            tmp_video.unlink()
-        raise RuntimeError(f"ffmpeg failed for {current_video.name} + {next_video.name}: {result.stderr[-500:]}")
-    os.replace(tmp_video, dst_video)
+    run_ffmpeg_to_local_then_publish(cmd, dst_video, f"{current_video.name} + {next_video.name}")
 
 
 def transcode_episode_video(src_video: pathlib.Path, dst_video: pathlib.Path, fps: float) -> None:
     """Losslessly normalizes a non-extended episode onto the same timeline/codec."""
 
-    tmp_video = dst_video.with_suffix(".mp4.tmp")
     cmd = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-y",
         "-i",
         str(src_video),
@@ -468,20 +495,13 @@ def transcode_episode_video(src_video: pathlib.Path, dst_video: pathlib.Path, fp
         "fast",
         "-qp",
         "0",
-        "-g",
-        "1",
         "-r",
         f"{fps:.12g}",
         "-an",
         "-pix_fmt",
         "yuv420p",
-        str(tmp_video),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        tmp_video.unlink(missing_ok=True)
-        raise RuntimeError(f"ffmpeg failed for {src_video.name}: {result.stderr[-500:]}")
-    os.replace(tmp_video, dst_video)
+    run_ffmpeg_to_local_then_publish(cmd, dst_video, src_video.name)
 
 
 def process_episode_videos(
@@ -499,9 +519,8 @@ def process_episode_videos(
 ) -> dict:
     """Copies or extends all camera videos for one episode.
 
-    All videos are re-encoded with the same lossless settings (CRF 0, all
-    I-frames) so that copy frames and their original counterparts are
-    pixel-identical (P1-D).
+    All videos are re-encoded with the same lossless settings (QP 0) so that
+    copy frames and their original counterparts are pixel-identical (P1-D).
 
     After writing each video, verifies the frame count matches
     ``expected_length`` using ffprobe (P1-4).
