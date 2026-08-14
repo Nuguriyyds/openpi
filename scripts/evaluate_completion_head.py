@@ -470,6 +470,10 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
     }
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = 2
+        # JAX owns background threads by this point. Forking a multithreaded
+        # JAX process can deadlock; fresh spawned interpreters safely isolate
+        # video decoding workers.
+        loader_kwargs["multiprocessing_context"] = "spawn"
     frame_loader = torch.utils.data.DataLoader(**loader_kwargs)
 
     result_episode_indices: list[int] = []
