@@ -1432,13 +1432,19 @@ _CONFIGS = [
         ),
         num_train_steps=3_000,
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.99,
+        # Only the small completion head is trainable. Keeping a second EMA
+        # copy of the entire frozen model wastes memory bandwidth every step.
+        ema_decay=None,
         batch_size=64,
-        num_workers=4,
+        # Three videos are decoded for every sample; use enough workers to
+        # overlap OSS reads and CPU decoding with the frozen VLM forward pass.
+        num_workers=16,
         log_interval=100,
         save_interval=200,
         keep_period=200,
-        fsdp_devices=2,
+        # Replicate the frozen model and shard only the batch across four GPUs.
+        # This removes layer-wise FSDP collectives from the frozen forward pass.
+        fsdp_devices=1,
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
     #

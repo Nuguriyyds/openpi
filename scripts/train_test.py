@@ -270,6 +270,13 @@ def test_boundary_config_epoch_and_sampling_settings():
     assert config.completion.val_groups == 0
 
 
+def test_boundary_config_uses_head_only_runtime_optimizations():
+    config = _config.get_config(BOUNDARY_CONFIG_NAME)
+    assert config.ema_decay is None
+    assert config.fsdp_devices == 1
+    assert config.num_workers == 16
+
+
 def test_boundary_config_rejects_epochs_over_2():
     with pytest.raises(ValueError, match="epochs"):
         _completion.CompletionTrainingConfig(stage="head", boundary_sampling=True, epochs=3)
