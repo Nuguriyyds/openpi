@@ -1186,6 +1186,9 @@ def _export_episode_mp4(
         threshold=threshold,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    local_fd, local_name = tempfile.mkstemp(prefix="completion-visual-", suffix=".mp4")
+    os.close(local_fd)
+    local_output = Path(local_name)
     command = [
         ffmpeg_bin,
         "-hide_banner",
@@ -1212,7 +1215,7 @@ def _export_episode_mp4(
         "18",
         "-pix_fmt",
         "yuv420p",
-        str(output_path),
+        str(local_output),
     ]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     written_frames = 0
@@ -1244,13 +1247,31 @@ def _export_episode_mp4(
         capture.release()
         process.kill()
         process.wait()
+        local_output.unlink(missing_ok=True)
         raise
 
     if written_frames == 0:
+        local_output.unlink(missing_ok=True)
         raise RuntimeError(f"Source video contains no frames: {source_path}")
     if return_code != 0:
         message = stderr.decode("utf-8", errors="replace").strip()
+        local_output.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg failed for {source_path}: {message}")
+    if not local_output.is_file() or local_output.stat().st_size == 0:
+        local_output.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg produced no MP4 for {source_path}")
+
+    # MP4 finalization seeks backwards to write trailer/moov metadata, which
+    # OSS/FUSE mounts do not reliably support. Encode on local disk, then copy
+    # the already closed file sequentially to the mounted output directory.
+    mounted_tmp = output_path.with_suffix(".mp4.tmp")
+    mounted_tmp.unlink(missing_ok=True)
+    try:
+        shutil.copyfile(local_output, mounted_tmp)
+        os.replace(mounted_tmp, output_path)
+    finally:
+        local_output.unlink(missing_ok=True)
+        mounted_tmp.unlink(missing_ok=True)
 
 
 def _export_mp4_report(
@@ -1378,7 +1399,7 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         output_dir = (args.evaluation_base / args.exp_name / timestamp).resolve()
     else:
         output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=args.resume)
     _setup_logging(output_dir)
     started_at = datetime.now(UTC)
     LOGGER.info("Evaluation output: %s", output_dir)
@@ -1390,13 +1411,16 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     for step in steps:
         checkpoint_dir = checkpoint_root / str(step)
         checkpoint_output = output_dir / f"checkpoint_{step}"
-        checkpoint_output.mkdir()
+        checkpoint_output.mkdir(exist_ok=args.resume)
         prediction_file = checkpoint_output / "predictions.npz"
-        _run_checkpoint_worker(
-            args,
-            checkpoint_dir=checkpoint_dir,
-            prediction_file=prediction_file,
-        )
+        if args.resume and prediction_file.is_file():
+            LOGGER.info("Reusing completed checkpoint predictions: %s", prediction_file)
+        else:
+            _run_checkpoint_worker(
+                args,
+                checkpoint_dir=checkpoint_dir,
+                prediction_file=prediction_file,
+            )
 
         metrics = compute_metrics(prediction_file, fps=fps, threshold=args.threshold)
         checkpoint_summary = {
@@ -1494,6 +1518,11 @@ def _parse_args() -> argparse.Namespace:
         help="Numeric checkpoint steps and/or 'latest'. Each checkpoint receives a complete independent report.",
     )
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse predictions.npz in an existing output directory and continue report/MP4 generation.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
         "--num-workers",
