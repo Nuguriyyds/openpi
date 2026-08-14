@@ -1004,6 +1004,32 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+
+    TrainConfig(
+        name="pi05_730_breakfast_subtasks",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir="/mnt/data/models/wyt/assets",
+                asset_id="agilex_make_breakfast_subtasks",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        batch_size=64,
+        num_train_steps=50_000,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=4,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=50_000,
+        fsdp_devices=4,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
