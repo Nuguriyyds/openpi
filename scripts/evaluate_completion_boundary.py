@@ -272,6 +272,8 @@ def _run_checkpoint_worker(args: argparse.Namespace, *, checkpoint_dir: Path, pr
         str(args.batch_size),
         "--seed",
         str(args.seed),
+        "--num-workers",
+        str(args.num_workers),
         # The worker uses the same strict parser as the parent process. Pass
         # through the already validated, preregistered step even though the
         # worker restores from the explicit directory below.
@@ -578,6 +580,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--stride", type=int, default=15, help="Negative sampling stride for test_sparse.")
     # Hidden args for the subprocess worker.
@@ -587,6 +590,8 @@ def _parse_args() -> argparse.Namespace:
 
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
     if args.stride < 1:
         parser.error("--stride must be at least 1")
     if (args.worker_checkpoint is None) != (args.worker_output is None):

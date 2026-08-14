@@ -39,17 +39,22 @@ DEFAULT_EXP_NAME = "s2_completion_head"
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/models/wyt/data")
 DEFAULT_CHECKPOINT_BASE = Path("/mnt/data/models/wyt/checkpoints")
 DEFAULT_EVALUATION_BASE = Path("/mnt/data/models/wyt/evaluations")
-DEFAULT_DATASET_ROOT = Path(
-    "/mnt/data/models/wyt/data/agilex_make_breakfast_subtask_730_frozen_head"
-)
+DEFAULT_DATASET_ROOT = Path("/mnt/data/models/wyt/data/agilex_make_breakfast_subtask_730_frozen_head")
 DEFAULT_CHECKPOINT_STEPS = ("200", "1000", "latest")
 TOP_VIDEO_KEY = "observation.image.top"
 LABEL_KEY = "completion"
 
 
+def _list_collate(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keeps raw LeRobot samples separate for policy transforms in the parent."""
+
+    return samples
+
+
 # --------------------------------------------------------------------------- #
 #  Helpers                                                                     #
 # --------------------------------------------------------------------------- #
+
 
 def _setup_logging(output_dir: Path | None = None) -> None:
     LOGGER.setLevel(logging.INFO)
@@ -112,6 +117,7 @@ def _resolve_checkpoint_steps(checkpoint_root: Path, requested: list[str]) -> li
 #  Metrics                                                                     #
 # --------------------------------------------------------------------------- #
 
+
 def _sigmoid(logits: np.ndarray) -> np.ndarray:
     logits = np.asarray(logits, dtype=np.float64).reshape(-1)
     scores = np.empty_like(logits)
@@ -170,8 +176,7 @@ def _roc_auc(scores: np.ndarray, targets: np.ndarray) -> float:
         return 0.5
     ranks = _rankdata(scores)
     return float(
-        (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2)
-        / (positive_count * negative_count)
+        (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2) / (positive_count * negative_count)
     )
 
 
@@ -263,9 +268,7 @@ def _aggregate_episode_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     false_positives = sum(int(row["pre_threshold_false_positive_count"]) for row in rows)
     delays = [float(row["detection_delay_frames"]) for row in rows if row["detection_delay_frames"] is not None]
     delay_seconds = [
-        float(row["detection_delay_seconds"])
-        for row in rows
-        if row["detection_delay_seconds"] is not None
+        float(row["detection_delay_seconds"]) for row in rows if row["detection_delay_seconds"] is not None
     ]
     return {
         "episode_count": len(rows),
@@ -314,9 +317,7 @@ def compute_metrics(prediction_file: Path, *, fps: float, threshold: float) -> d
         mask = episode_indices == episode_index
         episode_task_indices = np.unique(task_indices[mask])
         if len(episode_task_indices) != 1:
-            raise ValueError(
-                f"Episode {episode_index}: expected one task index, got {episode_task_indices.tolist()}"
-            )
+            raise ValueError(f"Episode {episode_index}: expected one task index, got {episode_task_indices.tolist()}")
         episode_frame_indices = frame_indices[mask]
         order = np.argsort(episode_frame_indices)
         ordered_frame_indices = episode_frame_indices[order]
@@ -358,6 +359,7 @@ def compute_metrics(prediction_file: Path, *, fps: float, threshold: float) -> d
 #  Checkpoint evaluation worker (runs in a subprocess)                         #
 # --------------------------------------------------------------------------- #
 
+
 def _evaluation_repack():
     import openpi.transforms as transforms
 
@@ -385,6 +387,7 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
     import jax
     import jax.numpy as jnp
     import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+    import torch
 
     import openpi.models.model as model_api
     from openpi.policies import policy_config
@@ -421,15 +424,11 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
     # subsequent calls with the same shapes reuse the cached XLA program.
     # ``train`` must be a static argument because preprocess_observation and
     # the completion head both branch on it with a Python ``if train:``.
-    compute_fn = nnx_utils.module_jit(
-        model.compute_completion_logits, static_argnames="train"
-    )
+    compute_fn = nnx_utils.module_jit(model.compute_completion_logits, static_argnames="train")
 
     # Determine test episodes from the split manifest.
     manifest_path = config.completion.split_manifest_path
-    manifest = _completion_data.SplitManifest.from_dict(
-        json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    )
+    manifest = _completion_data.SplitManifest.from_dict(json.loads(Path(manifest_path).read_text(encoding="utf-8")))
     test_episode_ids = manifest.episode_ids("test")
     LOGGER.info("Test episodes (%d): %s", len(test_episode_ids), test_episode_ids)
 
@@ -444,17 +443,34 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
     for episode_index in test_episode_ids:
         start = int(episode_from[episode_index])
         end = int(episode_to[episode_index])
-        frame_specs.extend(
-            (episode_index, local_frame, start + local_frame)
-            for local_frame in range(end - start)
-        )
+        frame_specs.extend((episode_index, local_frame, start + local_frame) for local_frame in range(end - start))
 
     LOGGER.info(
-        "Evaluating %d test episodes (%d frames), batch_size=%d",
+        "Evaluating %d test episodes (%d frames), batch_size=%d, data_workers=%d",
         len(test_episode_ids),
         len(frame_specs),
         args.batch_size,
+        args.num_workers,
     )
+
+    # LeRobot video access is the dominant cost on remote/OSS storage. The old
+    # evaluator called dataset[index] serially in the model process, leaving
+    # all GPUs idle while three videos were opened and decoded per frame.
+    # DataLoader preserves sampler order while overlapping those reads across
+    # workers. Policy transforms remain in this process because the policy/JAX
+    # objects are not safe to pickle into worker processes.
+    ordered_dataset_indices = [dataset_index for _, _, dataset_index in frame_specs]
+    loader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": args.batch_size,
+        "sampler": ordered_dataset_indices,
+        "num_workers": args.num_workers,
+        "collate_fn": _list_collate,
+        "persistent_workers": args.num_workers > 0,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+    frame_loader = torch.utils.data.DataLoader(**loader_kwargs)
 
     result_episode_indices: list[int] = []
     result_task_indices: list[int] = []
@@ -465,13 +481,20 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
 
     rng = jax.random.key(args.seed)
 
-    for batch_start in range(0, len(frame_specs), args.batch_size):
+    for batch_number, raw_samples in enumerate(frame_loader):
+        batch_start = batch_number * args.batch_size
         valid_specs = frame_specs[batch_start : batch_start + args.batch_size]
         transformed_items: list[dict[str, Any]] = []
         batch_metadata: list[tuple[int, int, int, float]] = []
 
-        for episode_index, local_frame_index, dataset_index in valid_specs:
-            sample = dict(dataset[dataset_index])
+        if len(raw_samples) != len(valid_specs):
+            raise RuntimeError(
+                f"Data loader returned {len(raw_samples)} samples for {len(valid_specs)} ordered frame specifications"
+            )
+        for (episode_index, local_frame_index, _dataset_index), raw_sample in zip(
+            valid_specs, raw_samples, strict=True
+        ):
+            sample = dict(raw_sample)
             task_index = _scalar(sample["task_index"])
             prompt = tasks.get(task_index)
             if prompt is None:
@@ -498,9 +521,7 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
         logits = np.asarray(jax.block_until_ready(logits))
         elapsed_ms = (time.monotonic() - started) * 1000.0 / valid_count
 
-        for batch_index, (episode_index, task_index, local_frame_index, target) in enumerate(
-            batch_metadata
-        ):
+        for batch_index, (episode_index, task_index, local_frame_index, target) in enumerate(batch_metadata):
             result_episode_indices.append(episode_index)
             result_task_indices.append(task_index)
             result_frame_indices.append(local_frame_index)
@@ -535,6 +556,7 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 #  Report series (for HTML / MP4 visualisation)                                #
 # --------------------------------------------------------------------------- #
+
 
 def _format_dataset_path(pattern: str, episode_index: int, chunk_size: int, video_key: str) -> Path:
     return Path(
@@ -589,9 +611,7 @@ def _load_report_series(
             raise ValueError(f"Episode {episode_index}: missing from episodes.jsonl")
         expected_length = int(episode_rows[episode_index]["length"])
         if frame_count != expected_length:
-            raise ValueError(
-                f"Episode {episode_index}: prediction rows={frame_count}, dataset rows={expected_length}"
-            )
+            raise ValueError(f"Episode {episode_index}: prediction rows={frame_count}, dataset rows={expected_length}")
         episode_task_indices = np.unique(task_indices[mask])
         if len(episode_task_indices) != 1:
             raise ValueError(f"Episode {episode_index}: expected one task index")
@@ -636,6 +656,7 @@ def _load_report_series(
 # --------------------------------------------------------------------------- #
 #  HTML report                                                                 #
 # --------------------------------------------------------------------------- #
+
 
 def _html_document(manifest: dict[str, Any]) -> str:
     report_json = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -980,6 +1001,7 @@ def _write_html_report(report_dir: Path, manifest: dict[str, Any]) -> None:
 #  MP4 export                                                                  #
 # --------------------------------------------------------------------------- #
 
+
 def _plot_points(
     values: np.ndarray,
     *,
@@ -1033,17 +1055,23 @@ def _make_mp4_plot_base(
         y_value = y_coordinate(value)
         cv2.line(background, (left, y_value), (right, y_value), (70, 52, 40), 1, cv2.LINE_AA)
         cv2.putText(
-            background, f"{value:.2f}", (7, y_value + 4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (191, 175, 151), 1, cv2.LINE_AA,
+            background,
+            f"{value:.2f}",
+            (7, y_value + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (191, 175, 151),
+            1,
+            cv2.LINE_AA,
         )
 
     threshold_y = y_coordinate(threshold)
     for start in range(left, right, 14):
         cv2.line(background, (start, threshold_y), (min(start + 7, right), threshold_y), (255, 156, 180), 1)
     target_points = _plot_points(
-        target, left=left, right=right, top=top, bottom=bottom, minimum=minimum, maximum=maximum)
-    score_points = _plot_points(
-        score, left=left, right=right, top=top, bottom=bottom, minimum=minimum, maximum=maximum)
+        target, left=left, right=right, top=top, bottom=bottom, minimum=minimum, maximum=maximum
+    )
+    score_points = _plot_points(score, left=left, right=right, top=top, bottom=bottom, minimum=minimum, maximum=maximum)
     cv2.polylines(background, [target_points], False, (165, 217, 102), 2, cv2.LINE_AA)
     cv2.polylines(background, [score_points], False, (90, 173, 255), 2, cv2.LINE_AA)
 
@@ -1053,17 +1081,31 @@ def _make_mp4_plot_base(
         label = str(frame)
         text_width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0][0]
         cv2.putText(
-            background, label, (x_value - text_width // 2, height - 13),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (191, 175, 151), 1, cv2.LINE_AA,
+            background,
+            label,
+            (x_value - text_width // 2, height - 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (191, 175, 151),
+            1,
+            cv2.LINE_AA,
         )
 
-    return background, {"left": left, "right": right, "top": top, "bottom": bottom,
-                        "minimum": minimum, "maximum": maximum}
+    return background, {
+        "left": left,
+        "right": right,
+        "top": top,
+        "bottom": bottom,
+        "minimum": minimum,
+        "maximum": maximum,
+    }
 
 
 def _draw_mp4_plot_frame(
-    base: np.ndarray, geometry: dict[str, float | int],
-    episode: dict[str, Any], frame_index: int,
+    base: np.ndarray,
+    geometry: dict[str, float | int],
+    episode: dict[str, Any],
+    frame_index: int,
 ) -> np.ndarray:
     import cv2
 
@@ -1086,20 +1128,29 @@ def _draw_mp4_plot_frame(
     cv2.circle(panel, (x_value, y_coordinate(float(target[frame_index]))), 4, (165, 217, 102), -1, cv2.LINE_AA)
     cv2.circle(panel, (x_value, y_coordinate(float(score[frame_index]))), 4, (90, 173, 255), -1, cv2.LINE_AA)
     live_text = (
-        f"frame {frame_index}/{len(score) - 1}  "
-        f"target {target[frame_index]:.0f}  score {score[frame_index]:.3f}"
+        f"frame {frame_index}/{len(score) - 1}  target {target[frame_index]:.0f}  score {score[frame_index]:.3f}"
     )
     text_width = cv2.getTextSize(live_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0][0]
     cv2.putText(
-        panel, live_text, (max(12, panel.shape[1] - text_width - 12), 45),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (238, 242, 255), 1, cv2.LINE_AA,
+        panel,
+        live_text,
+        (max(12, panel.shape[1] - text_width - 12), 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (238, 242, 255),
+        1,
+        cv2.LINE_AA,
     )
     return panel
 
 
 def _export_episode_mp4(
-    episode: dict[str, Any], output_path: Path,
-    *, checkpoint_step: int, threshold: float, ffmpeg_bin: str,
+    episode: dict[str, Any],
+    output_path: Path,
+    *,
+    checkpoint_step: int,
+    threshold: float,
+    ffmpeg_bin: str,
 ) -> None:
     import cv2
 
@@ -1124,15 +1175,39 @@ def _export_episode_mp4(
         plot_height += 1
 
     base, geometry = _make_mp4_plot_base(
-        episode, width=output_width, height=plot_height,
-        checkpoint_step=checkpoint_step, threshold=threshold,
+        episode,
+        width=output_width,
+        height=plot_height,
+        checkpoint_step=checkpoint_step,
+        threshold=threshold,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
-        ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s:v", f"{output_width}x{output_height}",
-        "-r", f"{source_fps:.8f}", "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s:v",
+        f"{output_width}x{output_height}",
+        "-r",
+        f"{source_fps:.8f}",
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
         str(output_path),
     ]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1175,8 +1250,12 @@ def _export_episode_mp4(
 
 
 def _export_mp4_report(
-    series: list[dict[str, Any]], output_dir: Path,
-    *, checkpoint_step: int, threshold: float, ffmpeg: str,
+    series: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    checkpoint_step: int,
+    threshold: float,
+    ffmpeg: str,
 ) -> None:
     ffmpeg_bin = shutil.which(ffmpeg)
     if ffmpeg_bin is None:
@@ -1185,12 +1264,18 @@ def _export_mp4_report(
     for position, episode in enumerate(series, start=1):
         output_path = output_dir / f"episode_{int(episode['episode_index']):06d}.mp4"
         _export_episode_mp4(
-            episode, output_path,
-            checkpoint_step=checkpoint_step, threshold=threshold, ffmpeg_bin=ffmpeg_bin,
+            episode,
+            output_path,
+            checkpoint_step=checkpoint_step,
+            threshold=threshold,
+            ffmpeg_bin=ffmpeg_bin,
         )
         LOGGER.info(
             "Checkpoint %s MP4: %d/%d (%s)",
-            checkpoint_step, position, len(series), output_path.name,
+            checkpoint_step,
+            position,
+            len(series),
+            output_path.name,
         )
 
 
@@ -1198,18 +1283,32 @@ def _export_mp4_report(
 #  Comparison CSV and orchestration                                            #
 # --------------------------------------------------------------------------- #
 
+
 def _comparison_row(step: int, metrics: dict[str, Any]) -> dict[str, Any]:
     overall = metrics["overall"]
     row: dict[str, Any] = {"checkpoint_step": step}
     for key in (
-        "frame_count", "positive_count", "negative_count",
-        "auc", "best_f1", "best_threshold", "best_precision", "best_recall",
-        "f1_at_0.5", "precision_at_0.5", "recall_at_0.5", "bce",
-        "positive_score_mean", "negative_score_mean",
-        "early_trigger_rate", "never_trigger_rate",
+        "frame_count",
+        "positive_count",
+        "negative_count",
+        "auc",
+        "best_f1",
+        "best_threshold",
+        "best_precision",
+        "best_recall",
+        "f1_at_0.5",
+        "precision_at_0.5",
+        "recall_at_0.5",
+        "bce",
+        "positive_score_mean",
+        "negative_score_mean",
+        "early_trigger_rate",
+        "never_trigger_rate",
         "pre_threshold_false_positive_rate",
-        "mean_detection_delay_frames", "median_detection_delay_frames",
-        "mean_detection_delay_seconds", "median_detection_delay_seconds",
+        "mean_detection_delay_frames",
+        "median_detection_delay_frames",
+        "mean_detection_delay_seconds",
+        "median_detection_delay_seconds",
         "mean_infer_ms_per_frame",
     ):
         row[key] = overall[key]
@@ -1230,15 +1329,26 @@ def _write_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _run_checkpoint_worker(
-    args: argparse.Namespace, *, checkpoint_dir: Path, prediction_file: Path,
+    args: argparse.Namespace,
+    *,
+    checkpoint_dir: Path,
+    prediction_file: Path,
 ) -> None:
     command = [
-        sys.executable, str(Path(__file__).resolve()),
-        "--config-name", args.config_name,
-        "--batch-size", str(args.batch_size),
-        "--seed", str(args.seed),
-        "--worker-checkpoint", str(checkpoint_dir),
-        "--worker-output", str(prediction_file),
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--config-name",
+        args.config_name,
+        "--batch-size",
+        str(args.batch_size),
+        "--seed",
+        str(args.seed),
+        "--num-workers",
+        str(args.num_workers),
+        "--worker-checkpoint",
+        str(checkpoint_dir),
+        "--worker-output",
+        str(prediction_file),
     ]
     environment = os.environ.copy()
     environment["HF_LEROBOT_HOME"] = str(args.hf_lerobot_home.resolve())
@@ -1279,7 +1389,9 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         checkpoint_output.mkdir()
         prediction_file = checkpoint_output / "predictions.npz"
         _run_checkpoint_worker(
-            args, checkpoint_dir=checkpoint_dir, prediction_file=prediction_file,
+            args,
+            checkpoint_dir=checkpoint_dir,
+            prediction_file=prediction_file,
         )
 
         metrics = compute_metrics(prediction_file, fps=fps, threshold=args.threshold)
@@ -1296,8 +1408,11 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
 
         report_dir = checkpoint_output / "report"
         series, _ = _load_report_series(
-            dataset_root, prediction_file, metrics["episodes"],
-            output_dir=report_dir, copy_videos=args.copy_videos,
+            dataset_root,
+            prediction_file,
+            metrics["episodes"],
+            output_dir=report_dir,
+            copy_videos=args.copy_videos,
         )
         manifest = {
             "checkpoint_step": step,
@@ -1310,8 +1425,11 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         _write_html_report(report_dir, manifest)
         if args.export_mp4:
             _export_mp4_report(
-                series, report_dir / "mp4",
-                checkpoint_step=step, threshold=args.threshold, ffmpeg=args.ffmpeg,
+                series,
+                report_dir / "mp4",
+                checkpoint_step=step,
+                threshold=args.threshold,
+                ffmpeg=args.ffmpeg,
             )
 
         comparison_rows.append(_comparison_row(step, metrics))
@@ -1325,7 +1443,9 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         )
         LOGGER.info(
             "Completed checkpoint %s: AUC=%.4f best_f1=%.4f report=%s",
-            step, metrics["overall"]["auc"], metrics["overall"]["best_f1"],
+            step,
+            metrics["overall"]["auc"],
+            metrics["overall"]["best_f1"],
             report_dir / "index.html",
         )
 
@@ -1371,18 +1491,28 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=16,
+        help="Parallel LeRobot video decoding workers used by checkpoint inference.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--threshold", type=float, default=0.5,
+        "--threshold",
+        type=float,
+        default=0.5,
         help="Score threshold for detection metrics. The best-threshold F1 is always reported separately.",
     )
     parser.add_argument(
         "--no-copy-videos",
-        dest="copy_videos", action="store_false",
+        dest="copy_videos",
+        action="store_false",
         help="Reference dataset videos by absolute file URI instead of copying them into each HTML report.",
     )
     parser.add_argument(
-        "--export-mp4", action="store_true",
+        "--export-mp4",
+        action="store_true",
         help="Also export one top-camera-plus-score MP4 for every test episode and checkpoint.",
     )
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable used by --export-mp4.")
@@ -1393,6 +1523,8 @@ def _parse_args() -> argparse.Namespace:
 
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
     if not 0.0 < args.threshold <= 1.0:
         parser.error("--threshold must be in (0, 1]")
     if not args.checkpoints:

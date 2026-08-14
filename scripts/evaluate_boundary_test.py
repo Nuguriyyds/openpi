@@ -452,6 +452,7 @@ def test_checkpoint_worker_passes_required_preregistered_step(tmp_path, monkeypa
     args = argparse.Namespace(
         config_name=ecb.DEFAULT_CONFIG_NAME,
         batch_size=8,
+        num_workers=16,
         seed=42,
         checkpoint_step=3000,
         hf_lerobot_home=tmp_path,
@@ -465,6 +466,8 @@ def test_checkpoint_worker_passes_required_preregistered_step(tmp_path, monkeypa
     command = captured["command"]
     step_position = command.index("--checkpoint-step")
     assert command[step_position + 1] == "3000"
+    workers_position = command.index("--num-workers")
+    assert command[workers_position + 1] == "16"
     assert captured["kwargs"]["check"] is True
 
 
