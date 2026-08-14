@@ -272,6 +272,11 @@ def _run_checkpoint_worker(args: argparse.Namespace, *, checkpoint_dir: Path, pr
         str(args.batch_size),
         "--seed",
         str(args.seed),
+        # The worker uses the same strict parser as the parent process. Pass
+        # through the already validated, preregistered step even though the
+        # worker restores from the explicit directory below.
+        "--checkpoint-step",
+        str(args.checkpoint_step),
         "--worker-checkpoint",
         str(checkpoint_dir),
         "--worker-output",

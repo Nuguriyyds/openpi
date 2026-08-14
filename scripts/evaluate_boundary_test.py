@@ -8,6 +8,7 @@ diagnostic-only (not used as the deployment threshold).
 # ruff: noqa: SLF001  -- tests intentionally access private functions
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 
@@ -438,6 +439,33 @@ def test_cli_accepts_explicit_int_step(monkeypatch):
     assert args.checkpoint_step == 500
     assert not hasattr(args, "config_repo_id")
     assert not hasattr(args, "allow_unregistered_checkpoint")
+
+
+def test_checkpoint_worker_passes_required_preregistered_step(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(ecb.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        config_name=ecb.DEFAULT_CONFIG_NAME,
+        batch_size=8,
+        seed=42,
+        checkpoint_step=3000,
+        hf_lerobot_home=tmp_path,
+    )
+    ecb._run_checkpoint_worker(
+        args,
+        checkpoint_dir=tmp_path / "3000",
+        prediction_file=tmp_path / "predictions.npz",
+    )
+
+    command = captured["command"]
+    step_position = command.index("--checkpoint-step")
+    assert command[step_position + 1] == "3000"
+    assert captured["kwargs"]["check"] is True
 
 
 # ---------------------------------------------------------------------------
