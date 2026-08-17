@@ -1,17 +1,9 @@
-"""Versioned frozen-prefix feature caches for temporal completion training.
-
-The cache is deliberately tied to both a sealed trajectory manifest and a
-specific clean backbone/preprocessing fingerprint.  Loading fails closed when
-the row order, label semantics, checkpoint, or transform identity changes, so
-the legacy dense/copy-positive cache cannot accidentally enter this training
-path.
-"""
+"""Versioned frozen-prefix feature caches for temporal completion training."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 import dataclasses
-import hashlib
 import json
 import os
 import pathlib
@@ -21,63 +13,10 @@ import numpy as np
 
 import openpi.training.temporal_completion_data as _temporal_data
 
-FEATURE_CACHE_SCHEMA_VERSION = 2
+FEATURE_CACHE_SCHEMA_VERSION = 3
 PREPROCESS_PROTOCOL_VERSION = 1
 POOLING_METHOD = "masked_mean_fp32"
 SUPPORTED_FEATURE_DTYPES = (np.dtype(np.float16), np.dtype(np.float32))
-
-
-def _require_sha256(value: str, *, field: str) -> None:
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(f"{field} must be a lowercase SHA-256 hex digest")
-
-
-def _row_payload(row: _temporal_data.TemporalSampleRow) -> dict[str, Any]:
-    payload = dataclasses.asdict(row)
-    # JSON has no tuple type.  Normalising recursively through a round trip
-    # makes the fingerprint independent of Python tuple/list representation.
-    return json.loads(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-
-
-def rows_fingerprint(rows: Sequence[_temporal_data.TemporalSampleRow]) -> str:
-    encoded = json.dumps(
-        [_row_payload(row) for row in rows],
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def feature_payload_fingerprint(prefix_history: np.ndarray) -> str:
-    """Hashes feature dtype, shape, and bytes without materialising a copy."""
-
-    history = np.asarray(prefix_history)
-    if not history.flags.c_contiguous:
-        history = np.ascontiguousarray(history)
-    digest = hashlib.sha256()
-    digest.update(history.dtype.str.encode())
-    digest.update(b"\0")
-    digest.update(json.dumps(history.shape, separators=(",", ":")).encode())
-    digest.update(b"\0")
-    payload = memoryview(history).cast("B")
-    chunk_size = 8 * 1024 * 1024
-    for offset in range(0, len(payload), chunk_size):
-        digest.update(payload[offset : offset + chunk_size])
-    return digest.hexdigest()
-
-
-def directory_fingerprint(root: str | os.PathLike[str]) -> str:
-    """Content-fingerprints every regular file below an immutable tree."""
-
-    directory = pathlib.Path(root).resolve()
-    if not directory.is_dir():
-        raise FileNotFoundError(f"fingerprint directory not found: {directory}")
-    files = tuple(sorted((path for path in directory.rglob("*") if path.is_file()), key=pathlib.Path.as_posix))
-    if not files:
-        raise ValueError(f"fingerprint directory contains no regular files: {directory}")
-    return _temporal_data.fingerprint_files(files)
 
 
 def manifest_rows(
@@ -94,11 +33,6 @@ def manifest_rows(
 
 @dataclasses.dataclass(frozen=True)
 class TemporalFeatureCacheMetadata:
-    manifest_fingerprint: str
-    rows_fingerprint: str
-    checkpoint_fingerprint: str
-    preprocess_fingerprint: str
-    feature_payload_fingerprint: str
     model_config_name: str
     checkpoint_path: str
     task_prompts: tuple[str, str, str, str]
@@ -123,14 +57,6 @@ class TemporalFeatureCacheMetadata:
             )
         if self.pooling_method != POOLING_METHOD:
             raise ValueError(f"feature cache pooling_method must be {POOLING_METHOD!r}")
-        for field in (
-            "manifest_fingerprint",
-            "rows_fingerprint",
-            "checkpoint_fingerprint",
-            "preprocess_fingerprint",
-            "feature_payload_fingerprint",
-        ):
-            _require_sha256(getattr(self, field), field=field)
         if not self.model_config_name:
             raise ValueError("feature cache model_config_name must not be empty")
         if not self.checkpoint_path:
@@ -171,12 +97,8 @@ class TemporalFeatureCache:
     def validate(self, manifest: _temporal_data.TemporalCompletionManifest) -> None:
         _temporal_data.validate_temporal_manifest(manifest)
         expected_rows = manifest_rows(manifest)
-        if self.metadata.manifest_fingerprint != manifest.manifest_fingerprint:
-            raise ValueError("feature cache was built from a different temporal manifest")
         if self.metadata.task_prompts != manifest.task_prompts:
             raise ValueError("feature cache task prompts differ from the sealed temporal manifest")
-        if self.metadata.rows_fingerprint != rows_fingerprint(expected_rows):
-            raise ValueError("feature cache metadata has a stale temporal row fingerprint")
         if self.rows != expected_rows:
             raise ValueError("feature cache rows differ from the manifest's canonical natural candidate rows")
         if self.metadata.row_count != len(self.rows):
@@ -189,8 +111,6 @@ class TemporalFeatureCache:
             raise ValueError(f"prefix_history must be float16 or float32, got {history.dtype}")
         if not np.isfinite(history).all():
             raise ValueError("prefix_history contains non-finite values")
-        if self.metadata.feature_payload_fingerprint != feature_payload_fingerprint(history):
-            raise ValueError("prefix_history payload fingerprint does not match cache metadata")
 
     def indices_for_split(self, split: _temporal_data.SplitName) -> np.ndarray:
         if split not in _temporal_data.SPLIT_NAMES:
@@ -268,8 +188,6 @@ def save_temporal_feature_cache(
     *,
     manifest: _temporal_data.TemporalCompletionManifest,
     prefix_history: np.ndarray,
-    checkpoint_fingerprint: str,
-    preprocess_fingerprint: str,
     model_config_name: str,
     checkpoint_path: str,
 ) -> TemporalFeatureCacheMetadata:
@@ -280,11 +198,6 @@ def save_temporal_feature_cache(
     if history.ndim != 3 or history.shape[:2] != (len(rows), 3):
         raise ValueError(f"prefix_history must have shape [{len(rows)}, 3, D], got {history.shape}")
     metadata = TemporalFeatureCacheMetadata(
-        manifest_fingerprint=manifest.manifest_fingerprint,
-        rows_fingerprint=rows_fingerprint(rows),
-        checkpoint_fingerprint=checkpoint_fingerprint,
-        preprocess_fingerprint=preprocess_fingerprint,
-        feature_payload_fingerprint=feature_payload_fingerprint(history),
         model_config_name=model_config_name,
         checkpoint_path=checkpoint_path,
         task_prompts=manifest.task_prompts,
@@ -309,9 +222,7 @@ def load_temporal_feature_cache(
     path: str | os.PathLike[str],
     *,
     manifest: _temporal_data.TemporalCompletionManifest,
-    expected_checkpoint_fingerprint: str | None = None,
     expected_checkpoint_path: str | None = None,
-    expected_preprocess_fingerprint: str | None = None,
     expected_model_config_name: str | None = None,
 ) -> TemporalFeatureCache:
     """Loads and fully audits a cache before exposing any training samples."""
@@ -329,18 +240,8 @@ def load_temporal_feature_cache(
         prefix_history = arrays["prefix_history"]
     cache = TemporalFeatureCache(metadata=metadata, rows=rows, prefix_history=prefix_history)
     cache.validate(manifest)
-    if (
-        expected_checkpoint_fingerprint is not None
-        and metadata.checkpoint_fingerprint != expected_checkpoint_fingerprint
-    ):
-        raise ValueError("temporal feature cache checkpoint fingerprint does not match the requested clean checkpoint")
     if expected_checkpoint_path is not None and metadata.checkpoint_path != expected_checkpoint_path:
         raise ValueError("temporal feature cache checkpoint path does not match the requested clean checkpoint")
-    if (
-        expected_preprocess_fingerprint is not None
-        and metadata.preprocess_fingerprint != expected_preprocess_fingerprint
-    ):
-        raise ValueError("temporal feature cache preprocessing fingerprint does not match")
     if expected_model_config_name is not None and metadata.model_config_name != expected_model_config_name:
         raise ValueError("temporal feature cache model config does not match")
     return cache

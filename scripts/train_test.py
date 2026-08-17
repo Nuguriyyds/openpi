@@ -281,13 +281,14 @@ def test_temporal_train_and_validation_both_apply_configured_input_mode():
 
 def test_temporal_selection_binding_seals_input_mode():
     data_info = SimpleNamespace(
-        manifest=SimpleNamespace(manifest_fingerprint="a" * 64),
+        manifest=SimpleNamespace(),
         cache=SimpleNamespace(
             metadata=SimpleNamespace(
-                checkpoint_fingerprint="b" * 64,
-                rows_fingerprint="c" * 64,
-                preprocess_fingerprint="d" * 64,
-                feature_payload_fingerprint="e" * 64,
+                schema_version=2,
+                model_config_name="clean",
+                checkpoint_path="/checkpoint/49999",
+                row_count=100,
+                feature_dim=2048,
             )
         ),
     )
@@ -295,7 +296,7 @@ def test_temporal_selection_binding_seals_input_mode():
     binding = train._temporal_cache_binding(data_info, input_mode="current_only")  # noqa: SLF001
 
     assert binding["temporal_input_mode"] == "current_only"
-    assert binding["manifest_fingerprint"] == "a" * 64
+    assert binding["feature_cache_checkpoint_path"] == "/checkpoint/49999"
 
 
 def test_temporal_resume_rejects_stale_existing_validation_selection():

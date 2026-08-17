@@ -3,9 +3,7 @@
 Protocol (version 1)
 --------------------
 
-* Read the same sealed temporal-v2 prefix cache and manifest as the temporal
-  MLP.  The clean checkpoint contents and the shared preprocessing fingerprint
-  are recomputed before fitting.
+* Read the same temporal-v3 prefix cache and manifest as the temporal MLP.
 * Use only ``prefix_history[:, -1, :]``.  Every natural train row is used once
   in each deterministic full-batch objective; no temporal history is exposed.
 * Fit L2-regularised logistic probes for the fixed ``L2_CANDIDATES`` below.
@@ -36,7 +34,6 @@ import numpy as np
 
 from openpi.training import temporal_completion_data as temporal_data
 from openpi.training import temporal_completion_features as temporal_features
-from openpi.training import temporal_completion_preprocess as temporal_preprocess
 
 DEFAULT_CONFIG_NAME: Final = "pi05_agilex_breakfast_temporal_completion_head"
 CURRENT_PROBE_SCHEMA_VERSION: Final = 1
@@ -215,11 +212,10 @@ def probe_metadata(cache: temporal_features.TemporalFeatureCache) -> dict[str, A
         "schema_version": CURRENT_PROBE_SCHEMA_VERSION,
         "probe_type": "deterministic_linear_logit",
         "fit_split": "train",
-        "manifest_fingerprint": cache.metadata.manifest_fingerprint,
-        "rows_fingerprint": cache.metadata.rows_fingerprint,
-        "feature_cache_checkpoint_fingerprint": cache.metadata.checkpoint_fingerprint,
-        "feature_cache_preprocess_fingerprint": cache.metadata.preprocess_fingerprint,
-        "feature_cache_payload_fingerprint": cache.metadata.feature_payload_fingerprint,
+        "feature_cache_schema_version": cache.metadata.schema_version,
+        "feature_cache_model_config_name": cache.metadata.model_config_name,
+        "feature_cache_checkpoint_path": cache.metadata.checkpoint_path,
+        "feature_cache_row_count": cache.metadata.row_count,
         "feature_dim": cache.metadata.feature_dim,
     }
 
@@ -257,54 +253,28 @@ def save_probe_artifact(
     return output
 
 
-def _metadata_files(dataset_root: str | os.PathLike[str]) -> tuple[Path, ...]:
-    meta = Path(dataset_root).resolve() / "meta"
-    if not meta.is_dir():
-        raise FileNotFoundError(f"dataset metadata directory not found: {meta}")
-    files = tuple(sorted((path.resolve() for path in meta.rglob("*") if path.is_file()), key=Path.as_posix))
-    if not files:
-        raise ValueError(f"dataset metadata directory contains no regular files: {meta}")
-    return files
-
-
 def _load_sealed_manifest(path: Path) -> temporal_data.TemporalCompletionManifest:
     if not path.is_file():
         raise FileNotFoundError(f"required manifest not found: {path}")
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, Mapping):
         raise ValueError(f"expected a JSON object in {path}")
-    manifest = temporal_data.TemporalCompletionManifest.from_dict(value)
-    return temporal_data.load_temporal_manifest(
-        path,
-        expected_subtask_metadata_fingerprint=temporal_data.fingerprint_files(
-            _metadata_files(manifest.source_subtask_root)
-        ),
-        expected_full_metadata_fingerprint=temporal_data.fingerprint_files(_metadata_files(manifest.source_full_root)),
-    )
+    return temporal_data.TemporalCompletionManifest.from_dict(value)
 
 
 def load_fitting_cache(
     *,
     temporal_config: Any,
-    source_config: Any,
     manifest: temporal_data.TemporalCompletionManifest,
     feature_cache_path: Path,
 ) -> temporal_features.TemporalFeatureCache:
-    """Recomputes all clean-backbone/preprocess bindings before fitting."""
+    """Loads the cache selected by the temporal training configuration."""
 
     checkpoint_path = temporal_config.completion.temporal_source_checkpoint_path
-    expected_preprocess = temporal_preprocess.expected_preprocess_fingerprint(
-        source_train_config=source_config,
-        manifest=manifest,
-        checkpoint_path=checkpoint_path,
-    )
-    expected_checkpoint = temporal_features.directory_fingerprint(Path(checkpoint_path) / "params")
     return temporal_features.load_temporal_feature_cache(
         feature_cache_path,
         manifest=manifest,
-        expected_checkpoint_fingerprint=expected_checkpoint,
         expected_checkpoint_path=checkpoint_path,
-        expected_preprocess_fingerprint=expected_preprocess,
         expected_model_config_name=temporal_config.completion.temporal_source_model_config_name,
     )
 
@@ -326,10 +296,8 @@ def run_fitting(args: argparse.Namespace) -> tuple[Path, ProbeFitResult]:
         raise ValueError("output artifact path must not overwrite a fitting input")
 
     manifest = _load_sealed_manifest(manifest_path)
-    source_config = training_config.get_config(temporal_config.completion.temporal_source_model_config_name)
     cache = load_fitting_cache(
         temporal_config=temporal_config,
-        source_config=source_config,
         manifest=manifest,
         feature_cache_path=feature_cache_path,
     )

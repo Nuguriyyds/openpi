@@ -302,7 +302,7 @@ z = sum(prefix_out.float32 * mask) / max(sum(mask), 1)
 缓存键必须至少包含：
 
 ```text
-(source_episode, source_frame, prompt_index, checkpoint_fingerprint)
+(source_episode, source_frame, prompt_index)
 ```
 
 同一 raw frame 在不同 prompt 下不是同一个特征，禁止只按 `(episode, frame)` 去重。
@@ -312,7 +312,7 @@ z = sum(prefix_out.float32 * mask) / max(sum(mask), 1)
 - 模型处于 eval 模式，第一版不做 image augmentation。
 - prefix 输出在 pooling 前转 FP32。
 - 缓存可用 FP16 节约磁盘，但进入 LayerNorm/MLP 前必须转回 FP32。
-- cache manifest 记录 checkpoint、config、数据 root、prompt 文本、pooling 方法和代码版本。
+- manifest 记录数据 root；cache metadata 记录 checkpoint 路径、config、prompt 文本、pooling 方法和 schema 版本。
 - 当前 `clean_completion_features.../features.npz` 使用旧的 10 帧正窗口和旧采样集合，不能直接作为新训练集；只能用于调试或数值一致性检查。
 - 新正 tick 可能需要下一 subtask 的 source frame `0..14` 在旧 prompt 下提取，旧 `copy_frames=5` cache 覆盖不足。
 - 可以为所有 split 预提取 frozen feature；但 feature cache 的存在不授权训练/阈值选择读取 test label 或 test 指标。
@@ -622,7 +622,7 @@ controller 必须能运行在：
 - train/val/test trajectory 集合两两不交。
 - 同 trajectory 的所有 source episodes/ticks/prompts 同 split。
 - 比例取整和最终计数写入 manifest。
-- metadata fingerprint 变化时旧 manifest 被拒绝。
+- manifest schema、轨迹映射和 split 内容不合法时拒绝加载。
 - 737/736 的 unmatched 情况显式记录，不静默按 episode id 偏移。
 - full test episode 对应的四个 subtask episode 与 train subtask 集合交集必须为空。
 

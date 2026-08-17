@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 import dataclasses
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -27,7 +26,6 @@ import numpy as np
 
 from openpi.training import temporal_completion_data as temporal_data
 from openpi.training import temporal_completion_features as temporal_features
-from openpi.training import temporal_completion_preprocess as temporal_preprocess
 
 DEFAULT_CONFIG_NAME = "pi05_730_breakfast_subtasks"
 DEFAULT_CHECKPOINT = Path(
@@ -35,8 +33,8 @@ DEFAULT_CHECKPOINT = Path(
 )
 DEFAULT_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730")
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/dataset/ei/huggingface")
-DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v1.json")
-DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v2/features.npz")
+DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2.json")
+DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz")
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -77,37 +75,6 @@ class PrefixFeaturePlan:
             raise ValueError("prefix feature plan contains duplicate keys")
         if indices.size and (int(indices.min()) < 0 or int(indices.max()) >= len(self.keys)):
             raise ValueError("row_key_indices refers outside the unique key table")
-
-
-def metadata_files(dataset_root: str | os.PathLike[str]) -> tuple[Path, ...]:
-    """Returns every regular file below ``meta/`` in deterministic order."""
-
-    root = Path(dataset_root).resolve()
-    meta = root / "meta"
-    if not meta.is_dir():
-        raise FileNotFoundError(f"dataset metadata directory not found: {meta}")
-    files = tuple(sorted((path.resolve() for path in meta.rglob("*") if path.is_file()), key=Path.as_posix))
-    if not files:
-        raise ValueError(f"dataset metadata directory contains no regular files: {meta}")
-    return files
-
-
-def regular_files(root: str | os.PathLike[str]) -> tuple[Path, ...]:
-    """Returns all regular files under a sealed directory in stable order."""
-
-    resolved = Path(root).resolve()
-    if not resolved.is_dir():
-        raise FileNotFoundError(f"sealed directory not found: {resolved}")
-    files = tuple(sorted((path.resolve() for path in resolved.rglob("*") if path.is_file()), key=Path.as_posix))
-    if not files:
-        raise ValueError(f"sealed directory contains no regular files: {resolved}")
-    return files
-
-
-def tree_fingerprint(root: str | os.PathLike[str]) -> str:
-    """Content-fingerprints a directory using the shared fail-closed helper."""
-
-    return temporal_data.fingerprint_files(regular_files(root))
 
 
 def resolve_logical_prompts(tasks: Mapping[int, str]) -> dict[int, str]:
@@ -196,13 +163,6 @@ def assemble_prefix_history(
     return history.astype(dtype, copy=False)
 
 
-# Compatibility aliases keep the pure extractor tests and any existing local
-# tooling on the one shared production implementation.
-canonical_runtime_value = temporal_preprocess.canonical_runtime_value
-implementation_fingerprint = temporal_preprocess.implementation_fingerprint
-make_preprocess_fingerprint = temporal_preprocess.make_preprocess_fingerprint
-
-
 def _is_within(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -219,8 +179,8 @@ def assert_safe_output(output: Path, protected_roots: Sequence[Path]) -> None:
 
 
 def _evaluation_repack() -> Any:
-    # Keep heavy OpenPI/JAX imports out of module import so pure planning and
-    # fingerprint tests run without accelerator dependencies.
+    # Keep heavy OpenPI/JAX imports out of module import so pure planning tests
+    # run without accelerator dependencies.
     import openpi.transforms as transforms  # noqa: PLC0415
 
     return transforms.Group(
@@ -245,14 +205,7 @@ def _evaluation_repack() -> Any:
 def _read_manifest_fail_closed(path: Path) -> temporal_data.TemporalCompletionManifest:
     if not path.is_file():
         raise FileNotFoundError(f"sealed temporal manifest not found: {path}")
-    raw = temporal_data.TemporalCompletionManifest.from_dict(json.loads(path.read_text(encoding="utf-8")))
-    subtask_fingerprint = temporal_data.fingerprint_files(metadata_files(raw.source_subtask_root))
-    full_fingerprint = temporal_data.fingerprint_files(metadata_files(raw.source_full_root))
-    return temporal_data.load_temporal_manifest(
-        path,
-        expected_subtask_metadata_fingerprint=subtask_fingerprint,
-        expected_full_metadata_fingerprint=full_fingerprint,
-    )
+    return temporal_data.load_temporal_manifest(path)
 
 
 def _scalar_int(value: Any) -> int:
@@ -356,13 +309,6 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
     if not plan.keys:
         raise ValueError("sealed temporal manifest produced no prefix feature requests")
 
-    checkpoint_fingerprint = tree_fingerprint(checkpoint / "params")
-    preprocess_fingerprint = temporal_preprocess.expected_preprocess_fingerprint(
-        source_train_config=config,
-        manifest=manifest,
-        checkpoint_path=checkpoint,
-    )
-
     policy = policy_config.create_trained_policy(
         config,
         checkpoint,
@@ -438,8 +384,6 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
         output,
         manifest=manifest,
         prefix_history=prefix_history,
-        checkpoint_fingerprint=checkpoint_fingerprint,
-        preprocess_fingerprint=preprocess_fingerprint,
         model_config_name=args.config_name,
         checkpoint_path=str(checkpoint),
     )

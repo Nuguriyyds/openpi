@@ -3,22 +3,16 @@
 The script is intentionally read-only with respect to both LeRobot datasets.
 It derives each subtask's task index from its parquet rows (never from the
 episode number), verifies the corresponding prompt metadata, and accepts
-full-trajectory identity only through an explicit, evidence-backed JSON map.
+full-trajectory identity only through an explicit JSON map.
 
 Identity-map schema::
 
     {
-      "schema_version": 2,
-      "source_subtask_metadata_fingerprint": "<sha256>",
-      "source_full_metadata_fingerprint": "<sha256>",
+      "schema_version": 3,
       "matches": [{
         "group_id": 0,
         "full_episode_id": 17,
-        "subtask_episode_ids": [0, 1, 2, 3],
-        "evidence": {
-          "method": "state_action_and_video_alignment",
-          "artifacts": [{"path": "evidence/match-0.json", "sha256": "<sha256>"}]
-        }
+        "subtask_episode_ids": [0, 1, 2, 3]
       }],
       "ambiguities": [{
         "group_ids": [1, 2],
@@ -28,21 +22,10 @@ Identity-map schema::
           {"group_id": 1, "full_episode_id": 19},
           {"group_id": 2, "full_episode_id": 18}
         ],
-        "reason": "alignment scores do not separate the candidates",
-        "evidence": {
-          "method": "state_action_and_video_alignment",
-          "artifacts": [{"path": "evidence/ambiguity-0.json", "sha256": "<sha256>"}]
-        }
+        "reason": "alignment scores do not separate the candidates"
       }]
     }
 
-Evidence paths are relative to the identity-map directory.  Each referenced
-regular file is read and its SHA-256 recomputed before any identity record is
-accepted.  Missing, escaping, or modified artifacts fail closed.
-
-Every regular file recursively below ``root/meta`` participates in the source
-fingerprint.  ``fingerprint_files`` also hashes each resolved absolute path,
-so relocating a dataset deliberately invalidates a previous identity map.
 Omitted subtask groups and full episodes are retained as quarantined manifest
 records by :mod:`openpi.training.temporal_completion_data`.
 """
@@ -52,7 +35,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 import dataclasses
-import hashlib
 import json
 import os
 import pathlib
@@ -63,7 +45,7 @@ import pyarrow.parquet as pq
 
 from openpi.training import temporal_completion_data as temporal_data
 
-IDENTITY_MAP_SCHEMA_VERSION = 2
+IDENTITY_MAP_SCHEMA_VERSION = 3
 AUDIT_SUMMARY_SCHEMA_VERSION = 1
 REQUIRED_METADATA_NAMES = ("info.json", "episodes.jsonl", "tasks.jsonl")
 
@@ -73,7 +55,6 @@ class DatasetAudit:
     root: pathlib.Path
     repo_id: str
     metadata_files: tuple[pathlib.Path, ...]
-    metadata_fingerprint: str
     episode_count: int
     prompts_by_task: Mapping[int, str]
     subtask_episodes: tuple[temporal_data.SubtaskEpisodeRecord, ...] = ()
@@ -95,20 +76,8 @@ def _require_exact_keys(value: Mapping[str, Any], expected: set[str], *, context
         )
 
 
-def _require_sha256(value: Any, *, context: str) -> str:
-    digest = str(value)
-    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-        raise ValueError(f"{context} must be a lowercase SHA-256 hex digest")
-    return digest
-
-
 def metadata_files(dataset_root: str | os.PathLike[str]) -> tuple[pathlib.Path, ...]:
-    """Returns the public, stable source-metadata fingerprint input set.
-
-    The convention is deliberately broad: every regular file recursively
-    below ``root/meta`` is included, sorted by resolved POSIX path.  Required
-    LeRobot metadata files are checked explicitly before returning.
-    """
+    """Returns audited LeRobot metadata files in deterministic path order."""
 
     root = pathlib.Path(dataset_root).resolve()
     meta_dir = root / "meta"
@@ -127,12 +96,6 @@ def metadata_files(dataset_root: str | os.PathLike[str]) -> tuple[pathlib.Path, 
     if not files:
         raise ValueError(f"LeRobot metadata directory contains no regular files: {meta_dir}")
     return files
-
-
-def source_metadata_fingerprint(dataset_root: str | os.PathLike[str]) -> str:
-    """Fingerprints the exact file set returned by :func:`metadata_files`."""
-
-    return temporal_data.fingerprint_files(metadata_files(dataset_root))
 
 
 def _read_json(path: pathlib.Path, *, context: str) -> Mapping[str, Any]:
@@ -349,7 +312,6 @@ def audit_lerobot_dataset(
     if not repo_id.strip():
         raise ValueError("source repo_id must not be empty")
     files = metadata_files(root)
-    fingerprint = temporal_data.fingerprint_files(files)
     meta_dir = root / "meta"
     prompts = _load_prompts(meta_dir)
     episode_metadata = _load_episode_metadata(meta_dir)
@@ -402,7 +364,6 @@ def audit_lerobot_dataset(
         root=root,
         repo_id=repo_id,
         metadata_files=files,
-        metadata_fingerprint=fingerprint,
         episode_count=len(episode_metadata),
         prompts_by_task=dict(sorted(prompts.items())),
         subtask_episodes=tuple(subtask_records),
@@ -410,72 +371,13 @@ def audit_lerobot_dataset(
     )
 
 
-def _sha256_file(path: pathlib.Path, *, context: str) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as file:
-            while chunk := file.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as error:
-        raise ValueError(f"cannot read {context}: {path}") from error
-    return digest.hexdigest()
-
-
-def _verify_evidence(
-    value: Any,
-    *,
-    identity_directory: pathlib.Path,
-    context: str,
-) -> Mapping[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(f"{context} must be an object")
-    _require_exact_keys(value, {"method", "artifacts"}, context=context)
-    method = value["method"]
-    if not isinstance(method, str) or not method.strip():
-        raise ValueError(f"{context} method must be non-empty")
-    artifacts = value["artifacts"]
-    if not isinstance(artifacts, list) or not artifacts:
-        raise ValueError(f"{context} artifacts must be a non-empty list")
-
-    verified: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
-    for artifact_number, artifact in enumerate(artifacts, start=1):
-        artifact_context = f"{context} artifact {artifact_number}"
-        if not isinstance(artifact, dict):
-            raise ValueError(f"{artifact_context} must be an object")
-        _require_exact_keys(artifact, {"path", "sha256"}, context=artifact_context)
-        raw_path = artifact["path"]
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            raise ValueError(f"{artifact_context} path must be a non-empty relative path")
-        relative_path = pathlib.Path(raw_path)
-        if relative_path.is_absolute() or relative_path.anchor:
-            raise ValueError(f"{artifact_context} path must be relative to the identity-map directory")
-        resolved_path = (identity_directory / relative_path).resolve()
-        if not resolved_path.is_relative_to(identity_directory):
-            raise ValueError(f"{artifact_context} path escapes the identity-map directory: {raw_path!r}")
-        if not resolved_path.is_file():
-            raise FileNotFoundError(f"{artifact_context} file is missing or not regular: {resolved_path}")
-        normalized_path = resolved_path.relative_to(identity_directory).as_posix()
-        if normalized_path in seen_paths:
-            raise ValueError(f"{context} repeats evidence artifact path {normalized_path!r}")
-        seen_paths.add(normalized_path)
-        declared_sha256 = _require_sha256(artifact["sha256"], context=f"{artifact_context} sha256")
-        actual_sha256 = _sha256_file(resolved_path, context=artifact_context)
-        if actual_sha256 != declared_sha256:
-            raise ValueError(f"{artifact_context} SHA-256 mismatch: declared={declared_sha256}, actual={actual_sha256}")
-        verified.append({"path": normalized_path, "sha256": actual_sha256})
-    return {"method": method.strip(), "artifacts": verified}
-
-
 def load_identity_matches(
     path: str | os.PathLike[str],
     *,
     groups: Sequence[temporal_data.SubtaskGroupRecord],
     full_episodes: Sequence[temporal_data.FullEpisodeRecord],
-    subtask_metadata_fingerprint: str,
-    full_metadata_fingerprint: str,
 ) -> LoadedIdentityMap:
-    """Loads a source-locked identity map and revalidates every evidence file."""
+    """Loads and validates an explicit trajectory identity map."""
 
     identity_path = pathlib.Path(path).resolve()
     document = _read_json(identity_path, context="trajectory identity map")
@@ -483,8 +385,6 @@ def load_identity_matches(
         document,
         {
             "schema_version",
-            "source_subtask_metadata_fingerprint",
-            "source_full_metadata_fingerprint",
             "matches",
             "ambiguities",
         },
@@ -492,23 +392,6 @@ def load_identity_matches(
     )
     if _integer(document["schema_version"], context="identity map schema_version") != IDENTITY_MAP_SCHEMA_VERSION:
         raise ValueError(f"identity map schema_version must be {IDENTITY_MAP_SCHEMA_VERSION}")
-    expected_subtask = _require_sha256(
-        document["source_subtask_metadata_fingerprint"],
-        context="identity map source_subtask_metadata_fingerprint",
-    )
-    expected_full = _require_sha256(
-        document["source_full_metadata_fingerprint"],
-        context="identity map source_full_metadata_fingerprint",
-    )
-    if expected_subtask != subtask_metadata_fingerprint:
-        raise ValueError(
-            "identity map subtask metadata fingerprint is stale: "
-            f"map={expected_subtask}, current={subtask_metadata_fingerprint}"
-        )
-    if expected_full != full_metadata_fingerprint:
-        raise ValueError(
-            f"identity map full metadata fingerprint is stale: map={expected_full}, current={full_metadata_fingerprint}"
-        )
     raw_matches = document["matches"]
     if not isinstance(raw_matches, list) or not raw_matches:
         raise ValueError("identity map matches must be a non-empty list")
@@ -526,7 +409,7 @@ def load_identity_matches(
             raise ValueError(f"identity map match {row_number} must be an object")
         _require_exact_keys(
             raw_match,
-            {"group_id", "full_episode_id", "subtask_episode_ids", "evidence"},
+            {"group_id", "full_episode_id", "subtask_episode_ids"},
             context=f"identity map match {row_number}",
         )
         group_id = _integer(raw_match["group_id"], context=f"identity map match {row_number} group_id")
@@ -557,25 +440,10 @@ def load_identity_matches(
                 f"map={source_ids}, audited={expected_source_ids}"
             )
 
-        verified_evidence = _verify_evidence(
-            raw_match["evidence"],
-            identity_directory=identity_path.parent,
-            context=f"identity map match {row_number} evidence",
-        )
-
-        evidence_fingerprint = temporal_data.stable_fingerprint(
-            {
-                "group_id": group_id,
-                "full_episode_id": full_episode_id,
-                "subtask_episode_ids": list(source_ids),
-                "evidence": verified_evidence,
-            }
-        )
         matches.append(
             temporal_data.IdentityMatchRecord(
                 group_id=group_id,
                 full_episode_id=full_episode_id,
-                evidence_fingerprint=evidence_fingerprint,
             )
         )
 
@@ -585,7 +453,7 @@ def load_identity_matches(
             raise ValueError(f"identity map ambiguity {row_number} must be an object")
         _require_exact_keys(
             raw_ambiguity,
-            {"group_ids", "full_episode_ids", "candidates", "reason", "evidence"},
+            {"group_ids", "full_episode_ids", "candidates", "reason"},
             context=f"identity map ambiguity {row_number}",
         )
         raw_group_ids = raw_ambiguity["group_ids"]
@@ -649,29 +517,11 @@ def load_identity_matches(
         reason = raw_ambiguity["reason"]
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError(f"identity map ambiguity {row_number} reason must be non-empty")
-        verified_evidence = _verify_evidence(
-            raw_ambiguity["evidence"],
-            identity_directory=identity_path.parent,
-            context=f"identity map ambiguity {row_number} evidence",
-        )
-        evidence_fingerprint = temporal_data.stable_fingerprint(
-            {
-                "group_ids": list(group_ids),
-                "full_episode_ids": list(full_episode_ids),
-                "candidates": [
-                    {"group_id": group_id, "full_episode_id": full_episode_id}
-                    for group_id, full_episode_id in candidate_pairs
-                ],
-                "reason": reason.strip(),
-                "evidence": verified_evidence,
-            }
-        )
         ambiguity = temporal_data.IdentityAmbiguityRecord(
             group_ids=group_ids,
             full_episode_ids=full_episode_ids,
             candidate_pairs=candidate_pairs,
             reason=reason.strip(),
-            evidence_fingerprint=evidence_fingerprint,
         )
         ambiguities.append(ambiguity)
         seen_groups.update(group_ids)
@@ -722,8 +572,6 @@ def build_manifest(
         identity_map_path,
         groups=groups,
         full_episodes=full_audit.full_episodes,
-        subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-        full_metadata_fingerprint=full_audit.metadata_fingerprint,
     )
     identities = temporal_data.build_trajectory_identities(
         groups,
@@ -737,8 +585,6 @@ def build_manifest(
         source_subtask_root=subtask_audit.root,
         source_full_repo_id=full_repo_id,
         source_full_root=full_audit.root,
-        subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-        full_metadata_fingerprint=full_audit.metadata_fingerprint,
         task_prompts=tuple(subtask_audit.prompts_by_task[index] for index in range(4)),
     )
     mapping_counts: dict[str, int] = {}
@@ -749,15 +595,12 @@ def build_manifest(
             exclusion_counts[trajectory.exclusion_reason] = exclusion_counts.get(trajectory.exclusion_reason, 0) + 1
     summary: Mapping[str, Any] = {
         "schema_version": AUDIT_SUMMARY_SCHEMA_VERSION,
-        "manifest_fingerprint": manifest.manifest_fingerprint,
-        "metadata_fingerprint_convention": "all_regular_files_recursively_below_meta_with_resolved_paths",
         "subtask": {
             "root": str(subtask_audit.root),
             "repo_id": subtask_repo_id,
             "episode_count": subtask_audit.episode_count,
             "group_count": len(groups),
             "metadata_files": [str(path) for path in subtask_audit.metadata_files],
-            "metadata_fingerprint": subtask_audit.metadata_fingerprint,
             "ordered_prompts": [subtask_audit.prompts_by_task[index] for index in range(4)],
         },
         "full": {
@@ -765,10 +608,9 @@ def build_manifest(
             "repo_id": full_repo_id,
             "episode_count": full_audit.episode_count,
             "metadata_files": [str(path) for path in full_audit.metadata_files],
-            "metadata_fingerprint": full_audit.metadata_fingerprint,
         },
         "identity": {
-            "verified_match_count": len(identity_map.matches),
+            "match_count": len(identity_map.matches),
             "ambiguity_component_count": len(identity_map.ambiguities),
             "mapping_status_counts": dict(sorted(mapping_counts.items())),
             "exclusion_reason_counts": dict(sorted(exclusion_counts.items())),

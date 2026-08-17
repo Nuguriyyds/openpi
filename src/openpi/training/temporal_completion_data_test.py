@@ -40,7 +40,6 @@ def _identities(
         temporal_data.IdentityMatchRecord(
             group_id=index,
             full_episode_id=index,
-            evidence_fingerprint=temporal_data.stable_fingerprint({"pair": index}),
         )
         for index in range(count)
     )
@@ -54,8 +53,6 @@ def _manifest(tmp_path, count: int = 10, *, extra_full: int = 0):
         source_subtask_root=tmp_path / "subtasks",
         source_full_repo_id="org/breakfast-full",
         source_full_root=tmp_path / "full",
-        subtask_metadata_fingerprint=temporal_data.stable_fingerprint({"subtask": "v1"}),
-        full_metadata_fingerprint=temporal_data.stable_fingerprint({"full": "v1"}),
         task_prompts=("task 0", "task 1", "task 2", "task 3"),
     )
 
@@ -172,7 +169,6 @@ def test_unreachable_positive_quarantines_whole_trajectory(tmp_path):
             source_episode_ids=(4, 5, 6, 7),
         ),
         full_episode=temporal_data.FullEpisodeRecord(1, 201),
-        evidence_fingerprint=temporal_data.stable_fingerprint({"pair": 1}),
         exclusion_reason=None,
     )
     manifest = temporal_data.create_temporal_manifest(
@@ -181,8 +177,6 @@ def test_unreachable_positive_quarantines_whole_trajectory(tmp_path):
         source_subtask_root=tmp_path,
         source_full_repo_id="full",
         source_full_root=tmp_path,
-        subtask_metadata_fingerprint=temporal_data.stable_fingerprint("sub"),
-        full_metadata_fingerprint=temporal_data.stable_fingerprint("full"),
         task_prompts=("task 0", "task 1", "task 2", "task 3"),
     )
 
@@ -235,23 +229,21 @@ def test_identity_mapping_is_bijective_and_records_737_versus_736_style_unmatche
     full_only = [identity for identity in identities if identity.mapping_status == "full_only"]
     assert len(full_only) == 1
     assert full_only[0].full_episode.episode_id == 2
-    assert full_only[0].exclusion_reason == "no_verified_subtask_group_mapping"
+    assert full_only[0].exclusion_reason == "no_subtask_group_mapping"
 
 
 def test_identity_mapping_rejects_unknown_or_duplicate_pairs():
     groups = temporal_data.build_subtask_groups(_episodes_for_groups(2))
     full = (temporal_data.FullEpisodeRecord(0, 240), temporal_data.FullEpisodeRecord(1, 240))
-    evidence = temporal_data.stable_fingerprint("evidence")
-
     with pytest.raises(ValueError, match="unknown subtask group"):
-        temporal_data.build_trajectory_identities(groups, full, (temporal_data.IdentityMatchRecord(9, 0, evidence),))
+        temporal_data.build_trajectory_identities(groups, full, (temporal_data.IdentityMatchRecord(9, 0),))
     with pytest.raises(ValueError, match="multiple full-trajectory mappings"):
         temporal_data.build_trajectory_identities(
             groups,
             full,
             (
-                temporal_data.IdentityMatchRecord(0, 0, evidence),
-                temporal_data.IdentityMatchRecord(0, 1, evidence),
+                temporal_data.IdentityMatchRecord(0, 0),
+                temporal_data.IdentityMatchRecord(0, 1),
             ),
         )
 
@@ -259,20 +251,17 @@ def test_identity_mapping_rejects_unknown_or_duplicate_pairs():
 def test_ambiguity_reserves_both_sides_and_does_not_fall_through_to_unmatched():
     groups = temporal_data.build_subtask_groups(_episodes_for_groups(3))
     full = tuple(temporal_data.FullEpisodeRecord(index, 240) for index in range(3))
-    match_evidence = temporal_data.stable_fingerprint("match evidence")
-    ambiguity_evidence = temporal_data.stable_fingerprint("ambiguity evidence")
     ambiguity = temporal_data.IdentityAmbiguityRecord(
         group_ids=(1, 2),
         full_episode_ids=(1, 2),
         candidate_pairs=((1, 1), (1, 2), (2, 1)),
         reason="alignment candidates are tied",
-        evidence_fingerprint=ambiguity_evidence,
     )
 
     identities = temporal_data.build_trajectory_identities(
         groups,
         full,
-        (temporal_data.IdentityMatchRecord(0, 0, match_evidence),),
+        (temporal_data.IdentityMatchRecord(0, 0),),
         (ambiguity,),
     )
 
@@ -282,45 +271,39 @@ def test_ambiguity_reserves_both_sides_and_does_not_fall_through_to_unmatched():
     assert {identity.group.group_id for identity in ambiguous if identity.group is not None} == {1, 2}
     assert {identity.full_episode.episode_id for identity in ambiguous if identity.full_episode is not None} == {1, 2}
     assert all((identity.group is None) != (identity.full_episode is None) for identity in ambiguous)
-    assert {identity.evidence_fingerprint for identity in ambiguous} == {ambiguity_evidence}
     assert not any(identity.mapping_status in ("subtask_only", "full_only") for identity in identities)
 
 
 def test_ambiguity_schema_rejects_incomplete_candidates_and_cross_component_overlap():
-    evidence = temporal_data.stable_fingerprint("ambiguity evidence")
     with pytest.raises(ValueError, match="every ambiguous group and full episode"):
         temporal_data.IdentityAmbiguityRecord(
             group_ids=(0, 1),
             full_episode_ids=(0,),
             candidate_pairs=((0, 0),),
             reason="missing candidate",
-            evidence_fingerprint=evidence,
         )
 
     groups = temporal_data.build_subtask_groups(_episodes_for_groups(3))
     full = tuple(temporal_data.FullEpisodeRecord(index, 240) for index in range(3))
-    first = temporal_data.IdentityAmbiguityRecord((0,), (0,), ((0, 0),), "first tie", evidence)
-    second = temporal_data.IdentityAmbiguityRecord((1,), (0,), ((1, 0),), "second tie", evidence)
+    first = temporal_data.IdentityAmbiguityRecord((0,), (0,), ((0, 0),), "first tie")
+    second = temporal_data.IdentityAmbiguityRecord((1,), (0,), ((1, 0),), "second tie")
     with pytest.raises(ValueError, match="repeats full episodes from another ambiguity"):
         temporal_data.build_trajectory_identities(groups, full, (), (first, second))
 
 
-def test_manifest_requires_ambiguous_rows_to_be_one_sided_evidenced_and_explicitly_excluded(tmp_path):
+def test_manifest_requires_ambiguous_rows_to_be_one_sided_and_explicitly_excluded(tmp_path):
     groups = temporal_data.build_subtask_groups(_episodes_for_groups(2))
     full = tuple(temporal_data.FullEpisodeRecord(index, 240) for index in range(2))
-    match_evidence = temporal_data.stable_fingerprint("match")
-    ambiguity_evidence = temporal_data.stable_fingerprint("ambiguity")
     identities = temporal_data.build_trajectory_identities(
         groups,
         full,
-        (temporal_data.IdentityMatchRecord(0, 0, match_evidence),),
+        (temporal_data.IdentityMatchRecord(0, 0),),
         (
             temporal_data.IdentityAmbiguityRecord(
                 (1,),
                 (1,),
                 ((1, 1),),
                 "one unresolved pair",
-                ambiguity_evidence,
             ),
         ),
     )
@@ -330,18 +313,11 @@ def test_manifest_requires_ambiguous_rows_to_be_one_sided_evidenced_and_explicit
         source_subtask_root=tmp_path / "subtasks",
         source_full_repo_id="full",
         source_full_root=tmp_path / "full",
-        subtask_metadata_fingerprint=temporal_data.stable_fingerprint("subtasks"),
-        full_metadata_fingerprint=temporal_data.stable_fingerprint("full"),
         task_prompts=("task 0", "task 1", "task 2", "task 3"),
     )
     ambiguous_index = next(
         index for index, record in enumerate(manifest.trajectories) if record.mapping_status == "ambiguous"
     )
-    records = list(manifest.trajectories)
-    records[ambiguous_index] = dataclasses.replace(records[ambiguous_index], evidence_fingerprint=None)
-    with pytest.raises(ValueError, match="lacks mapping evidence"):
-        temporal_data.validate_temporal_manifest(dataclasses.replace(manifest, trajectories=tuple(records)))
-
     records = list(manifest.trajectories)
     records[ambiguous_index] = dataclasses.replace(records[ambiguous_index], exclusion_reason="generic quarantine")
     with pytest.raises(ValueError, match="lacks an explicit ambiguity reason"):
@@ -355,8 +331,6 @@ def test_split_counts_for_736_are_exact_and_split_is_deterministic(tmp_path):
         "source_subtask_root": tmp_path / "subtasks",
         "source_full_repo_id": "full",
         "source_full_root": tmp_path / "full",
-        "subtask_metadata_fingerprint": temporal_data.stable_fingerprint("subtasks"),
-        "full_metadata_fingerprint": temporal_data.stable_fingerprint("full"),
         "task_prompts": ("task 0", "task 1", "task 2", "task 3"),
     }
     first = temporal_data.create_temporal_manifest(identities, **kwargs)
@@ -381,32 +355,18 @@ def test_unmatched_full_is_quarantined_before_split(tmp_path):
     unmatched = [record for record in manifest.trajectories if record.mapping_status == "full_only"]
     assert len(unmatched) == 1
     assert unmatched[0].split is None
-    assert unmatched[0].exclusion_reason == "no_verified_subtask_group_mapping"
+    assert unmatched[0].exclusion_reason == "no_subtask_group_mapping"
 
 
-def test_manifest_round_trip_is_fingerprinted_and_rejects_source_drift_or_rewrite(tmp_path):
+def test_manifest_round_trip_and_rewrite_protection(tmp_path):
     manifest = _manifest(tmp_path)
     path = tmp_path / "temporal_manifest.json"
     temporal_data.save_temporal_manifest(path, manifest)
     temporal_data.save_temporal_manifest(path, manifest)
 
-    loaded = temporal_data.load_temporal_manifest(
-        path,
-        expected_subtask_metadata_fingerprint=manifest.subtask_metadata_fingerprint,
-        expected_full_metadata_fingerprint=manifest.full_metadata_fingerprint,
-    )
+    loaded = temporal_data.load_temporal_manifest(path)
     assert loaded == manifest
-    with pytest.raises(ValueError, match="subtask metadata fingerprint changed"):
-        temporal_data.load_temporal_manifest(
-            path,
-            expected_subtask_metadata_fingerprint=temporal_data.stable_fingerprint("changed"),
-            expected_full_metadata_fingerprint=manifest.full_metadata_fingerprint,
-        )
-
-    changed = dataclasses.replace(
-        manifest,
-        full_metadata_fingerprint=temporal_data.stable_fingerprint("changed full metadata"),
-    )
+    changed = dataclasses.replace(manifest, source_full_repo_id="different/full")
     with pytest.raises(FileExistsError, match="refusing to rewrite"):
         temporal_data.save_temporal_manifest(path, changed)
 
@@ -415,7 +375,7 @@ def test_manifest_rejects_content_tampering_and_unknown_schema_fields(tmp_path):
     manifest = _manifest(tmp_path)
     value = manifest.to_dict()
     value["fps"] = 31
-    with pytest.raises(ValueError, match="content fingerprint mismatch"):
+    with pytest.raises(ValueError, match="timing"):
         temporal_data.TemporalCompletionManifest.from_dict(value)
 
     value = manifest.to_dict()
@@ -449,13 +409,3 @@ def test_manifest_rows_keep_all_source_views_in_their_trajectory_split(tmp_path)
     assert train_trajectories.isdisjoint(test_trajectories)
     assert train_sources.isdisjoint(test_sources)
     assert all(row.prompt_index == row.task_index for row in (*train_rows, *test_rows))
-
-
-def test_file_fingerprint_changes_when_metadata_bytes_change(tmp_path):
-    metadata = tmp_path / "episodes.jsonl"
-    metadata.write_text('{"episode": 0}\n', encoding="utf-8")
-    first = temporal_data.fingerprint_files((metadata,))
-    metadata.write_text('{"episode": 1}\n', encoding="utf-8")
-    second = temporal_data.fingerprint_files((metadata,))
-
-    assert first != second

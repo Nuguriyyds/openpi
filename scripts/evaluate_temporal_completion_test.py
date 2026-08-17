@@ -42,16 +42,27 @@ def _write_selection(
                 "last_validated_checkpoint_step": step if last_validated_step is None else last_validated_step,
                 "validation_rank": [1.0, 0.9, 0.8, 0.7],
                 "threshold_selection": selection,
-                "manifest_fingerprint": "a" * 64,
-                "feature_cache_checkpoint_fingerprint": "b" * 64,
-                "feature_cache_rows_fingerprint": "c" * 64,
-                "feature_cache_preprocess_fingerprint": "d" * 64,
-                "feature_cache_payload_fingerprint": "e" * 64,
+                "feature_cache_schema_version": 3,
+                "feature_cache_model_config_name": "clean",
+                "feature_cache_checkpoint_path": "/checkpoint/49999",
+                "feature_cache_row_count": 100,
+                "feature_cache_feature_dim": 2048,
                 "temporal_input_mode": temporal_input_mode,
             }
         ),
         encoding="utf-8",
     )
+
+
+def _artifact_kwargs(*, temporal_input_mode: str = "history") -> dict[str, object]:
+    return {
+        "feature_cache_schema_version": 3,
+        "feature_cache_model_config_name": "clean",
+        "feature_cache_checkpoint_path": "/checkpoint/49999",
+        "feature_cache_row_count": 100,
+        "feature_cache_feature_dim": 2048,
+        "temporal_input_mode": temporal_input_mode,
+    }
 
 
 def _event(
@@ -95,12 +106,7 @@ def test_validation_artifact_resolves_only_its_exact_retained_checkpoint(tmp_pat
 
     artifact = evaluator.load_validation_artifact(
         tmp_path,
-        manifest_fingerprint="a" * 64,
-        feature_cache_checkpoint_fingerprint="b" * 64,
-        feature_cache_rows_fingerprint="c" * 64,
-        feature_cache_preprocess_fingerprint="d" * 64,
-        feature_cache_payload_fingerprint="e" * 64,
-        temporal_input_mode="history",
+        **_artifact_kwargs(),
     )
 
     assert artifact.checkpoint_step == 200
@@ -119,12 +125,7 @@ def test_validation_artifact_rejects_non_validation_threshold(tmp_path: Path) ->
     with pytest.raises(ValueError, match="originate from validation"):
         evaluator.load_validation_artifact(
             tmp_path,
-            manifest_fingerprint="a" * 64,
-            feature_cache_checkpoint_fingerprint="b" * 64,
-            feature_cache_rows_fingerprint="c" * 64,
-            feature_cache_preprocess_fingerprint="d" * 64,
-            feature_cache_payload_fingerprint="e" * 64,
-            temporal_input_mode="history",
+            **_artifact_kwargs(),
         )
 
 
@@ -134,12 +135,7 @@ def test_validation_artifact_rejects_temporal_input_mode_mismatch(tmp_path: Path
     with pytest.raises(ValueError, match="temporal_input_mode does not match"):
         evaluator.load_validation_artifact(
             tmp_path,
-            manifest_fingerprint="a" * 64,
-            feature_cache_checkpoint_fingerprint="b" * 64,
-            feature_cache_rows_fingerprint="c" * 64,
-            feature_cache_preprocess_fingerprint="d" * 64,
-            feature_cache_payload_fingerprint="e" * 64,
-            temporal_input_mode="current_only",
+            **_artifact_kwargs(temporal_input_mode="current_only"),
         )
 
 
@@ -147,12 +143,7 @@ def test_completed_run_guard_rejects_stale_progress_and_missing_final_checkpoint
     _write_selection(tmp_path, step=200, last_validated_step=200)
     artifact = evaluator.load_validation_artifact(
         tmp_path,
-        manifest_fingerprint="a" * 64,
-        feature_cache_checkpoint_fingerprint="b" * 64,
-        feature_cache_rows_fingerprint="c" * 64,
-        feature_cache_preprocess_fingerprint="d" * 64,
-        feature_cache_payload_fingerprint="e" * 64,
-        temporal_input_mode="history",
+        **_artifact_kwargs(),
     )
 
     with pytest.raises(ValueError, match="does not prove a completed training run"):

@@ -20,7 +20,6 @@ import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.temporal_completion_data as _temporal_data
 import openpi.training.temporal_completion_features as _temporal_features
-import openpi.training.temporal_completion_preprocess as _temporal_preprocess
 import openpi.training.temporal_completion_sampler as _temporal_sampler
 import openpi.transforms as _transforms
 
@@ -674,25 +673,15 @@ def prepare_temporal_completion_data(config: _config.TrainConfig) -> TemporalCom
         raise ValueError("temporal completion requires split_manifest_path and temporal_feature_cache_path")
     with open(manifest_path, encoding="utf-8") as file:
         manifest = _temporal_data.TemporalCompletionManifest.from_dict(json.load(file))
-    checkpoint_params = os.path.join(config.completion.temporal_source_checkpoint_path, "params")
-    checkpoint_fingerprint = _temporal_features.directory_fingerprint(checkpoint_params)
-    source_config = _config.get_config(config.completion.temporal_source_model_config_name)
-    preprocess_fingerprint = _temporal_preprocess.expected_preprocess_fingerprint(
-        source_train_config=source_config,
-        manifest=manifest,
-        checkpoint_path=config.completion.temporal_source_checkpoint_path,
-    )
     cache = _temporal_features.load_temporal_feature_cache(
         feature_path,
         manifest=manifest,
-        expected_checkpoint_fingerprint=checkpoint_fingerprint,
         expected_checkpoint_path=config.completion.temporal_source_checkpoint_path,
-        expected_preprocess_fingerprint=preprocess_fingerprint,
         expected_model_config_name=config.completion.temporal_source_model_config_name,
     )
     logging.info(
         "Temporal completion cache: manifest=%s rows=%d feature_dim=%d checkpoint=%s",
-        manifest.manifest_fingerprint,
+        manifest_path,
         cache.metadata.row_count,
         cache.metadata.feature_dim,
         cache.metadata.checkpoint_path,

@@ -10,7 +10,6 @@ from __future__ import annotations
 import bisect
 from collections.abc import Mapping, Sequence
 import dataclasses
-import hashlib
 import json
 import os
 import pathlib
@@ -22,7 +21,7 @@ TICK_STRIDE_FRAMES = 15
 TASKS_PER_TRAJECTORY = 4
 TEMPORAL_HISTORY_STEPS = 3
 SPLIT_SEED = 42
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 SPLIT_RATIOS: Mapping[str, float] = {"train": 0.72, "val": 0.08, "test": 0.20}
 
 SplitName = Literal["train", "val", "test"]
@@ -37,39 +36,6 @@ def _require_exact_keys(value: Mapping[str, Any], expected: set[str], *, context
         missing = sorted(expected - actual)
         unexpected = sorted(actual - expected)
         raise ValueError(f"{context} fields do not match schema; missing={missing}, unexpected={unexpected}")
-
-
-def _require_sha256(value: str, *, field: str) -> None:
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(f"{field} must be a lowercase SHA-256 hex digest")
-
-
-def stable_fingerprint(value: Any) -> str:
-    """Returns a stable SHA-256 digest for JSON-compatible metadata."""
-
-    if dataclasses.is_dataclass(value):
-        value = dataclasses.asdict(value)
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def fingerprint_files(paths: Sequence[str | os.PathLike[str]]) -> str:
-    """Fingerprints both metadata file names and bytes in stable path order."""
-
-    resolved = sorted((pathlib.Path(path).resolve() for path in paths), key=lambda path: path.as_posix())
-    if not resolved:
-        raise ValueError("at least one metadata file is required for a fingerprint")
-    digest = hashlib.sha256()
-    for path in resolved:
-        if not path.is_file():
-            raise FileNotFoundError(f"metadata fingerprint input is missing: {path}")
-        digest.update(path.as_posix().encode())
-        digest.update(b"\0")
-        with path.open("rb") as file:
-            while chunk := file.read(1024 * 1024):
-                digest.update(chunk)
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 def ceil_to_tick(frame_position: int, *, stride: int = TICK_STRIDE_FRAMES) -> int:
@@ -280,12 +246,10 @@ def map_logical_frame(group: SubtaskGroupRecord, logical_frame: int) -> SourceFr
 class IdentityMatchRecord:
     group_id: int
     full_episode_id: int
-    evidence_fingerprint: str
 
     def __post_init__(self) -> None:
         if self.group_id < 0 or self.full_episode_id < 0:
             raise ValueError("identity match IDs must be non-negative")
-        _require_sha256(self.evidence_fingerprint, field="identity evidence_fingerprint")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -302,7 +266,6 @@ class IdentityAmbiguityRecord:
     full_episode_ids: tuple[int, ...]
     candidate_pairs: tuple[tuple[int, int], ...]
     reason: str
-    evidence_fingerprint: str
 
     def __post_init__(self) -> None:
         if not self.group_ids or not self.full_episode_ids or not self.candidate_pairs:
@@ -328,7 +291,6 @@ class IdentityAmbiguityRecord:
             raise ValueError("every ambiguous group and full episode must participate in a candidate relationship")
         if not self.reason.strip():
             raise ValueError("identity ambiguity reason must be non-empty")
-        _require_sha256(self.evidence_fingerprint, field="identity ambiguity evidence_fingerprint")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -337,7 +299,6 @@ class TrajectoryIdentityRecord:
     mapping_status: MappingStatus
     group: SubtaskGroupRecord | None
     full_episode: FullEpisodeRecord | None
-    evidence_fingerprint: str | None
     exclusion_reason: str | None
 
     def __post_init__(self) -> None:
@@ -346,11 +307,10 @@ class TrajectoryIdentityRecord:
         if self.mapping_status not in ("matched", "subtask_only", "full_only", "ambiguous"):
             raise ValueError(f"unknown mapping_status {self.mapping_status!r}")
         if self.mapping_status == "matched":
-            if self.group is None or self.full_episode is None or self.evidence_fingerprint is None:
-                raise ValueError("matched identity requires group, full episode, and mapping evidence")
+            if self.group is None or self.full_episode is None:
+                raise ValueError("matched identity requires a subtask group and full episode")
             if self.exclusion_reason is not None:
                 raise ValueError("a matched identity cannot have an identity exclusion reason")
-            _require_sha256(self.evidence_fingerprint, field="identity evidence_fingerprint")
         else:
             if self.exclusion_reason is None:
                 raise ValueError(f"{self.mapping_status} identity must state an exclusion_reason")
@@ -361,9 +321,6 @@ class TrajectoryIdentityRecord:
             if self.mapping_status == "ambiguous":
                 if (self.group is None) == (self.full_episode is None):
                     raise ValueError("ambiguous identity must contain exactly one subtask group or full episode")
-                if self.evidence_fingerprint is None:
-                    raise ValueError("ambiguous identity requires mapping evidence")
-                _require_sha256(self.evidence_fingerprint, field="identity ambiguity evidence_fingerprint")
                 if not self.exclusion_reason.startswith("ambiguous_identity:"):
                     raise ValueError("ambiguous identity requires an explicit ambiguity exclusion reason")
 
@@ -374,7 +331,7 @@ def build_trajectory_identities(
     matches: Sequence[IdentityMatchRecord],
     ambiguities: Sequence[IdentityAmbiguityRecord] = (),
 ) -> tuple[TrajectoryIdentityRecord, ...]:
-    """Builds a bijective, evidence-backed mapping plus explicit quarantine rows."""
+    """Builds a bijective mapping plus explicit quarantine rows."""
 
     group_by_id = {group.group_id: group for group in groups}
     full_by_id = {episode.episode_id: episode for episode in full_episodes}
@@ -403,7 +360,6 @@ def build_trajectory_identities(
                 mapping_status="matched",
                 group=group_by_id[match.group_id],
                 full_episode=full_by_id[match.full_episode_id],
-                evidence_fingerprint=match.evidence_fingerprint,
                 exclusion_reason=None,
             )
         )
@@ -452,7 +408,6 @@ def build_trajectory_identities(
                 mapping_status="ambiguous",
                 group=group_by_id[group_id],
                 full_episode=None,
-                evidence_fingerprint=ambiguity.evidence_fingerprint,
                 exclusion_reason=exclusion_reason,
             )
             for group_id in ambiguity.group_ids
@@ -463,7 +418,6 @@ def build_trajectory_identities(
                 mapping_status="ambiguous",
                 group=None,
                 full_episode=full_by_id[full_episode_id],
-                evidence_fingerprint=ambiguity.evidence_fingerprint,
                 exclusion_reason=exclusion_reason,
             )
             for full_episode_id in ambiguity.full_episode_ids
@@ -475,8 +429,7 @@ def build_trajectory_identities(
             mapping_status="subtask_only",
             group=group_by_id[group_id],
             full_episode=None,
-            evidence_fingerprint=None,
-            exclusion_reason="no_verified_full_trajectory_mapping",
+            exclusion_reason="no_full_trajectory_mapping",
         )
         for group_id in sorted(set(group_by_id) - matched_group_ids - ambiguous_group_ids)
     )
@@ -486,8 +439,7 @@ def build_trajectory_identities(
             mapping_status="full_only",
             group=None,
             full_episode=full_by_id[full_episode_id],
-            evidence_fingerprint=None,
-            exclusion_reason="no_verified_subtask_group_mapping",
+            exclusion_reason="no_subtask_group_mapping",
         )
         for full_episode_id in sorted(set(full_by_id) - matched_full_ids - ambiguous_full_ids)
     )
@@ -542,7 +494,6 @@ class ManifestTrajectoryRecord:
     full_length: int | None
     mapping_status: MappingStatus
     exclusion_reason: str | None
-    evidence_fingerprint: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -558,7 +509,6 @@ class ManifestTrajectoryRecord:
             "full_length": self.full_length,
             "mapping_status": self.mapping_status,
             "exclusion_reason": self.exclusion_reason,
-            "evidence_fingerprint": self.evidence_fingerprint,
         }
 
     @classmethod
@@ -576,7 +526,6 @@ class ManifestTrajectoryRecord:
             "full_length",
             "mapping_status",
             "exclusion_reason",
-            "evidence_fingerprint",
         }
         _require_exact_keys(value, fields, context="manifest trajectory")
         return cls(
@@ -592,7 +541,6 @@ class ManifestTrajectoryRecord:
             full_length=None if value["full_length"] is None else int(value["full_length"]),
             mapping_status=value["mapping_status"],
             exclusion_reason=value["exclusion_reason"],
-            evidence_fingerprint=value["evidence_fingerprint"],
         )
 
     def as_group(self) -> SubtaskGroupRecord:
@@ -614,8 +562,6 @@ class TemporalCompletionManifest:
     source_subtask_root: str
     source_full_repo_id: str
     source_full_root: str
-    subtask_metadata_fingerprint: str
-    full_metadata_fingerprint: str
     task_prompts: tuple[str, str, str, str]
     split_counts: SplitCounts
     trajectories: tuple[ManifestTrajectoryRecord, ...]
@@ -631,8 +577,6 @@ class TemporalCompletionManifest:
             "source_subtask_root": self.source_subtask_root,
             "source_full_repo_id": self.source_full_repo_id,
             "source_full_root": self.source_full_root,
-            "subtask_metadata_fingerprint": self.subtask_metadata_fingerprint,
-            "full_metadata_fingerprint": self.full_metadata_fingerprint,
             "task_prompts": list(self.task_prompts),
             "fps": self.fps,
             "tick_stride_frames": self.tick_stride_frames,
@@ -642,12 +586,8 @@ class TemporalCompletionManifest:
             "trajectories": [trajectory.to_dict() for trajectory in self.trajectories],
         }
 
-    @property
-    def manifest_fingerprint(self) -> str:
-        return stable_fingerprint(self._payload())
-
     def to_dict(self) -> dict[str, Any]:
-        return {**self._payload(), "manifest_fingerprint": self.manifest_fingerprint}
+        return self._payload()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TemporalCompletionManifest:
@@ -657,8 +597,6 @@ class TemporalCompletionManifest:
             "source_subtask_root",
             "source_full_repo_id",
             "source_full_root",
-            "subtask_metadata_fingerprint",
-            "full_metadata_fingerprint",
             "task_prompts",
             "fps",
             "tick_stride_frames",
@@ -666,13 +604,8 @@ class TemporalCompletionManifest:
             "split_ratios",
             "split_counts",
             "trajectories",
-            "manifest_fingerprint",
         }
         _require_exact_keys(value, fields, context="temporal completion manifest")
-        payload = {key: item for key, item in value.items() if key != "manifest_fingerprint"}
-        expected_fingerprint = stable_fingerprint(payload)
-        if value["manifest_fingerprint"] != expected_fingerprint:
-            raise ValueError("temporal completion manifest content fingerprint mismatch")
         if value["split_ratios"] != dict(SPLIT_RATIOS):
             raise ValueError(f"manifest split_ratios must be exactly {dict(SPLIT_RATIOS)}")
         manifest = cls(
@@ -681,8 +614,6 @@ class TemporalCompletionManifest:
             source_subtask_root=str(value["source_subtask_root"]),
             source_full_repo_id=str(value["source_full_repo_id"]),
             source_full_root=str(value["source_full_root"]),
-            subtask_metadata_fingerprint=str(value["subtask_metadata_fingerprint"]),
-            full_metadata_fingerprint=str(value["full_metadata_fingerprint"]),
             task_prompts=tuple(str(item) for item in value["task_prompts"]),  # type: ignore[arg-type]
             fps=int(value["fps"]),
             tick_stride_frames=int(value["tick_stride_frames"]),
@@ -715,7 +646,6 @@ def _manifest_record(
         full_length=None if full_episode is None else full_episode.length,
         mapping_status=identity.mapping_status,
         exclusion_reason=exclusion_reason,
-        evidence_fingerprint=identity.evidence_fingerprint,
     )
 
 
@@ -726,8 +656,6 @@ def create_temporal_manifest(
     source_subtask_root: str | os.PathLike[str],
     source_full_repo_id: str,
     source_full_root: str | os.PathLike[str],
-    subtask_metadata_fingerprint: str,
-    full_metadata_fingerprint: str,
     task_prompts: Sequence[str],
     split_seed: int = SPLIT_SEED,
 ) -> TemporalCompletionManifest:
@@ -737,8 +665,6 @@ def create_temporal_manifest(
         raise ValueError(f"temporal split_seed is locked to {SPLIT_SEED}, got {split_seed}")
     if not identities:
         raise ValueError("identity audit produced no records")
-    _require_sha256(subtask_metadata_fingerprint, field="subtask_metadata_fingerprint")
-    _require_sha256(full_metadata_fingerprint, field="full_metadata_fingerprint")
     task_prompts = tuple(str(prompt) for prompt in task_prompts)
     if len(task_prompts) != TASKS_PER_TRAJECTORY or any(not prompt.strip() for prompt in task_prompts):
         raise ValueError("temporal manifest requires exactly four non-empty ordered task prompts")
@@ -785,8 +711,6 @@ def create_temporal_manifest(
         source_subtask_root=str(pathlib.Path(source_subtask_root).resolve()),
         source_full_repo_id=source_full_repo_id,
         source_full_root=str(pathlib.Path(source_full_root).resolve()),
-        subtask_metadata_fingerprint=subtask_metadata_fingerprint,
-        full_metadata_fingerprint=full_metadata_fingerprint,
         task_prompts=task_prompts,  # type: ignore[arg-type]
         split_counts=counts,
         trajectories=records,
@@ -817,9 +741,6 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
         raise ValueError("manifest source_subtask_root must be absolute")
     if not pathlib.Path(manifest.source_full_root).is_absolute():
         raise ValueError("manifest source_full_root must be absolute")
-    _require_sha256(manifest.subtask_metadata_fingerprint, field="subtask_metadata_fingerprint")
-    _require_sha256(manifest.full_metadata_fingerprint, field="full_metadata_fingerprint")
-
     seen_trajectory_ids: set[str] = set()
     seen_group_ids: set[int] = set()
     seen_full_ids: set[int] = set()
@@ -858,9 +779,8 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
             raise ValueError(f"trajectory {record.trajectory_id} has full_length without full_episode_id")
 
         if record.mapping_status == "matched":
-            if group is None or record.full_episode_id is None or record.evidence_fingerprint is None:
-                raise ValueError(f"matched trajectory {record.trajectory_id} lacks group/full/evidence")
-            _require_sha256(record.evidence_fingerprint, field="identity evidence_fingerprint")
+            if group is None or record.full_episode_id is None:
+                raise ValueError(f"matched trajectory {record.trajectory_id} lacks group/full identity")
             reasons = reachability_exclusion_reasons(group)
             if record.split is None:
                 if not reasons or record.exclusion_reason != ";".join(reasons):
@@ -883,9 +803,6 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
                     raise ValueError(
                         f"ambiguous trajectory {record.trajectory_id} must contain exactly one identity side"
                     )
-                if record.evidence_fingerprint is None:
-                    raise ValueError(f"ambiguous trajectory {record.trajectory_id} lacks mapping evidence")
-                _require_sha256(record.evidence_fingerprint, field="identity ambiguity evidence_fingerprint")
                 if not record.exclusion_reason.startswith("ambiguous_identity:"):
                     raise ValueError(f"ambiguous trajectory {record.trajectory_id} lacks an explicit ambiguity reason")
 
@@ -936,7 +853,7 @@ def save_temporal_manifest(path: str | os.PathLike[str], manifest: TemporalCompl
     output_path = pathlib.Path(path)
     if output_path.exists():
         existing = TemporalCompletionManifest.from_dict(json.loads(output_path.read_text(encoding="utf-8")))
-        if existing.manifest_fingerprint == manifest.manifest_fingerprint:
+        if existing == manifest:
             return
         raise FileExistsError(f"refusing to rewrite sealed temporal manifest: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -945,20 +862,10 @@ def save_temporal_manifest(path: str | os.PathLike[str], manifest: TemporalCompl
     os.replace(temporary_path, output_path)
 
 
-def load_temporal_manifest(
-    path: str | os.PathLike[str],
-    *,
-    expected_subtask_metadata_fingerprint: str,
-    expected_full_metadata_fingerprint: str,
-) -> TemporalCompletionManifest:
-    """Loads only a schema-valid manifest for the current source metadata."""
+def load_temporal_manifest(path: str | os.PathLike[str]) -> TemporalCompletionManifest:
+    """Loads and validates a temporal completion manifest."""
 
-    manifest = TemporalCompletionManifest.from_dict(json.loads(pathlib.Path(path).read_text(encoding="utf-8")))
-    if manifest.subtask_metadata_fingerprint != expected_subtask_metadata_fingerprint:
-        raise ValueError("subtask metadata fingerprint changed; refusing stale temporal manifest")
-    if manifest.full_metadata_fingerprint != expected_full_metadata_fingerprint:
-        raise ValueError("full metadata fingerprint changed; refusing stale temporal manifest")
-    return manifest
+    return TemporalCompletionManifest.from_dict(json.loads(pathlib.Path(path).read_text(encoding="utf-8")))
 
 
 @dataclasses.dataclass(frozen=True)

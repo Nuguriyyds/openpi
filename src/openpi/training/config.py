@@ -991,7 +991,7 @@ _CONFIGS = [
             stage="head",
             objective="binary",
             split_manifest_path=(
-                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v1.json"
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2.json"
             ),
             split_seed=42,
             val_interval=200,
@@ -1004,7 +1004,7 @@ _CONFIGS = [
             bce_pos_weight_override=1.0,
             temporal_sampling=True,
             temporal_feature_cache_path=(
-                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v2/features.npz"
+                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz"
             ),
             temporal_source_model_config_name="pi05_730_breakfast_subtasks",
             temporal_input_mode="history",

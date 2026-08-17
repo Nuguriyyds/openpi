@@ -22,11 +22,10 @@ class _Row:
 
 @dataclasses.dataclass(frozen=True)
 class _Metadata:
-    manifest_fingerprint: str = "a" * 64
-    rows_fingerprint: str = "b" * 64
-    checkpoint_fingerprint: str = "c" * 64
-    preprocess_fingerprint: str = "d" * 64
-    feature_payload_fingerprint: str = "e" * 64
+    schema_version: int = 3
+    model_config_name: str = "clean_pi05"
+    checkpoint_path: str = "/checkpoint/49999"
+    row_count: int = 14
     feature_dim: int = 2
 
 
@@ -97,11 +96,10 @@ def test_artifact_exactly_matches_evaluator_schema_and_binds_cache(tmp_path: Pat
             "schema_version",
             "probe_type",
             "fit_split",
-            "manifest_fingerprint",
-            "rows_fingerprint",
-            "feature_cache_checkpoint_fingerprint",
-            "feature_cache_preprocess_fingerprint",
-            "feature_cache_payload_fingerprint",
+            "feature_cache_schema_version",
+            "feature_cache_model_config_name",
+            "feature_cache_checkpoint_path",
+            "feature_cache_row_count",
             "feature_dim",
         }
         assert metadata["schema_version"] == evaluator.CURRENT_PROBE_SCHEMA_VERSION
@@ -115,8 +113,8 @@ def test_artifact_exactly_matches_evaluator_schema_and_binds_cache(tmp_path: Pat
     assert loaded.bias == fit.bias
 
     changed_binding = _Cache()
-    changed_binding.metadata = dataclasses.replace(changed_binding.metadata, preprocess_fingerprint="f" * 64)
-    with pytest.raises(ValueError, match="preprocess_fingerprint"):
+    changed_binding.metadata = dataclasses.replace(changed_binding.metadata, checkpoint_path="/other/checkpoint")
+    with pytest.raises(ValueError, match="feature_cache_checkpoint_path"):
         evaluator._load_current_only_probe(  # type: ignore[arg-type]  # noqa: SLF001
             output,
             cache=changed_binding,
@@ -125,7 +123,7 @@ def test_artifact_exactly_matches_evaluator_schema_and_binds_cache(tmp_path: Pat
         fitter.save_probe_artifact(output, cache=cache, fit=fit)  # type: ignore[arg-type]
 
 
-def test_clean_checkpoint_and_shared_preprocess_bindings_are_mandatory(
+def test_clean_checkpoint_path_and_model_config_bindings_are_mandatory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -136,50 +134,30 @@ def test_clean_checkpoint_and_shared_preprocess_bindings_are_mandatory(
             temporal_source_model_config_name="clean_pi05",
         )
     )
-    source_config = object()
     manifest = object()
     cache = object()
     calls: dict[str, object] = {}
-
-    def expected_preprocess_fingerprint(**kwargs):
-        calls["preprocess_kwargs"] = kwargs
-        return "p" * 64
-
-    def directory_fingerprint(path):
-        calls["checkpoint_path"] = Path(path)
-        return "q" * 64
 
     def load_temporal_feature_cache(path, **kwargs):
         calls["cache_path"] = Path(path)
         calls["cache_kwargs"] = kwargs
         return cache
 
-    monkeypatch.setattr(fitter.temporal_preprocess, "expected_preprocess_fingerprint", expected_preprocess_fingerprint)
-    monkeypatch.setattr(fitter.temporal_features, "directory_fingerprint", directory_fingerprint)
     monkeypatch.setattr(fitter.temporal_features, "load_temporal_feature_cache", load_temporal_feature_cache)
     cache_path = tmp_path / "features.npz"
 
     assert (
         fitter.load_fitting_cache(
             temporal_config=temporal_config,
-            source_config=source_config,
             manifest=manifest,  # type: ignore[arg-type]
             feature_cache_path=cache_path,
         )
         is cache
     )
-    assert calls["preprocess_kwargs"] == {
-        "source_train_config": source_config,
-        "manifest": manifest,
-        "checkpoint_path": str(checkpoint),
-    }
-    assert calls["checkpoint_path"] == checkpoint / "params"
     assert calls["cache_path"] == cache_path
     assert calls["cache_kwargs"] == {
         "manifest": manifest,
-        "expected_checkpoint_fingerprint": "q" * 64,
         "expected_checkpoint_path": str(checkpoint),
-        "expected_preprocess_fingerprint": "p" * 64,
         "expected_model_config_name": "clean_pi05",
     }
 

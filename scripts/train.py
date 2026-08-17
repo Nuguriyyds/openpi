@@ -698,15 +698,15 @@ def _temporal_cache_binding(
     data_info: _data_loader.TemporalCompletionDataInfo,
     *,
     input_mode: _completion.TemporalInputMode,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     metadata = data_info.cache.metadata
     return {
         "temporal_input_mode": input_mode,
-        "manifest_fingerprint": data_info.manifest.manifest_fingerprint,
-        "feature_cache_checkpoint_fingerprint": metadata.checkpoint_fingerprint,
-        "feature_cache_rows_fingerprint": metadata.rows_fingerprint,
-        "feature_cache_preprocess_fingerprint": metadata.preprocess_fingerprint,
-        "feature_cache_payload_fingerprint": metadata.feature_payload_fingerprint,
+        "feature_cache_schema_version": metadata.schema_version,
+        "feature_cache_model_config_name": metadata.model_config_name,
+        "feature_cache_checkpoint_path": metadata.checkpoint_path,
+        "feature_cache_row_count": metadata.row_count,
+        "feature_cache_feature_dim": metadata.feature_dim,
     }
 
 

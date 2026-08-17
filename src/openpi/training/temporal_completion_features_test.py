@@ -1,5 +1,4 @@
 import dataclasses
-import hashlib
 
 import numpy as np
 import pytest
@@ -8,17 +7,13 @@ from openpi.training import temporal_completion_data as temporal_data
 from openpi.training import temporal_completion_features as features
 
 
-def _sha(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
 def _manifest():
     episodes = [
         temporal_data.SubtaskEpisodeRecord(episode_id=index, task_index=index % 4, length=60) for index in range(12)
     ]
     groups = temporal_data.build_subtask_groups(episodes)
     full = [temporal_data.FullEpisodeRecord(episode_id=index, length=240) for index in range(3)]
-    matches = [temporal_data.IdentityMatchRecord(index, index, _sha(f"evidence-{index}")) for index in range(3)]
+    matches = [temporal_data.IdentityMatchRecord(index, index) for index in range(3)]
     identities = temporal_data.build_trajectory_identities(groups, full, matches)
     return temporal_data.create_temporal_manifest(
         identities,
@@ -26,8 +21,6 @@ def _manifest():
         source_subtask_root=".",
         source_full_repo_id="full",
         source_full_root=".",
-        subtask_metadata_fingerprint=_sha("subtasks"),
-        full_metadata_fingerprint=_sha("full"),
         task_prompts=("task 0", "task 1", "task 2", "task 3"),
     )
 
@@ -41,16 +34,12 @@ def test_feature_cache_round_trip_and_split_dataset(tmp_path):
         path,
         manifest=manifest,
         prefix_history=history,
-        checkpoint_fingerprint=_sha("checkpoint"),
-        preprocess_fingerprint=_sha("preprocess"),
         model_config_name="clean",
         checkpoint_path="/checkpoint/49999",
     )
     loaded = features.load_temporal_feature_cache(
         path,
         manifest=manifest,
-        expected_checkpoint_fingerprint=_sha("checkpoint"),
-        expected_preprocess_fingerprint=_sha("preprocess"),
         expected_model_config_name="clean",
     )
     assert loaded.rows == rows
@@ -71,13 +60,11 @@ def test_feature_cache_rejects_stale_manifest(tmp_path):
         path,
         manifest=manifest,
         prefix_history=np.zeros((len(rows), 3, 2), dtype=np.float16),
-        checkpoint_fingerprint=_sha("checkpoint"),
-        preprocess_fingerprint=_sha("preprocess"),
         model_config_name="clean",
         checkpoint_path="/checkpoint/49999",
     )
-    stale = dataclasses.replace(manifest, source_subtask_repo_id="different")
-    with pytest.raises(ValueError, match="different temporal manifest"):
+    stale = dataclasses.replace(manifest, task_prompts=("changed", "task 1", "task 2", "task 3"))
+    with pytest.raises(ValueError, match="task prompts differ"):
         features.load_temporal_feature_cache(path, manifest=stale)
 
 
@@ -89,8 +76,6 @@ def test_feature_cache_rejects_wrong_history_shape(tmp_path):
             tmp_path / "features.npz",
             manifest=manifest,
             prefix_history=np.zeros((len(rows), 2, 4), dtype=np.float16),
-            checkpoint_fingerprint=_sha("checkpoint"),
-            preprocess_fingerprint=_sha("preprocess"),
             model_config_name="clean",
             checkpoint_path="/checkpoint/49999",
         )

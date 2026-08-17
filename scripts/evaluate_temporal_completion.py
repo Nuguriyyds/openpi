@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 import dataclasses
-import hashlib
 import json
 import math
 import os
@@ -34,7 +33,6 @@ import numpy as np
 from openpi.training import temporal_completion_data as temporal_data
 from openpi.training import temporal_completion_features as temporal_features
 from openpi.training import temporal_completion_metrics as temporal_metrics
-from openpi.training import temporal_completion_preprocess as temporal_preprocess
 
 DEFAULT_CONFIG_NAME = "pi05_agilex_breakfast_temporal_completion_head"
 SELECTION_FILE_NAME = "best_temporal_validation.json"
@@ -51,11 +49,11 @@ class ValidationArtifact:
     last_validated_checkpoint_step: int
     validation_rank: tuple[float, float, float, float]
     threshold_selection: temporal_metrics.ThresholdSelection
-    manifest_fingerprint: str
-    feature_cache_checkpoint_fingerprint: str
-    feature_cache_rows_fingerprint: str
-    feature_cache_preprocess_fingerprint: str
-    feature_cache_payload_fingerprint: str
+    feature_cache_schema_version: int
+    feature_cache_model_config_name: str
+    feature_cache_checkpoint_path: str
+    feature_cache_row_count: int
+    feature_cache_feature_dim: int
     temporal_input_mode: str
     path: Path
 
@@ -75,16 +73,6 @@ class CurrentOnlyLinearProbe:
         if not np.isfinite(features).all():
             raise ValueError("current-only features contain non-finite values")
         return features @ self.weight + self.bias
-
-
-def _require_sha256(value: Any, *, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 hex digest")
-    return value
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -144,11 +132,11 @@ def _parse_threshold_selection(value: Any) -> temporal_metrics.ThresholdSelectio
 def load_validation_artifact(
     checkpoint_root: Path,
     *,
-    manifest_fingerprint: str,
-    feature_cache_checkpoint_fingerprint: str,
-    feature_cache_rows_fingerprint: str,
-    feature_cache_preprocess_fingerprint: str,
-    feature_cache_payload_fingerprint: str,
+    feature_cache_schema_version: int,
+    feature_cache_model_config_name: str,
+    feature_cache_checkpoint_path: str,
+    feature_cache_row_count: int,
+    feature_cache_feature_dim: int,
     temporal_input_mode: str,
 ) -> ValidationArtifact:
     """Loads the mandatory validation artifact and audits its data binding."""
@@ -161,11 +149,11 @@ def load_validation_artifact(
         "last_validated_checkpoint_step",
         "validation_rank",
         "threshold_selection",
-        "manifest_fingerprint",
-        "feature_cache_checkpoint_fingerprint",
-        "feature_cache_rows_fingerprint",
-        "feature_cache_preprocess_fingerprint",
-        "feature_cache_payload_fingerprint",
+        "feature_cache_schema_version",
+        "feature_cache_model_config_name",
+        "feature_cache_checkpoint_path",
+        "feature_cache_row_count",
+        "feature_cache_feature_dim",
         "temporal_input_mode",
     }
     if not required_fields.issubset(value):
@@ -187,35 +175,16 @@ def load_validation_artifact(
     if not all(math.isfinite(float(item)) for item in rank_value):
         raise ValueError("best_temporal_validation validation_rank must contain only finite numbers")
 
-    stored_manifest_fingerprint = _require_sha256(
-        value["manifest_fingerprint"], field="best_temporal_validation.manifest_fingerprint"
-    )
-    stored_cache_fingerprint = _require_sha256(
-        value["feature_cache_checkpoint_fingerprint"],
-        field="best_temporal_validation.feature_cache_checkpoint_fingerprint",
-    )
-    stored_rows_fingerprint = _require_sha256(
-        value["feature_cache_rows_fingerprint"],
-        field="best_temporal_validation.feature_cache_rows_fingerprint",
-    )
-    stored_preprocess_fingerprint = _require_sha256(
-        value["feature_cache_preprocess_fingerprint"],
-        field="best_temporal_validation.feature_cache_preprocess_fingerprint",
-    )
-    stored_payload_fingerprint = _require_sha256(
-        value["feature_cache_payload_fingerprint"],
-        field="best_temporal_validation.feature_cache_payload_fingerprint",
-    )
-    if stored_manifest_fingerprint != manifest_fingerprint:
-        raise ValueError("best_temporal_validation was selected with a different sealed manifest")
-    if stored_cache_fingerprint != feature_cache_checkpoint_fingerprint:
-        raise ValueError("best_temporal_validation was selected with a different clean-prefix feature cache")
-    if stored_rows_fingerprint != feature_cache_rows_fingerprint:
-        raise ValueError("best_temporal_validation was selected with different canonical cache rows")
-    if stored_preprocess_fingerprint != feature_cache_preprocess_fingerprint:
-        raise ValueError("best_temporal_validation was selected with different prefix preprocessing")
-    if stored_payload_fingerprint != feature_cache_payload_fingerprint:
-        raise ValueError("best_temporal_validation was selected with different prefix feature values")
+    expected_cache_binding = {
+        "feature_cache_schema_version": feature_cache_schema_version,
+        "feature_cache_model_config_name": feature_cache_model_config_name,
+        "feature_cache_checkpoint_path": feature_cache_checkpoint_path,
+        "feature_cache_row_count": feature_cache_row_count,
+        "feature_cache_feature_dim": feature_cache_feature_dim,
+    }
+    for field, expected in expected_cache_binding.items():
+        if value[field] != expected:
+            raise ValueError(f"best_temporal_validation {field} does not match the requested feature cache")
     if temporal_input_mode not in ("history", "current_only"):
         raise ValueError(f"unsupported evaluator temporal_input_mode: {temporal_input_mode!r}")
     stored_input_mode = value["temporal_input_mode"]
@@ -229,11 +198,11 @@ def load_validation_artifact(
         last_validated_checkpoint_step=last_validated_step,
         validation_rank=tuple(float(item) for item in rank_value),  # type: ignore[arg-type]
         threshold_selection=_parse_threshold_selection(value["threshold_selection"]),
-        manifest_fingerprint=stored_manifest_fingerprint,
-        feature_cache_checkpoint_fingerprint=stored_cache_fingerprint,
-        feature_cache_rows_fingerprint=stored_rows_fingerprint,
-        feature_cache_preprocess_fingerprint=stored_preprocess_fingerprint,
-        feature_cache_payload_fingerprint=stored_payload_fingerprint,
+        feature_cache_schema_version=int(value["feature_cache_schema_version"]),
+        feature_cache_model_config_name=str(value["feature_cache_model_config_name"]),
+        feature_cache_checkpoint_path=str(value["feature_cache_checkpoint_path"]),
+        feature_cache_row_count=int(value["feature_cache_row_count"]),
+        feature_cache_feature_dim=int(value["feature_cache_feature_dim"]),
         temporal_input_mode=stored_input_mode,
         path=path,
     )
@@ -282,28 +251,10 @@ def require_completed_temporal_run(
     return final_checkpoint
 
 
-def _metadata_files(dataset_root: str | os.PathLike[str]) -> tuple[Path, ...]:
-    meta = Path(dataset_root).resolve() / "meta"
-    if not meta.is_dir():
-        raise FileNotFoundError(f"dataset metadata directory not found: {meta}")
-    files = tuple(sorted((path.resolve() for path in meta.rglob("*") if path.is_file()), key=Path.as_posix))
-    if not files:
-        raise ValueError(f"dataset metadata directory contains no regular files: {meta}")
-    return files
-
-
 def _load_sealed_manifest(path: Path) -> temporal_data.TemporalCompletionManifest:
-    """Validates both the manifest seal and the current source metadata."""
+    """Loads and validates the temporal manifest schema and contents."""
 
-    value = _read_json_object(path)
-    manifest = temporal_data.TemporalCompletionManifest.from_dict(value)
-    subtask_fingerprint = temporal_data.fingerprint_files(_metadata_files(manifest.source_subtask_root))
-    full_fingerprint = temporal_data.fingerprint_files(_metadata_files(manifest.source_full_root))
-    return temporal_data.load_temporal_manifest(
-        path,
-        expected_subtask_metadata_fingerprint=subtask_fingerprint,
-        expected_full_metadata_fingerprint=full_fingerprint,
-    )
+    return temporal_data.TemporalCompletionManifest.from_dict(_read_json_object(path))
 
 
 def _verify_recomputed_selection(
@@ -513,11 +464,10 @@ def _load_current_only_probe(
         "schema_version",
         "probe_type",
         "fit_split",
-        "manifest_fingerprint",
-        "rows_fingerprint",
-        "feature_cache_checkpoint_fingerprint",
-        "feature_cache_preprocess_fingerprint",
-        "feature_cache_payload_fingerprint",
+        "feature_cache_schema_version",
+        "feature_cache_model_config_name",
+        "feature_cache_checkpoint_path",
+        "feature_cache_row_count",
         "feature_dim",
     }
     if set(metadata) != expected_metadata:
@@ -530,11 +480,10 @@ def _load_current_only_probe(
     if metadata["probe_type"] != "deterministic_linear_logit" or metadata["fit_split"] != "train":
         raise ValueError("current-only ablation requires a deterministic linear-logit probe fitted only on train")
     expected_bindings = {
-        "manifest_fingerprint": cache.metadata.manifest_fingerprint,
-        "rows_fingerprint": cache.metadata.rows_fingerprint,
-        "feature_cache_checkpoint_fingerprint": cache.metadata.checkpoint_fingerprint,
-        "feature_cache_preprocess_fingerprint": cache.metadata.preprocess_fingerprint,
-        "feature_cache_payload_fingerprint": cache.metadata.feature_payload_fingerprint,
+        "feature_cache_schema_version": cache.metadata.schema_version,
+        "feature_cache_model_config_name": cache.metadata.model_config_name,
+        "feature_cache_checkpoint_path": cache.metadata.checkpoint_path,
+        "feature_cache_row_count": cache.metadata.row_count,
         "feature_dim": cache.metadata.feature_dim,
     }
     for field, expected in expected_bindings.items():
@@ -548,14 +497,6 @@ def _load_current_only_probe(
     if not np.isfinite(weight).all() or not np.isfinite(bias_value):
         raise ValueError("current-only probe weights must be finite")
     return CurrentOnlyLinearProbe(weight=weight, bias=float(bias_value), metadata=metadata)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        while chunk := file.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _evaluate_current_only(
@@ -584,11 +525,10 @@ def _evaluate_current_only(
         "fit_split": "train",
         "paired_row_count": len(current_cache.rows),
         "source_cache": {
-            "manifest_fingerprint": current_cache.metadata.manifest_fingerprint,
-            "rows_fingerprint": current_cache.metadata.rows_fingerprint,
-            "checkpoint_fingerprint": current_cache.metadata.checkpoint_fingerprint,
-            "preprocess_fingerprint": current_cache.metadata.preprocess_fingerprint,
-            "payload_fingerprint": current_cache.metadata.feature_payload_fingerprint,
+            "schema_version": current_cache.metadata.schema_version,
+            "model_config_name": current_cache.metadata.model_config_name,
+            "checkpoint_path": current_cache.metadata.checkpoint_path,
+            "row_count": current_cache.metadata.row_count,
         },
         "threshold_selection": dataclasses.asdict(selection),
         **result,
@@ -650,29 +590,19 @@ def run_evaluation(args: argparse.Namespace) -> Path:
         raise ValueError("output report path must not overwrite any evaluation input")
 
     manifest = _load_sealed_manifest(manifest_path)
-    source_config = training_config.get_config(config.completion.temporal_source_model_config_name)
-    expected_preprocess_fingerprint = temporal_preprocess.expected_preprocess_fingerprint(
-        source_train_config=source_config,
-        manifest=manifest,
-        checkpoint_path=config.completion.temporal_source_checkpoint_path,
-    )
     cache = temporal_features.load_temporal_feature_cache(
         feature_cache_path,
         manifest=manifest,
-        expected_checkpoint_fingerprint=temporal_features.directory_fingerprint(
-            Path(config.completion.temporal_source_checkpoint_path) / "params"
-        ),
         expected_checkpoint_path=config.completion.temporal_source_checkpoint_path,
-        expected_preprocess_fingerprint=expected_preprocess_fingerprint,
         expected_model_config_name=config.completion.temporal_source_model_config_name,
     )
     artifact = load_validation_artifact(
         checkpoint_root,
-        manifest_fingerprint=manifest.manifest_fingerprint,
-        feature_cache_checkpoint_fingerprint=cache.metadata.checkpoint_fingerprint,
-        feature_cache_rows_fingerprint=cache.metadata.rows_fingerprint,
-        feature_cache_preprocess_fingerprint=cache.metadata.preprocess_fingerprint,
-        feature_cache_payload_fingerprint=cache.metadata.feature_payload_fingerprint,
+        feature_cache_schema_version=cache.metadata.schema_version,
+        feature_cache_model_config_name=cache.metadata.model_config_name,
+        feature_cache_checkpoint_path=cache.metadata.checkpoint_path,
+        feature_cache_row_count=cache.metadata.row_count,
+        feature_cache_feature_dim=cache.metadata.feature_dim,
         temporal_input_mode=config.completion.temporal_input_mode,
     )
     final_checkpoint = require_completed_temporal_run(
@@ -716,14 +646,11 @@ def run_evaluation(args: argparse.Namespace) -> Path:
         "enabled": False,
         "reason": "supply both a sealed cache and separately fitted train-only probe weights to enable",
     }
-    current_probe_sha256: str | None = None
     if args.current_only_cache is not None and args.current_only_probe_weights is not None:
         current_cache = temporal_features.load_temporal_feature_cache(
             args.current_only_cache.resolve(),
             manifest=manifest,
-            expected_checkpoint_fingerprint=cache.metadata.checkpoint_fingerprint,
             expected_checkpoint_path=cache.metadata.checkpoint_path,
-            expected_preprocess_fingerprint=expected_preprocess_fingerprint,
             expected_model_config_name=cache.metadata.model_config_name,
         )
         probe = _load_current_only_probe(args.current_only_probe_weights.resolve(), cache=current_cache)
@@ -732,7 +659,6 @@ def run_evaluation(args: argparse.Namespace) -> Path:
             current_cache=current_cache,
             probe=probe,
         )
-        current_probe_sha256 = _sha256_file(args.current_only_probe_weights.resolve())
 
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -751,19 +677,18 @@ def run_evaluation(args: argparse.Namespace) -> Path:
         "bindings": {
             "config_name": config.name,
             "manifest_path": str(manifest_path),
-            "manifest_fingerprint": manifest.manifest_fingerprint,
             "feature_cache_path": str(feature_cache_path),
-            "feature_cache_rows_fingerprint": cache.metadata.rows_fingerprint,
-            "feature_cache_checkpoint_fingerprint": cache.metadata.checkpoint_fingerprint,
-            "feature_cache_preprocess_fingerprint": cache.metadata.preprocess_fingerprint,
-            "feature_cache_payload_fingerprint": cache.metadata.feature_payload_fingerprint,
+            "feature_cache_schema_version": cache.metadata.schema_version,
+            "feature_cache_model_config_name": cache.metadata.model_config_name,
+            "feature_cache_checkpoint_path": cache.metadata.checkpoint_path,
+            "feature_cache_row_count": cache.metadata.row_count,
+            "feature_cache_feature_dim": cache.metadata.feature_dim,
             "temporal_input_mode": artifact.temporal_input_mode,
             "validation_selection_path": str(artifact.path),
             "checkpoint_step": artifact.checkpoint_step,
             "last_validated_checkpoint_step": artifact.last_validated_checkpoint_step,
             "final_checkpoint_path": str(final_checkpoint),
             "checkpoint_path": str(checkpoint),
-            "current_only_probe_sha256": current_probe_sha256,
         },
         "threshold_selection": dataclasses.asdict(artifact.threshold_selection),
         "validation_rank": artifact.validation_rank,

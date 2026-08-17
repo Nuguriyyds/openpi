@@ -1,5 +1,4 @@
 import dataclasses
-import hashlib
 
 import numpy as np
 import pytest
@@ -114,56 +113,6 @@ def test_assembly_uses_oldest_to_current_indices_and_requires_fp32_model_output(
         extract.assemble_prefix_history(plan, unique.astype(np.float16))
     with pytest.raises(ValueError, match="non-finite"):
         extract.assemble_prefix_history(plan, np.full_like(unique, np.nan))
-
-
-def test_metadata_and_tree_fingerprints_change_on_content_change(tmp_path):
-    dataset = tmp_path / "dataset"
-    meta = dataset / "meta"
-    nested = meta / "tasks"
-    nested.mkdir(parents=True)
-    info = meta / "info.json"
-    tasks = nested / "tasks.jsonl"
-    info.write_text('{"fps": 30}', encoding="utf-8")
-    tasks.write_text('{"task_index": 0}', encoding="utf-8")
-
-    files = extract.metadata_files(dataset)
-    assert files == tuple(sorted((info.resolve(), tasks.resolve()), key=lambda path: path.as_posix()))
-    first = temporal_data.fingerprint_files(files)
-    tasks.write_text('{"task_index": 1}', encoding="utf-8")
-    second = temporal_data.fingerprint_files(extract.metadata_files(dataset))
-    assert first != second
-    assert extract.tree_fingerprint(meta) == second
-
-
-@dataclasses.dataclass(frozen=True)
-class _TinyConfig:
-    width: int
-    values: np.ndarray
-
-
-def test_preprocess_fingerprint_is_stable_and_sensitive_to_every_identity_input():
-    assets = hashlib.sha256(b"assets").hexdigest()
-    code = hashlib.sha256(b"code").hexdigest()
-    model = _TinyConfig(width=4, values=np.asarray([1.0, 2.0], dtype=np.float32))
-    data = _TinyConfig(width=3, values=np.asarray([3], dtype=np.int16))
-
-    kwargs = {
-        "model_config": model,
-        "data_config": data,
-        "prompts": PROMPTS,
-        "checkpoint_assets_fingerprint": assets,
-        "code_fingerprint": code,
-    }
-    first = extract.make_preprocess_fingerprint(**kwargs)
-    assert first == extract.make_preprocess_fingerprint(**kwargs)
-    assert len(first) == 64
-    assert first != extract.make_preprocess_fingerprint(**{**kwargs, "prompts": {**PROMPTS, 0: "changed"}})
-    assert first != extract.make_preprocess_fingerprint(
-        **{**kwargs, "model_config": _TinyConfig(width=5, values=model.values)}
-    )
-    assert first != extract.make_preprocess_fingerprint(
-        **{**kwargs, "checkpoint_assets_fingerprint": hashlib.sha256(b"new assets").hexdigest()}
-    )
 
 
 def test_output_guard_rejects_data_checkpoint_and_manifest_roots(tmp_path):

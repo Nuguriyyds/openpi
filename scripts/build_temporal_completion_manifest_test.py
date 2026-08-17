@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import pathlib
 
@@ -75,30 +74,14 @@ def _identity_document(
     full_root: pathlib.Path,
     matches: list[tuple[int, int]],
 ) -> dict[str, object]:
-    evidence_directory = subtask_root.parent / "evidence"
-    evidence_directory.mkdir(exist_ok=True)
-    artifacts: dict[tuple[int, int], dict[str, str]] = {}
-    for group_id, full_episode_id in matches:
-        relative_path = pathlib.Path("evidence") / f"match-{group_id}-{full_episode_id}.json"
-        payload = f'{{"group_id":{group_id},"full_episode_id":{full_episode_id}}}\n'.encode()
-        (subtask_root.parent / relative_path).write_bytes(payload)
-        artifacts[(group_id, full_episode_id)] = {
-            "path": relative_path.as_posix(),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
+    del subtask_root, full_root
     return {
-        "schema_version": 2,
-        "source_subtask_metadata_fingerprint": build_manifest.source_metadata_fingerprint(subtask_root),
-        "source_full_metadata_fingerprint": build_manifest.source_metadata_fingerprint(full_root),
+        "schema_version": 3,
         "matches": [
             {
                 "group_id": group_id,
                 "full_episode_id": full_episode_id,
                 "subtask_episode_ids": list(range(group_id * 4, group_id * 4 + 4)),
-                "evidence": {
-                    "method": "synthetic_state_action_alignment",
-                    "artifacts": [artifacts[(group_id, full_episode_id)]],
-                },
             }
             for group_id, full_episode_id in matches
         ],
@@ -115,12 +98,7 @@ def _append_ambiguity(
     candidates: list[tuple[int, int]],
     reason: str = "synthetic candidates are tied",
 ) -> None:
-    name = f"ambiguity-{'-'.join(map(str, group_ids))}-{'-'.join(map(str, full_episode_ids))}.json"
-    relative_path = pathlib.Path("evidence") / name
-    payload = json.dumps({"candidates": candidates}, sort_keys=True).encode()
-    artifact_path = identity_directory / relative_path
-    artifact_path.parent.mkdir(exist_ok=True)
-    artifact_path.write_bytes(payload)
+    del identity_directory
     ambiguity = {
         "group_ids": group_ids,
         "full_episode_ids": full_episode_ids,
@@ -128,10 +106,6 @@ def _append_ambiguity(
             {"group_id": group_id, "full_episode_id": full_episode_id} for group_id, full_episode_id in candidates
         ],
         "reason": reason,
-        "evidence": {
-            "method": "synthetic_tie_audit",
-            "artifacts": [{"path": relative_path.as_posix(), "sha256": hashlib.sha256(payload).hexdigest()}],
-        },
     }
     ambiguities = document["ambiguities"]
     assert isinstance(ambiguities, list)
@@ -156,7 +130,7 @@ def test_cli_audits_parquet_identity_and_seals_trajectory_split(tmp_path, capsys
         task_by_episode={episode_id: episode_id % 4 for episode_id in full_ids},
     )
     # Deliberately reverse identity: the implementation must consume this
-    # evidence map and must never infer equality/order from episode numbers.
+    # identity map and must never infer equality/order from episode numbers.
     matches = list(zip(range(6), reversed(full_ids), strict=True))
     identity_path = tmp_path / "identity.json"
     identity_path.write_text(json.dumps(_identity_document(subtask_root, full_root, matches)), encoding="utf-8")
@@ -186,28 +160,22 @@ def test_cli_audits_parquet_identity_and_seals_trajectory_split(tmp_path, capsys
     assert manifest.split_counts.to_dict() == {"train": 4, "val": 1, "test": 1}
     assert {record.mapping_status for record in manifest.trajectories} == {"matched"}
     assert {record.group_id: record.full_episode_id for record in manifest.trajectories} == dict(matches)
-    assert manifest.subtask_metadata_fingerprint == build_manifest.source_metadata_fingerprint(subtask_root)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert summary["metadata_fingerprint_convention"] == (
-        "all_regular_files_recursively_below_meta_with_resolved_paths"
-    )
-    assert summary["identity"]["verified_match_count"] == 6
+    assert summary["identity"]["match_count"] == 6
     assert summary["identity"]["mapping_status_counts"] == {"matched": 6}
     assert json.loads(capsys.readouterr().out) == summary
 
 
-def test_metadata_fingerprint_includes_every_nested_regular_meta_file(tmp_path) -> None:
+def test_metadata_listing_includes_every_nested_regular_meta_file(tmp_path) -> None:
     root = tmp_path / "dataset"
     _make_dataset(root, [0], length=1, task_by_episode={0: 0})
     before_files = build_manifest.metadata_files(root)
-    before_fingerprint = build_manifest.source_metadata_fingerprint(root)
     extra = root / "meta" / "nested" / "alignment.json"
     extra.parent.mkdir()
     extra.write_text('{"version": 1}\n', encoding="utf-8")
 
     after_files = build_manifest.metadata_files(root)
     assert after_files == tuple(sorted((*before_files, extra.resolve()), key=lambda path: path.as_posix()))
-    assert build_manifest.source_metadata_fingerprint(root) != before_fingerprint
 
 
 def test_subtask_order_is_derived_from_parquet_not_episode_id(tmp_path) -> None:
@@ -219,7 +187,7 @@ def test_subtask_order_is_derived_from_parquet_not_episode_id(tmp_path) -> None:
         build_manifest.audit_lerobot_dataset(root, repo_id="test/subtasks", subtask=True)
 
 
-def test_identity_map_is_source_locked_evidence_backed_and_bijective(tmp_path) -> None:
+def test_identity_map_is_explicit_and_bijective(tmp_path) -> None:
     subtask_root = tmp_path / "subtasks"
     full_root = tmp_path / "full"
     _make_dataset(
@@ -241,34 +209,6 @@ def test_identity_map_is_source_locked_evidence_backed_and_bijective(tmp_path) -
             identity_path,
             groups=groups,
             full_episodes=full_audit.full_episodes,
-            subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-            full_metadata_fingerprint=full_audit.metadata_fingerprint,
-        )
-
-    document = _identity_document(subtask_root, full_root, [(0, 20)])
-    document["source_full_metadata_fingerprint"] = "0" * 64
-    identity_path = tmp_path / "stale.json"
-    identity_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="full metadata fingerprint is stale"):
-        build_manifest.load_identity_matches(
-            identity_path,
-            groups=groups,
-            full_episodes=full_audit.full_episodes,
-            subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-            full_metadata_fingerprint=full_audit.metadata_fingerprint,
-        )
-
-    document = _identity_document(subtask_root, full_root, [(0, 20)])
-    document["matches"][0]["evidence"]["artifacts"] = []  # type: ignore[index]
-    identity_path = tmp_path / "no-evidence.json"
-    identity_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="artifacts must be a non-empty list"):
-        build_manifest.load_identity_matches(
-            identity_path,
-            groups=groups,
-            full_episodes=full_audit.full_episodes,
-            subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-            full_metadata_fingerprint=full_audit.metadata_fingerprint,
         )
 
     valid_document = _identity_document(subtask_root, full_root, [(0, 20)])
@@ -294,61 +234,7 @@ def test_identity_map_is_source_locked_evidence_backed_and_bijective(tmp_path) -
     }
 
 
-def test_identity_v2_recomputes_relative_artifact_hash_and_rejects_missing_or_tampered_file(
-    tmp_path, monkeypatch
-) -> None:
-    subtask_root = tmp_path / "subtasks"
-    full_root = tmp_path / "full"
-    _make_dataset(
-        subtask_root,
-        list(range(4)),
-        length=45,
-        task_by_episode={episode_id: episode_id % 4 for episode_id in range(4)},
-    )
-    _make_dataset(full_root, [20], length=180, task_by_episode={20: 0})
-    subtask_audit = build_manifest.audit_lerobot_dataset(subtask_root, repo_id="test/subtasks", subtask=True)
-    full_audit = build_manifest.audit_lerobot_dataset(full_root, repo_id="test/full", subtask=False)
-    groups = temporal_data.build_subtask_groups(subtask_audit.subtask_episodes)
-    document = _identity_document(subtask_root, full_root, [(0, 20)])
-    identity_path = tmp_path / "identity.json"
-    identity_path.write_text(json.dumps(document), encoding="utf-8")
-
-    unrelated_cwd = tmp_path / "cwd"
-    unrelated_cwd.mkdir()
-    monkeypatch.chdir(unrelated_cwd)
-    loaded = build_manifest.load_identity_matches(
-        identity_path,
-        groups=groups,
-        full_episodes=full_audit.full_episodes,
-        subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-        full_metadata_fingerprint=full_audit.metadata_fingerprint,
-    )
-    assert len(loaded.matches) == 1
-    assert loaded.ambiguities == ()
-
-    artifact = tmp_path / "evidence" / "match-0-20.json"
-    artifact.write_text("tampered\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        build_manifest.load_identity_matches(
-            identity_path,
-            groups=groups,
-            full_episodes=full_audit.full_episodes,
-            subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-            full_metadata_fingerprint=full_audit.metadata_fingerprint,
-        )
-
-    artifact.unlink()
-    with pytest.raises(FileNotFoundError, match="file is missing or not regular"):
-        build_manifest.load_identity_matches(
-            identity_path,
-            groups=groups,
-            full_episodes=full_audit.full_episodes,
-            subtask_metadata_fingerprint=subtask_audit.metadata_fingerprint,
-            full_metadata_fingerprint=full_audit.metadata_fingerprint,
-        )
-
-
-def test_identity_v2_rejects_legacy_schema_and_artifact_path_escape(tmp_path) -> None:
+def test_identity_v3_rejects_legacy_schema(tmp_path) -> None:
     subtask_root = tmp_path / "bundle" / "subtasks"
     full_root = tmp_path / "bundle" / "full"
     _make_dataset(
@@ -368,20 +254,8 @@ def test_identity_v2_rejects_legacy_schema_and_artifact_path_escape(tmp_path) ->
     kwargs = {
         "groups": groups,
         "full_episodes": full_audit.full_episodes,
-        "subtask_metadata_fingerprint": subtask_audit.metadata_fingerprint,
-        "full_metadata_fingerprint": full_audit.metadata_fingerprint,
     }
-    with pytest.raises(ValueError, match="schema_version must be 2"):
-        build_manifest.load_identity_matches(identity_path, **kwargs)
-
-    document["schema_version"] = 2
-    outside = tmp_path / "outside.json"
-    outside.write_text("evidence", encoding="utf-8")
-    document["matches"][0]["evidence"]["artifacts"] = [  # type: ignore[index]
-        {"path": "../outside.json", "sha256": hashlib.sha256(b"evidence").hexdigest()}
-    ]
-    identity_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="escapes the identity-map directory"):
+    with pytest.raises(ValueError, match="schema_version must be 3"):
         build_manifest.load_identity_matches(identity_path, **kwargs)
 
 
@@ -423,7 +297,6 @@ def test_ambiguity_is_explicitly_quarantined_on_both_identity_sides(tmp_path) ->
     assert {record.group_id for record in ambiguous if record.group_id is not None} == {1, 2}
     assert {record.full_episode_id for record in ambiguous if record.full_episode_id is not None} == {21, 22}
     assert all((record.group_id is None) != (record.full_episode_id is None) for record in ambiguous)
-    assert len({record.evidence_fingerprint for record in ambiguous}) == 1
     assert all(record.split is None for record in ambiguous)
     assert {record.exclusion_reason for record in ambiguous} == {"ambiguous_identity:two alignments remain tied"}
 
@@ -444,8 +317,6 @@ def test_ambiguities_cannot_overlap_matches_or_each_other(tmp_path) -> None:
     kwargs = {
         "groups": groups,
         "full_episodes": full_audit.full_episodes,
-        "subtask_metadata_fingerprint": subtask_audit.metadata_fingerprint,
-        "full_metadata_fingerprint": full_audit.metadata_fingerprint,
     }
 
     document = _identity_document(subtask_root, full_root, [(0, 20)])
