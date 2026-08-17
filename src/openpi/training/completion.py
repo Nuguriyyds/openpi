@@ -10,6 +10,7 @@ import jax.numpy as jnp
 
 CompletionTrainingStage = Literal["disabled", "action", "head"]
 CompletionObjective = Literal["binary", "progress"]
+TemporalInputMode = Literal["history", "current_only"]
 PROGRESS_BIN_COUNT: Final = 10
 
 
@@ -80,11 +81,39 @@ class CompletionTrainingConfig:
     train_steps: int | None = None
     eval_checkpoint_step: int | None = None
 
+    # Strict 2 Hz temporal event mode.  This path trains the completion head
+    # from a versioned frozen-prefix feature cache rather than from individual
+    # labeled LeRobot frames.  It is intentionally separate from the legacy
+    # dense/boundary samplers so their label semantics cannot be mixed.
+    temporal_sampling: bool = False
+    temporal_feature_cache_path: str | None = None
+    temporal_source_model_config_name: str = "pi05_730_breakfast_subtasks"
+    temporal_source_checkpoint_path: str = (
+        "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999"
+    )
+    # ``current_only`` is a same-architecture ablation: it retains the exact
+    # [B, 3, D] temporal head and zeros the first two slots immediately before
+    # the head.  It therefore changes neither eligible rows nor parameter count.
+    temporal_input_mode: TemporalInputMode = "history"
+    temporal_history_steps: int = 3
+    temporal_stride_frames: int = 15
+    temporal_positive_per_batch: int = 21
+    temporal_hard_negative_per_batch: int = 21
+    temporal_ordinary_negative_per_batch: int = 22
+    temporal_hard_negative_ticks: int = 4
+    temporal_train_fraction: float = 0.72
+    temporal_val_fraction: float = 0.08
+    temporal_test_fraction: float = 0.20
+
     def __post_init__(self) -> None:
         if self.stage not in ("disabled", "action", "head"):
             raise ValueError(f"unsupported completion training stage: {self.stage!r}")
         if self.objective not in ("binary", "progress"):
             raise ValueError(f"unsupported completion objective: {self.objective!r}")
+        if self.temporal_input_mode not in ("history", "current_only"):
+            raise ValueError(f"unsupported temporal_input_mode: {self.temporal_input_mode!r}")
+        if not self.temporal_sampling and self.temporal_input_mode != "history":
+            raise ValueError("temporal_input_mode='current_only' requires temporal_sampling=True")
         if not self.label_key:
             raise ValueError("completion.label_key must not be empty")
         if self.split_manifest_repo_id is not None and not self.split_manifest_repo_id:
@@ -162,12 +191,59 @@ class CompletionTrainingConfig:
                 raise ValueError("progress objective uses progress-stratified sampling, not balanced_sampling")
             if self.bce_pos_weight_override is not None:
                 raise ValueError("progress objective does not support bce_pos_weight_override")
+        if self.temporal_sampling:
+            if self.stage != "head":
+                raise ValueError("completion.temporal_sampling is only supported for stage 'head'")
+            if self.objective != "binary":
+                raise ValueError("temporal completion requires the binary objective")
+            if self.boundary_sampling or self.balanced_sampling:
+                raise ValueError("temporal completion cannot be combined with legacy boundary/balanced sampling")
+            if self.epochs is not None:
+                raise ValueError("temporal completion uses a fixed train_steps budget, not legacy epochs")
+            if self.temporal_feature_cache_path is None or not self.temporal_feature_cache_path:
+                raise ValueError("temporal completion requires temporal_feature_cache_path")
+            if not self.temporal_source_model_config_name:
+                raise ValueError("temporal completion requires temporal_source_model_config_name")
+            if not self.temporal_source_checkpoint_path:
+                raise ValueError("temporal completion requires temporal_source_checkpoint_path")
+            if self.temporal_history_steps != 3:
+                raise ValueError("temporal completion requires exactly three history steps")
+            if self.temporal_stride_frames != 15:
+                raise ValueError("the locked 2 Hz/30 fps scheme requires temporal_stride_frames=15")
+            counts = (
+                self.temporal_positive_per_batch,
+                self.temporal_hard_negative_per_batch,
+                self.temporal_ordinary_negative_per_batch,
+            )
+            if counts != (21, 21, 22):
+                raise ValueError("temporal completion v1 requires batch counts (21, 21, 22)")
+            if self.temporal_hard_negative_ticks != 4:
+                raise ValueError("temporal completion hard negatives must cover the preceding four 2 Hz ticks")
+            fractions = (
+                self.temporal_train_fraction,
+                self.temporal_val_fraction,
+                self.temporal_test_fraction,
+            )
+            if any(fraction <= 0.0 or fraction >= 1.0 for fraction in fractions):
+                raise ValueError("temporal completion split fractions must lie in (0, 1)")
+            if abs(sum(fractions) - 1.0) > 1.0e-9:
+                raise ValueError("temporal completion split fractions must sum to 1")
+            if self.focal_gamma != 0.0:
+                raise ValueError("temporal completion v1 uses unweighted BCE, not focal loss")
+            if self.bce_pos_weight_override not in (None, 1.0):
+                raise ValueError("temporal completion v1 requires bce_pos_weight_override=1.0")
 
     @property
     def uses_completion_data(self) -> bool:
         """Whether the persisted breakfast split is required."""
 
         return self.stage != "disabled"
+
+    @property
+    def uses_legacy_completion_data(self) -> bool:
+        """Whether the legacy per-frame LeRobot preparation path is required."""
+
+        return self.stage != "disabled" and not self.temporal_sampling
 
     @property
     def trains_completion_head(self) -> bool:
@@ -177,7 +253,10 @@ class CompletionTrainingConfig:
     def requires_completion_labels(self) -> bool:
         """Whether the raw dataset must contain audited head labels."""
 
-        return self.stage == "head"
+        # Temporal labels live in the sealed trajectory manifest/feature cache;
+        # asking the legacy loader to audit a per-frame ``completion`` column
+        # would silently mix the two incompatible label definitions.
+        return self.stage == "head" and not self.temporal_sampling
 
     @property
     def uses_focal_loss(self) -> bool:
@@ -204,10 +283,35 @@ class CompletionTrainingConfig:
         return self.stage == "head" and self.boundary_sampling
 
     @property
+    def uses_temporal_completion(self) -> bool:
+        """Whether the strict three-prefix 2 Hz event path is selected."""
+
+        return self.stage == "head" and self.temporal_sampling
+
+    @property
     def is_epoch_based(self) -> bool:
         """Whether boundary sampling controls the step budget and resume state."""
 
         return self.epochs is not None or self.train_steps is not None
+
+
+def apply_temporal_input_mode(prefix_history: jax.Array, mode: TemporalInputMode) -> jax.Array:
+    """Applies the locked same-shape history/current-only ablation transform.
+
+    ``current_only`` deliberately zeroes (rather than removes) the older two
+    slots.  The shared LayerNorm can map those zeros to its learned beta, but
+    that value is constant across samples and cannot carry historical
+    information; retaining it is part of the same-parameter-count control.
+    """
+
+    if mode not in ("history", "current_only"):
+        raise ValueError(f"unsupported temporal input mode: {mode!r}")
+    history = jnp.asarray(prefix_history, dtype=jnp.float32)
+    if history.ndim != 3 or history.shape[1] != 3 or history.shape[2] <= 0:
+        raise ValueError(f"temporal prefix history must have shape [B, 3, D], got {history.shape}")
+    if mode == "history":
+        return history
+    return jnp.concatenate((jnp.zeros_like(history[:, :2, :]), history[:, 2:, :]), axis=1)
 
 
 def positive_class_weight(negative_count: int, positive_count: int) -> float:

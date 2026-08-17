@@ -1,9 +1,12 @@
+import dataclasses
+
 import flax.nnx as nnx
 import pytest
 
 from openpi.models import pi0_config
 from openpi.training import completion as completion_training
 from openpi.training import config
+from openpi.training import weight_loaders
 
 
 def test_existing_ttrtc_config_keeps_completion_disabled():
@@ -14,6 +17,93 @@ def test_existing_ttrtc_config_keeps_completion_disabled():
     assert existing.completion.stage == "disabled"
     assert isinstance(existing.freeze_filter, nnx.Nothing)
     assert existing.data.repo_id == "modanqing/agilex_empty_the_box_all_470"
+
+
+def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
+    clean = config.get_config("pi05_730_breakfast_subtasks")
+    temporal = config.get_config("pi05_agilex_breakfast_temporal_completion_head")
+
+    assert not clean.training_time_rtc.enabled
+    assert not clean.model.completion_head.enabled
+    assert clean.data.repo_id == "modanqing/agilex_make_breakfast_subtask_730"
+    assert temporal.data.repo_id == clean.data.repo_id
+    assert not temporal.training_time_rtc.enabled
+    assert temporal.completion.uses_temporal_completion
+    assert not temporal.completion.requires_completion_labels
+    assert temporal.completion.temporal_input_mode == "history"
+    assert temporal.model.completion_head.variant == "temporal_mlp"
+    assert temporal.model.completion_head.resolved_pooling == "masked_mean"
+    assert temporal.model.completion_head.temporal_steps == 3
+    assert temporal.model.completion_head.hidden_dim == 128
+    assert temporal.model.completion_head.dropout_rate == 0.1
+    assert temporal.num_workers == 0
+    assert temporal.completion.temporal_stride_frames == 15
+    assert (
+        temporal.completion.temporal_positive_per_batch,
+        temporal.completion.temporal_hard_negative_per_batch,
+        temporal.completion.temporal_ordinary_negative_per_batch,
+    ) == (21, 21, 22)
+    assert temporal.batch_size == 64
+    assert temporal.completion.focal_gamma == 0.0
+    assert temporal.completion.bce_pos_weight_override == 1.0
+    assert temporal.weight_loader.params_path.endswith("breakfast_subtasks_bs64_50k/49999/params")
+    assert temporal.weight_loader.missing_regex == r"completion_head/.*"
+    assert temporal.weight_loader.reject_unexpected
+    assert isinstance(temporal.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
+
+
+def test_temporal_current_only_config_changes_only_name_and_input_mode():
+    history = config.get_config("pi05_agilex_breakfast_temporal_completion_head")
+    current_only = config.get_config("pi05_agilex_breakfast_temporal_completion_current_only_head")
+
+    assert current_only.completion.temporal_input_mode == "current_only"
+    assert current_only.model == history.model
+    assert current_only.seed == history.seed
+    assert current_only.batch_size == history.batch_size == 64
+    assert current_only.weight_loader == history.weight_loader
+    assert current_only.completion.temporal_feature_cache_path == history.completion.temporal_feature_cache_path
+    assert (
+        dataclasses.replace(
+            current_only,
+            name=history.name,
+            completion=history.completion,
+        )
+        == history
+    )
+
+
+def test_temporal_input_mode_is_locked_and_current_only_requires_temporal_sampling():
+    with pytest.raises(ValueError, match="unsupported temporal_input_mode"):
+        completion_training.CompletionTrainingConfig(temporal_input_mode="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="requires temporal_sampling"):
+        completion_training.CompletionTrainingConfig(temporal_input_mode="current_only")
+
+
+def test_temporal_completion_rejects_backbone_different_from_feature_source():
+    temporal = config.get_config("pi05_agilex_breakfast_temporal_completion_head")
+
+    with pytest.raises(ValueError, match="must match temporal_source_checkpoint_path/params"):
+        dataclasses.replace(
+            temporal,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "/mnt/data/models/wyt/checkpoints/wrong/params",
+                missing_regex=r"completion_head/.*",
+                reject_unexpected=True,
+            ),
+        )
+
+
+def test_temporal_completion_rejects_sampler_counts_different_from_locked_batch():
+    with pytest.raises(ValueError, match=r"requires batch counts \(21, 21, 22\)"):
+        completion_training.CompletionTrainingConfig(
+            stage="head",
+            temporal_sampling=True,
+            temporal_feature_cache_path="features.npz",
+            temporal_positive_per_batch=20,
+            temporal_hard_negative_per_batch=20,
+            temporal_ordinary_negative_per_batch=24,
+            bce_pos_weight_override=1.0,
+        )
 
 
 def test_binary_breakfast_two_stage_configs_are_explicit_and_share_the_split():

@@ -2,6 +2,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from openpi.models import completion
 from openpi.training import completion as training_completion
@@ -34,6 +35,156 @@ def test_masked_attention_pool_ignores_padding_tokens():
     pooled_b = completion.masked_attention_pool(jnp.concatenate([valid_tokens, padding_b], axis=1), mask, query)
 
     np.testing.assert_allclose(pooled_a, pooled_b, rtol=0.0, atol=0.0)
+
+
+def test_masked_mean_pool_is_fp32_and_ignores_padding_tokens():
+    valid_tokens = jnp.asarray([[[1.0, 2.0], [3.0, 6.0]]], dtype=jnp.float16)
+    padding_a = jnp.asarray([[[10.0, 20.0], [30.0, 40.0]]], dtype=jnp.float16)
+    padding_b = jnp.asarray([[[-1000.0, 1000.0], [1000.0, -1000.0]]], dtype=jnp.float16)
+    mask = jnp.asarray([[True, True, False, False]])
+
+    pooled_a = completion.masked_mean_pool(jnp.concatenate([valid_tokens, padding_a], axis=1), mask)
+    pooled_b = completion.masked_mean_pool(jnp.concatenate([valid_tokens, padding_b], axis=1), mask)
+
+    assert pooled_a.dtype == jnp.float32
+    np.testing.assert_allclose(pooled_a, jnp.asarray([[2.0, 4.0]], dtype=jnp.float32))
+    np.testing.assert_array_equal(pooled_a, pooled_b)
+
+
+def test_masked_mean_pool_all_padding_returns_zero():
+    tokens = jnp.ones((2, 3, 4), dtype=jnp.float16)
+    pooled = completion.masked_mean_pool(tokens, jnp.zeros((2, 3), dtype=jnp.bool_))
+
+    np.testing.assert_array_equal(pooled, jnp.zeros((2, 4), dtype=jnp.float32))
+
+
+def test_masked_mean_pool_stops_gradient_to_prefix_tokens():
+    mask = jnp.ones((2, 3), dtype=jnp.bool_)
+    tokens = jnp.ones((2, 3, 4), dtype=jnp.float32)
+
+    gradient = jax.grad(lambda value: jnp.sum(completion.masked_mean_pool(value, mask)))(tokens)
+
+    np.testing.assert_array_equal(gradient, jnp.zeros_like(tokens))
+
+
+@pytest.mark.parametrize(
+    ("tokens", "mask"),
+    [
+        (jnp.ones((2, 4)), jnp.ones((2,), dtype=jnp.bool_)),
+        (jnp.ones((2, 3, 4)), jnp.ones((2, 4), dtype=jnp.bool_)),
+        (jnp.ones((2, 3, 4)), jnp.ones((2, 3, 1), dtype=jnp.bool_)),
+    ],
+)
+def test_masked_mean_pool_rejects_malformed_shapes(tokens, mask):
+    with pytest.raises(ValueError, match=r"completion (tokens|mask)"):
+        completion.masked_mean_pool(tokens, mask)
+
+
+def test_temporal_completion_config_is_explicit_and_strict():
+    config = completion.CompletionHeadConfig(enabled=True, variant="temporal_mlp")
+
+    assert config.temporal_steps == 3
+    assert config.hidden_dim == 128
+    assert config.resolved_pooling == "masked_mean"
+    with pytest.raises(ValueError, match="exactly three"):
+        completion.CompletionHeadConfig(enabled=True, variant="temporal_mlp", temporal_steps=2)
+    with pytest.raises(ValueError, match="requires pooling"):
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_mlp",
+            pooling="masked_attention",
+        )
+    with pytest.raises(ValueError, match="variant='legacy_attention'"):
+        completion.CompletionHead(
+            4,
+            completion.CompletionHeadConfig(enabled=True, variant="temporal_mlp"),
+            rngs=nnx.Rngs(0),
+        )
+
+
+def test_temporal_completion_head_output_shape_dtype_and_shared_layer_norm():
+    head = completion.TemporalCompletionHead(
+        8,
+        completion.CompletionHeadConfig(enabled=True, variant="temporal_mlp", hidden_dim=16),
+        rngs=nnx.Rngs(0),
+    )
+    history = jax.random.normal(jax.random.key(1), (4, 3, 8), dtype=jnp.float16)
+    logits = head(history, train=False)
+    param_state = nnx.state(head, nnx.Param).flat_state()
+    param_paths = ["/".join(str(part) for part in path) for path in param_state]
+
+    assert logits.shape == (4,)
+    assert logits.dtype == jnp.float32
+    assert np.all(np.isfinite(logits))
+    assert param_paths.count("layer_norm/scale") == 1
+    assert param_paths.count("layer_norm/bias") == 1
+    assert all(variable.value.dtype == jnp.float32 for variable in param_state.values())
+
+
+def test_temporal_completion_head_preserves_oldest_to_newest_concat_order():
+    head = completion.TemporalCompletionHead(
+        2,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_mlp",
+            hidden_dim=1,
+            dropout_rate=0.0,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+    head.projection.kernel.value = jnp.arange(1.0, 7.0, dtype=jnp.float32)[:, None]
+    head.projection.bias.value = jnp.zeros((1,), dtype=jnp.float32)
+    head.output.kernel.value = jnp.ones((1, 1), dtype=jnp.float32)
+    head.output.bias.value = jnp.zeros((1,), dtype=jnp.float32)
+    history = jnp.asarray([[[1.0, 3.0], [5.0, 2.0], [-4.0, 8.0]]], dtype=jnp.float32)
+
+    normalized = head.layer_norm(history)
+    expected_concat = jnp.concatenate([normalized[:, 0], normalized[:, 1], normalized[:, 2]], axis=-1)
+    expected = jax.nn.gelu(expected_concat @ head.projection.kernel.value)[:, 0]
+
+    np.testing.assert_allclose(head(history, train=False), expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("shape", [(2, 8), (2, 2, 8), (2, 3, 7), (2, 4, 8)])
+def test_temporal_completion_head_rejects_malformed_history(shape):
+    head = completion.TemporalCompletionHead(
+        8,
+        completion.CompletionHeadConfig(enabled=True, variant="temporal_mlp"),
+        rngs=nnx.Rngs(0),
+    )
+
+    with pytest.raises(ValueError, match="prefix_history"):
+        head(jnp.ones(shape), train=False)
+
+
+def test_temporal_completion_head_stops_gradient_to_history():
+    head = completion.TemporalCompletionHead(
+        4,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_mlp",
+            dropout_rate=0.0,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+    history = jnp.ones((2, 3, 4), dtype=jnp.float32)
+
+    gradient = jax.grad(lambda value: jnp.sum(head(value, train=False)))(history)
+
+    np.testing.assert_array_equal(gradient, jnp.zeros_like(history))
+
+
+def test_temporal_completion_dropout_requires_rng_only_during_training():
+    head = completion.TemporalCompletionHead(
+        4,
+        completion.CompletionHeadConfig(enabled=True, variant="temporal_mlp", dropout_rate=0.5),
+        rngs=nnx.Rngs(0),
+    )
+    history = jnp.ones((2, 3, 4), dtype=jnp.float32)
+
+    np.testing.assert_array_equal(head(history, train=False), head(history, train=False))
+    with pytest.raises(ValueError, match="requires an RNG"):
+        head(history, train=True)
 
 
 def test_logits_and_weighted_loss_are_finite_for_extreme_values():

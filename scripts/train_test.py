@@ -4,6 +4,7 @@ import inspect
 import os
 import pathlib
 import textwrap
+from types import SimpleNamespace
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -246,6 +247,71 @@ def test_should_save_epoch_checkpoint_no_off_by_one():
     assert train.should_save_epoch_checkpoint(sp, steps_per_epoch=sp, total_steps=total) is True
     # One step before the boundary does NOT save.
     assert train.should_save_epoch_checkpoint(sp - 1, steps_per_epoch=sp, total_steps=total) is False
+
+
+def test_temporal_validation_rank_uses_metric_report_keys():
+    metrics = {
+        "val/temporal/boundary_top1_rate": 0.8,
+        "val/temporal/hard_local/auprc": 0.7,
+        "val/temporal/margin/hard_local_median": 0.2,
+        "val/temporal/natural/auprc": 0.9,
+    }
+
+    assert train.temporal_validation_rank(metrics) == (0.8, 0.7, 0.2, 0.9)
+
+
+def test_temporal_input_mode_keeps_shape_and_removes_only_history_slots():
+    source = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4)
+
+    history = _completion.apply_temporal_input_mode(source, "history")
+    current_only = _completion.apply_temporal_input_mode(source, "current_only")
+
+    np.testing.assert_array_equal(np.asarray(history), np.asarray(source))
+    assert current_only.shape == source.shape
+    np.testing.assert_array_equal(np.asarray(current_only[:, :2, :]), np.zeros((2, 2, 4), dtype=np.float32))
+    np.testing.assert_array_equal(np.asarray(current_only[:, 2, :]), np.asarray(source[:, 2, :]))
+    # The transform is functional; cached source features remain immutable.
+    np.testing.assert_array_equal(np.asarray(source), np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+
+
+def test_temporal_train_and_validation_both_apply_configured_input_mode():
+    assert "apply_temporal_input_mode" in inspect.getsource(train.train_step)
+    assert "apply_temporal_input_mode" in inspect.getsource(train.temporal_completion_eval_step)
+
+
+def test_temporal_selection_binding_seals_input_mode():
+    data_info = SimpleNamespace(
+        manifest=SimpleNamespace(manifest_fingerprint="a" * 64),
+        cache=SimpleNamespace(
+            metadata=SimpleNamespace(
+                checkpoint_fingerprint="b" * 64,
+                rows_fingerprint="c" * 64,
+                preprocess_fingerprint="d" * 64,
+                feature_payload_fingerprint="e" * 64,
+            )
+        ),
+    )
+
+    binding = train._temporal_cache_binding(data_info, input_mode="current_only")  # noqa: SLF001
+
+    assert binding["temporal_input_mode"] == "current_only"
+    assert binding["manifest_fingerprint"] == "a" * 64
+
+
+def test_temporal_resume_rejects_stale_existing_validation_selection():
+    assert (
+        train.require_current_temporal_validation_progress(
+            {"last_validated_checkpoint_step": 400},
+            resumed_step=400,
+        )
+        == 400
+    )
+
+    with pytest.raises(ValueError, match="stale for the resumed checkpoint"):
+        train.require_current_temporal_validation_progress(
+            {"last_validated_checkpoint_step": 200},
+            resumed_step=400,
+        )
 
 
 def test_boundary_config_uses_plain_unweighted_bce():

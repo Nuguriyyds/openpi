@@ -10,6 +10,8 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.completion import CompletionHead
+from openpi.models.completion import TemporalCompletionHead
+from openpi.models.completion import masked_mean_pool
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -102,10 +104,21 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.prefix_feature_dim = paligemma_config.width
         if config.completion_head.enabled:
             # The VLM hidden size comes from the selected PaliGemma config; it
             # is never hard-coded in the completion implementation.
-            self.completion_head = CompletionHead(paligemma_config.width, config.completion_head, rngs=rngs)
+            self.completion_head_variant = config.completion_head.variant
+            if config.completion_head.variant == "legacy_attention":
+                self.completion_head = CompletionHead(paligemma_config.width, config.completion_head, rngs=rngs)
+            elif config.completion_head.variant == "temporal_mlp":
+                self.completion_head = TemporalCompletionHead(
+                    paligemma_config.width,
+                    config.completion_head,
+                    rngs=rngs,
+                )
+            else:  # CompletionHeadConfig validates this before model construction.
+                raise ValueError(f"unsupported completion head variant: {config.completion_head.variant!r}")
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -226,8 +239,20 @@ class Pi0(_model.BaseModel):
 
         if not hasattr(self, "completion_head"):
             raise ValueError("completion head is disabled in Pi0Config")
+        if self.completion_head_variant != "legacy_attention":
+            raise ValueError(
+                "compute_completion_logits is the legacy single-observation API; "
+                "use compute_prefix_feature and compute_temporal_completion_logits for a temporal completion head"
+            )
         preprocess_rng = jax.random.fold_in(rng, 0xC0A4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        prefix_out, prefix_mask = self._compute_prefix_outputs(observation)
+        head_rng = jax.random.fold_in(rng, 0xC0A5)
+        return self.completion_head(prefix_out, prefix_mask, rng=head_rng, train=train)
+
+    def _compute_prefix_outputs(self, observation: _model.Observation) -> tuple[jax.Array, jax.Array]:
+        """Runs the already-preprocessed observation through the VLM prefix."""
+
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -237,8 +262,44 @@ class Pi0(_model.BaseModel):
             positions=positions,
         )
         assert prefix_out is not None
+        if prefix_out.ndim != 3 or prefix_out.shape[-1] != self.prefix_feature_dim:
+            raise ValueError(
+                f"prefix output must have shape [batch, tokens, {self.prefix_feature_dim}], got {prefix_out.shape}"
+            )
+        return prefix_out, prefix_mask
+
+    def compute_prefix_feature(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        train: bool = False,
+    ) -> jax.Array:
+        """Returns the stop-gradient FP32 masked-mean VLM prefix feature."""
+
+        preprocess_rng = jax.random.fold_in(rng, 0xC0A4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        prefix_out, prefix_mask = self._compute_prefix_outputs(observation)
+        feature = masked_mean_pool(prefix_out, prefix_mask)
+        if feature.ndim != 2 or feature.shape[-1] != self.prefix_feature_dim:
+            raise ValueError(f"prefix feature must have shape [batch, {self.prefix_feature_dim}], got {feature.shape}")
+        return feature
+
+    def compute_temporal_completion_logits(
+        self,
+        rng: at.KeyArrayLike,
+        prefix_history: jax.Array,
+        *,
+        train: bool = False,
+    ) -> jax.Array:
+        """Scores cached features ordered as [z_(t-2), z_(t-1), z_t]."""
+
+        if not hasattr(self, "completion_head"):
+            raise ValueError("completion head is disabled in Pi0Config")
+        if self.completion_head_variant != "temporal_mlp":
+            raise ValueError("compute_temporal_completion_logits requires completion_head.variant='temporal_mlp'")
         head_rng = jax.random.fold_in(rng, 0xC0A5)
-        return self.completion_head(prefix_out, prefix_mask, rng=head_rng, train=train)
+        return self.completion_head(prefix_history, rng=head_rng, train=train)
 
     def _compute_action_loss_and_prefix(
         self,
@@ -336,6 +397,49 @@ class Pi0(_model.BaseModel):
         action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
         delay: at.Int[at.Array, " b"] | at.Int[at.Array, ""] | int | None = None,
     ) -> _model.Actions:
+        """Preserves the existing action-only inference API."""
+
+        actions, _prefix_feature = self._sample_actions_with_prefix_feature(
+            rng,
+            observation,
+            num_steps=num_steps,
+            noise=noise,
+            action_prefix=action_prefix,
+            delay=delay,
+        )
+        return actions
+
+    def sample_actions_with_prefix_feature(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        delay: at.Int[at.Array, " b"] | at.Int[at.Array, ""] | int | None = None,
+    ) -> tuple[_model.Actions, jax.Array]:
+        """Returns actions and the pooled feature from the same prefix forward."""
+
+        return self._sample_actions_with_prefix_feature(
+            rng,
+            observation,
+            num_steps=num_steps,
+            noise=noise,
+            action_prefix=action_prefix,
+            delay=delay,
+        )
+
+    def _sample_actions_with_prefix_feature(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        delay: at.Int[at.Array, " b"] | at.Int[at.Array, ""] | int | None = None,
+    ) -> tuple[_model.Actions, jax.Array]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -362,7 +466,11 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        assert prefix_out is not None
+        prefix_feature = masked_mean_pool(prefix_out, prefix_mask)
 
         def step(carry):
             x_t, time = carry
@@ -416,4 +524,4 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         if action_prefix is not None:
             x_0 = jnp.where(action_prefix_mask[:, :, None], action_prefix, x_0)
-        return x_0
+        return x_0, prefix_feature

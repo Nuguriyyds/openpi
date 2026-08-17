@@ -1,5 +1,6 @@
 from collections.abc import Iterator, Sequence
 import dataclasses
+import json
 import logging
 import multiprocessing
 import os
@@ -17,6 +18,10 @@ import openpi.training.completion as _completion
 import openpi.training.completion_data as _completion_data
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.temporal_completion_data as _temporal_data
+import openpi.training.temporal_completion_features as _temporal_features
+import openpi.training.temporal_completion_preprocess as _temporal_preprocess
+import openpi.training.temporal_completion_sampler as _temporal_sampler
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -52,6 +57,17 @@ class DataLoader(Protocol[T_co]):
 
     def __iter__(self) -> Iterator[T_co]:
         raise NotImplementedError("Subclasses of DataLoader should implement __iter__.")
+
+
+@dataclasses.dataclass(frozen=True)
+class TemporalCompletionDataInfo:
+    """Sealed manifest and audited clean-prefix feature cache."""
+
+    manifest: _temporal_data.TemporalCompletionManifest
+    cache: _temporal_features.TemporalFeatureCache
+
+    def sample_count(self, split: _temporal_data.SplitName) -> int:
+        return int(self.cache.indices_for_split(split).size)
 
 
 class TransformedDataset(Dataset[T_co]):
@@ -594,8 +610,8 @@ def transform_iterable_dataset(
 def prepare_completion_data(config: _config.TrainConfig) -> _completion_data.CompletionDataInfo:
     """Creates/reuses the split manifest and audits labels only for S2 head training."""
 
-    if not config.completion.uses_completion_data:
-        raise ValueError("completion data preparation requires completion stage 'action' or 'head'")
+    if not config.completion.uses_legacy_completion_data:
+        raise ValueError("legacy completion preparation cannot be used for temporal completion")
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.repo_id in (None, "fake"):
         raise ValueError("completion training requires an explicit non-fake LeRobot repo_id")
@@ -647,6 +663,91 @@ def prepare_completion_data(config: _config.TrainConfig) -> _completion_data.Com
     return info
 
 
+def prepare_temporal_completion_data(config: _config.TrainConfig) -> TemporalCompletionDataInfo:
+    """Loads the sealed versioned manifest/cache pair for three-prefix training."""
+
+    if not config.completion.uses_temporal_completion:
+        raise ValueError("temporal completion preparation requires completion.temporal_sampling=True")
+    manifest_path = config.completion.split_manifest_path
+    feature_path = config.completion.temporal_feature_cache_path
+    if manifest_path is None or feature_path is None:
+        raise ValueError("temporal completion requires split_manifest_path and temporal_feature_cache_path")
+    with open(manifest_path, encoding="utf-8") as file:
+        manifest = _temporal_data.TemporalCompletionManifest.from_dict(json.load(file))
+    checkpoint_params = os.path.join(config.completion.temporal_source_checkpoint_path, "params")
+    checkpoint_fingerprint = _temporal_features.directory_fingerprint(checkpoint_params)
+    source_config = _config.get_config(config.completion.temporal_source_model_config_name)
+    preprocess_fingerprint = _temporal_preprocess.expected_preprocess_fingerprint(
+        source_train_config=source_config,
+        manifest=manifest,
+        checkpoint_path=config.completion.temporal_source_checkpoint_path,
+    )
+    cache = _temporal_features.load_temporal_feature_cache(
+        feature_path,
+        manifest=manifest,
+        expected_checkpoint_fingerprint=checkpoint_fingerprint,
+        expected_checkpoint_path=config.completion.temporal_source_checkpoint_path,
+        expected_preprocess_fingerprint=preprocess_fingerprint,
+        expected_model_config_name=config.completion.temporal_source_model_config_name,
+    )
+    logging.info(
+        "Temporal completion cache: manifest=%s rows=%d feature_dim=%d checkpoint=%s",
+        manifest.manifest_fingerprint,
+        cache.metadata.row_count,
+        cache.metadata.feature_dim,
+        cache.metadata.checkpoint_path,
+    )
+    return TemporalCompletionDataInfo(manifest=manifest, cache=cache)
+
+
+def create_temporal_feature_data_loader(
+    config: _config.TrainConfig,
+    *,
+    split: _temporal_data.SplitName,
+    temporal_data_info: TemporalCompletionDataInfo,
+    sharding: jax.sharding.Sharding | None = None,
+    num_batches: int | None = None,
+) -> DataLoader[tuple[jax.Array, jax.Array]]:
+    """Creates the strict 21/21/22 train loader or natural eval loader."""
+
+    if not config.completion.uses_temporal_completion:
+        raise ValueError("temporal feature loader requires completion.temporal_sampling=True")
+    if jax.process_count() != 1:
+        raise ValueError("temporal completion v1 supports one JAX process; multi-GPU within that process is supported")
+    data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = _temporal_features.TemporalFeatureDataset(temporal_data_info.cache, split)
+    local_batch_size = config.batch_size // jax.process_count()
+    if split == "train":
+        if config.batch_size != 64:
+            raise ValueError("temporal completion v1 requires global batch_size=64")
+        batch_sampler = _temporal_sampler.TemporalCompletionBatchSampler(
+            dataset.samples,
+            seed=config.seed,
+        )
+        repeat = True
+        drop_last = True
+    else:
+        batch_sampler = _temporal_sampler.NaturalTemporalEvalBatchSampler(
+            dataset.samples,
+            batch_size=local_batch_size,
+        )
+        repeat = False
+        drop_last = False
+    torch_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=sharding,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+        repeat=repeat,
+        drop_last=drop_last,
+        batch_sampler=batch_sampler,
+        temporal_sampler=batch_sampler if split == "train" else None,
+    )
+    return TemporalDataLoaderImpl(data_config, torch_loader, dataset)
+
+
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -669,12 +770,14 @@ def create_data_loader(
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
     """
+    if config.completion.uses_temporal_completion:
+        raise ValueError("temporal completion must use create_temporal_feature_data_loader")
     if natural_train_eval and split != "train":
         raise ValueError("natural_train_eval is only valid for the train split")
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
-    uses_completion_split = config.completion.uses_completion_data
+    uses_completion_split = config.completion.uses_legacy_completion_data
     emits_completion_target = config.completion.trains_completion_head
     selected_episode_ids: tuple[int, ...] | None = None
     if uses_completion_split:
@@ -958,6 +1061,8 @@ class TorchDataLoader:
         repeat: bool = True,
         drop_last: bool = True,
         boundary_sampler: BoundaryCompletionSampler | None = None,
+        batch_sampler: torch.utils.data.Sampler[list[int]] | None = None,
+        temporal_sampler: _temporal_sampler.TemporalCompletionBatchSampler | None = None,
     ):
         """Create a PyTorch data loader.
 
@@ -977,8 +1082,10 @@ class TorchDataLoader:
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if len(dataset) < local_batch_size:
+        if batch_sampler is None and len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+        if batch_sampler is not None and (sampler is not None or shuffle):
+            raise ValueError("batch_sampler cannot be combined with sampler or shuffle")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -991,6 +1098,7 @@ class TorchDataLoader:
         self._num_batches = num_batches
         self._repeat = repeat
         self._boundary_sampler = boundary_sampler
+        self._temporal_sampler = temporal_sampler
         # Validation must keep every frame, including a final short batch. A
         # data-sharded JAX array still requires that batch to divide evenly
         # across devices, so pad it here and trim the repeated rows in the
@@ -1005,19 +1113,29 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
-            num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=drop_last,
-            generator=generator,
-        )
+        common_loader_kwargs = {
+            "num_workers": num_workers,
+            "multiprocessing_context": mp_context,
+            "persistent_workers": num_workers > 0,
+            "collate_fn": _collate_fn,
+            "worker_init_fn": _worker_init_fn,
+            "generator": generator,
+        }
+        if batch_sampler is None:
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_size=local_batch_size,
+                shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+                sampler=sampler,
+                drop_last=drop_last,
+                **common_loader_kwargs,
+            )
+        else:
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_sampler=batch_sampler,
+                **common_loader_kwargs,
+            )
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
@@ -1026,6 +1144,10 @@ class TorchDataLoader:
     @property
     def boundary_sampler(self) -> BoundaryCompletionSampler | None:
         return self._boundary_sampler
+
+    @property
+    def temporal_sampler(self) -> _temporal_sampler.TemporalCompletionBatchSampler | None:
+        return self._temporal_sampler
 
     def __iter__(self):
         num_items = 0
@@ -1151,3 +1273,35 @@ class DataLoaderImpl(DataLoader):
                 yield training_batch
             else:
                 yield (*training_batch, batch[COMPLETION_TARGET_KEY])
+
+
+class TemporalDataLoaderImpl(DataLoader[tuple[jax.Array, jax.Array]]):
+    """Passes cached ``(prefix_history, target)`` batches through unchanged."""
+
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader,
+        dataset: _temporal_features.TemporalFeatureDataset,
+    ) -> None:
+        self._data_config = data_config
+        self._data_loader = data_loader
+        self.dataset = dataset
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    @property
+    def boundary_sampler(self) -> None:
+        return None
+
+    @property
+    def temporal_sampler(self) -> _temporal_sampler.TemporalCompletionBatchSampler | None:
+        return self._data_loader.temporal_sampler
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.dataset)
+
+    def __iter__(self) -> Iterator[tuple[jax.Array, jax.Array]]:
+        yield from self._data_loader

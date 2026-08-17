@@ -1,6 +1,8 @@
 import flax.nnx as nnx
 import jax
+import jax.numpy as jnp
 
+from openpi.models import completion as _completion
 import openpi.models.pi0_config as _pi0_config
 
 
@@ -86,6 +88,50 @@ def test_s2_parameter_audit_freezes_vlm_and_action_and_trains_only_head():
     assert not audit.trainable_action
     assert audit.trainable_completion
     assert all(path.startswith("completion_head/") for path in audit.trainable_completion)
+
+
+def test_temporal_completion_parameter_audit_freezes_backbone_and_trains_only_temporal_head():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        completion_head=_pi0_config.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_mlp",
+            pooling="masked_mean",
+            hidden_dim=128,
+        ),
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    audit = _pi0_config.audit_frozen_vlm_parameters(
+        abstract_model,
+        config.get_completion_head_only_freeze_filter(),
+        trainable_groups=("completion",),
+    )
+    completion_state = nnx.state(abstract_model.completion_head, nnx.Param).flat_state()
+
+    assert isinstance(abstract_model.completion_head, _completion.TemporalCompletionHead)
+    assert audit.frozen_vlm
+    assert audit.frozen_action
+    assert not audit.trainable_action
+    assert audit.trainable_completion
+    assert all(path.startswith("completion_head/") for path in audit.trainable_completion)
+    assert completion_state[("projection", "kernel")].value.shape == (3 * 64, 128)
+    assert all(variable.value.dtype == jnp.float32 for variable in completion_state.values())
+
+
+def test_completion_default_variant_preserves_legacy_attention_head():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        completion_head=_pi0_config.CompletionHeadConfig(enabled=True),
+    )
+
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+
+    assert config.completion_head.variant == "legacy_attention"
+    assert isinstance(abstract_model.completion_head, _completion.CompletionHead)
 
 
 def test_progress_head_freeze_filter_only_unfreezes_completion_head():

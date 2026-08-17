@@ -13,6 +13,41 @@ from openpi.training import config as _config
 import openpi.transforms as transforms
 
 
+def _path_component(value: Any) -> Any:
+    for attribute in ("key", "name", "idx"):
+        if hasattr(value, attribute):
+            return getattr(value, attribute)
+    return value
+
+
+def _temporal_mixed_restore_dtype(path) -> jnp.dtype:
+    """Keeps the frozen action/VLM BF16 and restores only the head as FP32."""
+
+    components = tuple(str(_path_component(component)) for component in path)
+    return jnp.float32 if "completion_head" in components else jnp.bfloat16
+
+
+def _jax_checkpoint_restore_dtype(train_config: _config.TrainConfig):
+    """Returns the legacy BF16 cast or temporal mixed-precision policy."""
+
+    return _temporal_mixed_restore_dtype if train_config.completion.uses_temporal_completion else jnp.bfloat16
+
+
+def _audit_temporal_head_fp32(model: Any) -> None:
+    import flax.nnx as nnx  # noqa: PLC0415
+
+    if not hasattr(model, "completion_head"):
+        raise ValueError("temporal policy checkpoint has no completion_head")
+    state = nnx.state(model.completion_head, nnx.Param).flat_state()
+    if not state:
+        raise ValueError("temporal policy completion_head has no parameters")
+    non_fp32 = [
+        "/".join(str(part) for part in path) for path, variable in state.items() if variable.value.dtype != jnp.float32
+    ]
+    if non_fp32:
+        raise ValueError(f"temporal policy completion_head parameters must remain FP32: {non_fp32[:5]}")
+
+
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -54,7 +89,14 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        model = train_config.model.load(
+            _model.restore_params(
+                checkpoint_dir / "params",
+                dtype=_jax_checkpoint_restore_dtype(train_config),
+            )
+        )
+        if train_config.completion.uses_temporal_completion:
+            _audit_temporal_head_fp32(model)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
@@ -66,7 +108,7 @@ def create_trained_policy(
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:
-            import torch
+            import torch  # noqa: PLC0415
 
             pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:

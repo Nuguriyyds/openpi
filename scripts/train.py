@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import json
 import logging
+import os
 import platform
 import shutil
 from typing import Any
@@ -28,6 +29,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+import openpi.training.temporal_completion_metrics as _temporal_metrics
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
@@ -211,7 +213,11 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions] | tuple[_model.Observation, _model.Actions, at.Array],
+    batch: (
+        tuple[_model.Observation, _model.Actions]
+        | tuple[_model.Observation, _model.Actions, at.Array]
+        | tuple[at.Array, at.Array]
+    ),
     *,
     pos_weight: float | None = None,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
@@ -224,7 +230,15 @@ def train_step(
     completion_stage = config.completion.stage
 
     if completion_stage == "head":
-        observation, _actions, completion_targets = batch
+        uses_temporal = config.completion.uses_temporal_completion
+        if uses_temporal:
+            prefix_history, completion_targets = batch
+            prefix_history = _completion.apply_temporal_input_mode(
+                prefix_history,
+                config.completion.temporal_input_mode,
+            )
+        else:
+            observation, _actions, completion_targets = batch
         completion_targets = jnp.asarray(completion_targets, dtype=jnp.float32)
         if completion_targets.ndim == 2 and completion_targets.shape[-1] == 1:
             completion_targets = completion_targets[..., 0]
@@ -233,10 +247,25 @@ def train_step(
         focal_alpha = config.completion.focal_alpha
         uses_focal = config.completion.uses_focal_loss
         uses_progress = config.completion.uses_progress_objective
-        if not uses_progress and not uses_focal and pos_weight is None:
+        if not uses_temporal and not uses_progress and not uses_focal and pos_weight is None:
             raise ValueError("pos_weight is required for completion head training")
 
-        if uses_progress:
+        if uses_temporal:
+
+            def temporal_completion_loss_fn(model, rng, history, targets):
+                logits = model.compute_temporal_completion_logits(rng, history, train=True)
+                if logits.shape != targets.shape:
+                    raise ValueError(
+                        f"temporal completion target shape {targets.shape} does not match logits shape {logits.shape}"
+                    )
+                return jnp.mean(_completion.bce_with_logits(logits, targets))
+
+            loss, grads = nnx.value_and_grad(
+                temporal_completion_loss_fn,
+                argnums=diff_state,
+            )(model, train_rng, prefix_history, completion_targets)
+            completion_loss = loss
+        elif uses_progress:
 
             def progress_loss_fn(model, rng, observation, targets):
                 logits = model.compute_completion_logits(rng, observation, train=True)
@@ -348,7 +377,10 @@ def train_step(
                 "completion_positive_count": jnp.sum(completion_targets),
                 "completion_positive_fraction": jnp.mean(completion_targets),
             }
-            if uses_focal:
+            if uses_temporal:
+                head_info["pos_weight"] = jnp.asarray(1.0, dtype=jnp.float32)
+                head_info["temporal_history_steps"] = jnp.asarray(3.0, dtype=jnp.float32)
+            elif uses_focal:
                 head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
                 head_info["focal_alpha"] = jnp.asarray(focal_alpha, dtype=jnp.float32)
             else:
@@ -374,6 +406,31 @@ def completion_eval_step(
     logits = model.compute_completion_logits(rng, observation, train=False)
     if logits.shape != targets.shape:
         raise ValueError(f"completion target shape {targets.shape} does not match logits shape {logits.shape}")
+    return logits, targets
+
+
+def temporal_completion_eval_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[at.Array, at.Array],
+) -> tuple[jax.Array, jax.Array]:
+    """Scores cached three-prefix histories without another VLM forward."""
+
+    eval_params = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, eval_params)
+    model.eval()
+    prefix_history, targets = batch
+    prefix_history = _completion.apply_temporal_input_mode(
+        prefix_history,
+        config.completion.temporal_input_mode,
+    )
+    targets = jnp.asarray(targets, dtype=jnp.float32)
+    if targets.ndim == 2 and targets.shape[-1] == 1:
+        targets = targets[..., 0]
+    logits = model.compute_temporal_completion_logits(rng, prefix_history, train=False)
+    if logits.shape != targets.shape:
+        raise ValueError(f"temporal completion target shape {targets.shape} does not match logits shape {logits.shape}")
     return logits, targets
 
 
@@ -589,6 +646,97 @@ def evaluate_completion(
     raise ValueError(f"unsupported completion objective: {objective!r}")
 
 
+def evaluate_temporal_completion_loader(
+    eval_step,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    data_loader: _data_loader.TemporalDataLoaderImpl,
+) -> tuple[dict[str, float], _temporal_metrics.ThresholdSelection]:
+    """Evaluates natural val rows and selects its conservative threshold."""
+
+    all_logits: list[np.ndarray] = []
+    for batch_index, batch in enumerate(data_loader):
+        logits, _targets = eval_step(jax.random.fold_in(rng, batch_index), state, batch)
+        all_logits.append(np.asarray(jax.device_get(logits)).reshape(-1))
+    if not all_logits:
+        raise ValueError("temporal validation loader produced no examples")
+    rows = data_loader.dataset.samples
+    logits = np.concatenate(all_logits)[: len(rows)]
+    if logits.shape != (len(rows),):
+        raise ValueError(f"temporal validation produced {logits.shape[0]} logits for {len(rows)} rows")
+    scores = _temporal_metrics.stable_sigmoid(logits)
+    selection = _temporal_metrics.select_validation_threshold(rows, scores)
+    report = _temporal_metrics.evaluate_temporal_completion(rows, scores=scores, threshold=selection)
+    metrics = {f"val/temporal/{key}": value for key, value in report.metrics.items()}
+    metrics.update(
+        {
+            "val/temporal/selected_threshold": selection.threshold,
+            "val/temporal/selection_early_events": float(selection.validation_early_trigger_events),
+            "val/temporal/selection_event_recall": selection.validation_event_recall,
+            "val/temporal/selection_event_f1": selection.validation_event_f1,
+        }
+    )
+    return metrics, selection
+
+
+def temporal_validation_rank(metrics: dict[str, float]) -> tuple[float, float, float, float]:
+    """Locked threshold-free checkpoint ordering (larger is better)."""
+
+    keys = (
+        "val/temporal/boundary_top1_rate",
+        "val/temporal/hard_local/auprc",
+        "val/temporal/margin/hard_local_median",
+        "val/temporal/natural/auprc",
+    )
+    values = tuple(float(metrics[key]) for key in keys)
+    # Keep the persisted selection JSON standards-compliant even if a tiny
+    # validation split cannot define one auxiliary metric.
+    return tuple(-1.0e30 if not np.isfinite(value) else value for value in values)
+
+
+def _temporal_cache_binding(
+    data_info: _data_loader.TemporalCompletionDataInfo,
+    *,
+    input_mode: _completion.TemporalInputMode,
+) -> dict[str, str]:
+    metadata = data_info.cache.metadata
+    return {
+        "temporal_input_mode": input_mode,
+        "manifest_fingerprint": data_info.manifest.manifest_fingerprint,
+        "feature_cache_checkpoint_fingerprint": metadata.checkpoint_fingerprint,
+        "feature_cache_rows_fingerprint": metadata.rows_fingerprint,
+        "feature_cache_preprocess_fingerprint": metadata.preprocess_fingerprint,
+        "feature_cache_payload_fingerprint": metadata.feature_payload_fingerprint,
+    }
+
+
+def _write_json_atomically(path: epath.Path, payload: dict[str, Any]) -> None:
+    temporary = epath.Path(f"{path}.tmp.{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(str(temporary), str(path))
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def require_current_temporal_validation_progress(selection: dict[str, Any], *, resumed_step: int) -> int:
+    """Rejects a durable checkpoint paired with a stale validation artifact."""
+
+    value = selection.get("last_validated_checkpoint_step")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("temporal validation selection has an invalid last_validated_checkpoint_step")
+    if value != resumed_step:
+        raise ValueError(
+            "temporal validation selection is stale for the resumed checkpoint: "
+            f"last_validated={value}, resumed={resumed_step}"
+        )
+    return value
+
+
 def compute_epoch_total_steps(steps_per_epoch: int, epochs: int) -> int:
     """Total optimizer steps for epoch-based boundary training.
 
@@ -681,15 +829,23 @@ def main(config: _config.TrainConfig):
     completion_stage = config.completion.stage
     uses_completion_data = config.completion.uses_completion_data
     trains_completion_head = config.completion.trains_completion_head
+    uses_temporal_completion = config.completion.uses_temporal_completion
     completion_data_info = None
+    temporal_data_info = None
     val_data_loader = None
     train_eval_data_loader = None
     pos_weight = None
-    if uses_completion_data:
+    if uses_temporal_completion:
+        temporal_data_info = _data_loader.prepare_temporal_completion_data(config)
+    elif uses_completion_data:
         completion_data_info = _data_loader.prepare_completion_data(config)
     if trains_completion_head:
-        assert completion_data_info is not None
-        if not config.completion.uses_progress_objective:
+        if uses_temporal_completion:
+            assert temporal_data_info is not None
+            pos_weight = 1.0
+        else:
+            assert completion_data_info is not None
+        if not uses_temporal_completion and not config.completion.uses_progress_objective:
             pos_weight = (
                 config.completion.bce_pos_weight_override
                 if config.completion.bce_pos_weight_override is not None
@@ -698,13 +854,22 @@ def main(config: _config.TrainConfig):
             if not config.completion.uses_focal_loss and pos_weight is None:
                 raise ValueError("completion head training requires audited train labels and pos_weight")
 
-    data_loader = _data_loader.create_data_loader(
-        config,
-        split="train",
-        completion_data_info=completion_data_info,
-        sharding=data_sharding,
-        shuffle=True,
-    )
+    if uses_temporal_completion:
+        assert temporal_data_info is not None
+        data_loader = _data_loader.create_temporal_feature_data_loader(
+            config,
+            split="train",
+            temporal_data_info=temporal_data_info,
+            sharding=data_sharding,
+        )
+    else:
+        data_loader = _data_loader.create_data_loader(
+            config,
+            split="train",
+            completion_data_info=completion_data_info,
+            sharding=data_sharding,
+            shuffle=True,
+        )
 
     # Budgeted boundary training: derive steps_per_epoch from the real sampler,
     # then resolve either an integer-epoch or explicit-step budget. Override
@@ -743,15 +908,25 @@ def main(config: _config.TrainConfig):
 
     # The val split is disabled for boundary training (val_groups=0); the merged
     # test split is evaluated only offline, never during training.
-    if trains_completion_head and config.completion.val_groups > 0:
-        val_data_loader = _data_loader.create_data_loader(
-            config,
-            split="val",
-            completion_data_info=completion_data_info,
-            sharding=data_sharding,
-            shuffle=False,
-        )
-        if config.completion.train_episode_limit is not None:
+    has_validation = trains_completion_head and (uses_temporal_completion or config.completion.val_groups > 0)
+    if has_validation:
+        if uses_temporal_completion:
+            assert temporal_data_info is not None
+            val_data_loader = _data_loader.create_temporal_feature_data_loader(
+                config,
+                split="val",
+                temporal_data_info=temporal_data_info,
+                sharding=data_sharding,
+            )
+        else:
+            val_data_loader = _data_loader.create_data_loader(
+                config,
+                split="val",
+                completion_data_info=completion_data_info,
+                sharding=data_sharding,
+                shuffle=False,
+            )
+        if not uses_temporal_completion and config.completion.train_episode_limit is not None:
             train_eval_data_loader = _data_loader.create_data_loader(
                 config,
                 split="train",
@@ -787,17 +962,32 @@ def main(config: _config.TrainConfig):
             resume_epoch,
             skip_batches,
         )
+    elif uses_temporal_completion:
+        temporal_sampler = data_loader.temporal_sampler
+        if temporal_sampler is None:
+            raise ValueError("temporal completion train loader did not expose its batch sampler")
+        temporal_steps_per_epoch = temporal_sampler.steps_per_epoch
+        temporal_sampler.set_epoch(start_step // temporal_steps_per_epoch)
+        temporal_sampler.set_skip_batches(start_step % temporal_steps_per_epoch)
+        logging.info(
+            "Temporal sampler resume: start_step=%d epoch=%d skip_batches=%d steps_per_epoch=%d",
+            start_step,
+            start_step // temporal_steps_per_epoch,
+            start_step % temporal_steps_per_epoch,
+            temporal_steps_per_epoch,
+        )
 
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    if not uses_temporal_completion:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     if uses_completion_data:
         audit_model = nnx.merge(train_state.model_def, train_state.params)
@@ -814,13 +1004,34 @@ def main(config: _config.TrainConfig):
             len(audit.trainable_action),
             len(audit.trainable_completion),
         )
-        assert completion_data_info is not None
-        dataset_metrics = {
-            "dataset/train_episode_count": len(completion_data_info.manifest.episode_ids("train")),
-            "dataset/val_episode_count": len(completion_data_info.manifest.episode_ids("val")),
-            "dataset/test_episode_count": len(completion_data_info.manifest.episode_ids("test")),
-        }
-        if config.completion.uses_progress_objective:
+        if uses_temporal_completion:
+            assert temporal_data_info is not None
+            dataset_metrics = {
+                "dataset/temporal_manifest_schema": float(temporal_data_info.manifest.schema_version),
+                "dataset/temporal_feature_cache_schema": float(temporal_data_info.cache.metadata.schema_version),
+                "dataset/train_trajectory_count": temporal_data_info.manifest.split_counts.train,
+                "dataset/val_trajectory_count": temporal_data_info.manifest.split_counts.val,
+                "dataset/test_trajectory_count": temporal_data_info.manifest.split_counts.test,
+                "dataset/train_candidate_count": temporal_data_info.sample_count("train"),
+                "dataset/val_candidate_count": temporal_data_info.sample_count("val"),
+                "dataset/test_candidate_count": temporal_data_info.sample_count("test"),
+                "dataset/feature_dim": temporal_data_info.cache.metadata.feature_dim,
+                "dataset/history_steps": temporal_data_info.cache.metadata.history_steps,
+                "dataset/effective_pos_weight": 1.0,
+            }
+            temporal_sampler = data_loader.temporal_sampler
+            if temporal_sampler is not None:
+                dataset_metrics.update(
+                    {f"dataset/train_pool_{name}": value for name, value in temporal_sampler.pool_sizes.items()}
+                )
+        else:
+            assert completion_data_info is not None
+            dataset_metrics = {
+                "dataset/train_episode_count": len(completion_data_info.manifest.episode_ids("train")),
+                "dataset/val_episode_count": len(completion_data_info.manifest.episode_ids("val")),
+                "dataset/test_episode_count": len(completion_data_info.manifest.episode_ids("test")),
+            }
+        if not uses_temporal_completion and config.completion.uses_progress_objective:
             dataset_metrics.update(
                 {
                     "dataset/progress_objective": 1.0,
@@ -828,7 +1039,7 @@ def main(config: _config.TrainConfig):
                     "dataset/progress_huber_delta": config.completion.huber_delta,
                 }
             )
-        elif completion_data_info.pos_weight is not None:
+        elif not uses_temporal_completion and completion_data_info.pos_weight is not None:
             dataset_metrics.update(
                 {
                     "dataset/train_positive_count": completion_data_info.train_positive_count,
@@ -898,11 +1109,61 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
     pcompletion_eval_step = None
-    if trains_completion_head and config.completion.val_groups > 0:
+    if has_validation:
         pcompletion_eval_step = jax.jit(
-            completion_eval_step,
+            functools.partial(temporal_completion_eval_step, config)
+            if uses_temporal_completion
+            else completion_eval_step,
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         )
+
+    temporal_selection_path = epath.Path(config.checkpoint_dir) / "best_temporal_validation.json"
+    best_temporal_rank: tuple[float, float, float, float] | None = None
+    best_temporal_step: int | None = None
+    best_temporal_threshold_selection: dict[str, Any] | None = None
+    pending_temporal_selection: dict[str, Any] | None = None
+    if (
+        uses_temporal_completion
+        and resuming
+        and start_step >= config.completion.val_interval
+        and not temporal_selection_path.is_file()
+    ):
+        raise FileNotFoundError(
+            "resumed temporal run has passed validation but lacks an atomically committed best selection"
+        )
+    if uses_temporal_completion and resuming and temporal_selection_path.is_file():
+        assert temporal_data_info is not None
+        previous_selection = json.loads(temporal_selection_path.read_text(encoding="utf-8"))
+        expected_binding = _temporal_cache_binding(
+            temporal_data_info,
+            input_mode=config.completion.temporal_input_mode,
+        )
+        missing_binding = set(expected_binding) - set(previous_selection)
+        if missing_binding:
+            raise ValueError(f"temporal validation selection is missing cache bindings: {sorted(missing_binding)}")
+        for field, expected in expected_binding.items():
+            if previous_selection[field] != expected:
+                raise ValueError(f"temporal validation selection {field} does not match the current cache")
+        best_temporal_rank = tuple(float(value) for value in previous_selection["validation_rank"])
+        best_temporal_step = int(previous_selection["checkpoint_step"])
+        require_current_temporal_validation_progress(
+            previous_selection,
+            resumed_step=start_step,
+        )
+        if len(best_temporal_rank) != 4 or not all(np.isfinite(best_temporal_rank)):
+            raise ValueError("temporal validation selection has an invalid validation_rank")
+        if best_temporal_step <= 0 or best_temporal_step > start_step:
+            raise ValueError(
+                f"temporal validation selection step {best_temporal_step} is incompatible with resumed step {start_step}"
+            )
+        if not (epath.Path(config.checkpoint_dir) / str(best_temporal_step)).is_dir():
+            raise FileNotFoundError(
+                f"temporal validation selection points to missing retained checkpoint {best_temporal_step}"
+            )
+        stored_threshold = previous_selection.get("threshold_selection", {})
+        if stored_threshold.get("selected_on_split") != "val":
+            raise ValueError("resumed temporal threshold was not selected on validation")
+        best_temporal_threshold_selection = dict(stored_threshold)
 
     pbar = tqdm.tqdm(
         range(start_step, total_steps),
@@ -934,30 +1195,69 @@ def main(config: _config.TrainConfig):
         if (
             not is_epoch_based
             and trains_completion_head
-            and config.completion.val_groups > 0
+            and has_validation
             and ((step + 1) % config.completion.val_interval == 0 or step == total_steps - 1)
         ):
             assert pcompletion_eval_step is not None
             assert val_data_loader is not None
-            assert completion_data_info is not None
-            expected_val_count = sum(
-                completion_data_info.episode_audits[episode_id].frame_count
-                for episode_id in completion_data_info.manifest.episode_ids("val")
-            )
-            with sharding.set_mesh(mesh):
-                val_metrics = evaluate_completion(
-                    pcompletion_eval_step,
-                    jax.random.fold_in(train_rng, step + 1),
-                    train_state,
-                    val_data_loader,
-                    expected_count=expected_val_count,
-                    objective=config.completion.objective,
-                    huber_delta=config.completion.huber_delta,
-                )
-            if config.completion.uses_progress_objective:
-                actual_val_count = int(val_metrics["val/frame_count"])
+            if uses_temporal_completion:
+                assert temporal_data_info is not None
+                expected_val_count = temporal_data_info.sample_count("val")
+                with sharding.set_mesh(mesh):
+                    val_metrics, threshold_selection = evaluate_temporal_completion_loader(
+                        pcompletion_eval_step,
+                        jax.random.fold_in(train_rng, step + 1),
+                        train_state,
+                        val_data_loader,
+                    )
+                actual_val_count = int(val_metrics["val/temporal/natural/sample_count"])
+                validation_rank = temporal_validation_rank(val_metrics)
+                if best_temporal_rank is None or validation_rank > best_temporal_rank:
+                    best_temporal_rank = validation_rank
+                    best_temporal_step = int(train_state.step)
+                    best_temporal_threshold_selection = dataclasses.asdict(threshold_selection)
+                    val_metrics["val/temporal/new_best_checkpoint"] = 1.0
+                    val_metrics["val/temporal/best_checkpoint_step"] = float(best_temporal_step)
+                else:
+                    val_metrics["val/temporal/new_best_checkpoint"] = 0.0
+                    val_metrics["val/temporal/best_checkpoint_step"] = float(best_temporal_step)
+                assert best_temporal_rank is not None
+                assert best_temporal_step is not None
+                assert best_temporal_threshold_selection is not None
+                # Commit validation progress after every durable checkpoint,
+                # even when the best model did not change.  On resume this
+                # detects a crash between saving the latest checkpoint and
+                # atomically replacing a stale selection JSON.
+                pending_temporal_selection = {
+                    "checkpoint_step": best_temporal_step,
+                    "last_validated_checkpoint_step": int(train_state.step),
+                    "validation_rank": list(best_temporal_rank),
+                    "threshold_selection": best_temporal_threshold_selection,
+                    **_temporal_cache_binding(
+                        temporal_data_info,
+                        input_mode=config.completion.temporal_input_mode,
+                    ),
+                }
             else:
-                actual_val_count = int(val_metrics["val/positive_count"] + val_metrics["val/negative_count"])
+                assert completion_data_info is not None
+                expected_val_count = sum(
+                    completion_data_info.episode_audits[episode_id].frame_count
+                    for episode_id in completion_data_info.manifest.episode_ids("val")
+                )
+                with sharding.set_mesh(mesh):
+                    val_metrics = evaluate_completion(
+                        pcompletion_eval_step,
+                        jax.random.fold_in(train_rng, step + 1),
+                        train_state,
+                        val_data_loader,
+                        expected_count=expected_val_count,
+                        objective=config.completion.objective,
+                        huber_delta=config.completion.huber_delta,
+                    )
+                if config.completion.uses_progress_objective:
+                    actual_val_count = int(val_metrics["val/frame_count"])
+                else:
+                    actual_val_count = int(val_metrics["val/positive_count"] + val_metrics["val/negative_count"])
             if actual_val_count != expected_val_count:
                 raise ValueError(
                     f"validation loader evaluated {actual_val_count} frames, expected {expected_val_count}"
@@ -1018,8 +1318,22 @@ def main(config: _config.TrainConfig):
                         # as a different step).
                         (dst / "_protected_step.json").write_text(json.dumps({"step": completed}), encoding="utf-8")
                         logging.info("Protected eval checkpoint copy: %s -> %s", src, dst)
-        elif (step % config.save_interval == 0 and step > start_step) or step == total_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        else:
+            completed = int(train_state.step)
+            if completed % config.save_interval == 0 or completed >= total_steps:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, completed)
+                if pending_temporal_selection is not None:
+                    if int(pending_temporal_selection["last_validated_checkpoint_step"]) != completed:
+                        raise AssertionError("pending temporal validation progress does not match the checkpoint saved")
+                    # Commit the selection only after its exact numeric
+                    # checkpoint is durable.  A crash can no longer leave a
+                    # best JSON pointing at a checkpoint that never finished.
+                    checkpoint_manager.wait_until_finished()
+                    retained = epath.Path(config.checkpoint_dir) / str(completed)
+                    if not retained.is_dir():
+                        raise FileNotFoundError(f"temporal checkpoint {completed} was not retained after save")
+                    _write_json_atomically(temporal_selection_path, pending_temporal_selection)
+                    pending_temporal_selection = None
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
@@ -1033,6 +1347,17 @@ def main(config: _config.TrainConfig):
                 f"Predetermined eval checkpoint (step {eval_checkpoint_step}) was deleted by the "
                 f"checkpoint manager (max_to_keep=1) and no protected copy exists. "
                 f"This should not happen — please report this bug."
+            )
+    if uses_temporal_completion:
+        if pending_temporal_selection is not None:
+            raise RuntimeError("temporal validation selection remained uncommitted after checkpointing")
+        if best_temporal_step is None or not temporal_selection_path.is_file():
+            raise FileNotFoundError("temporal training completed without a validation-selected checkpoint")
+        best_checkpoint = epath.Path(config.checkpoint_dir) / str(best_temporal_step)
+        if not best_checkpoint.is_dir():
+            raise FileNotFoundError(
+                f"validation selected step {best_temporal_step}, but its checkpoint was not retained; "
+                "keep_period/save_interval must retain every validation step"
             )
 
 

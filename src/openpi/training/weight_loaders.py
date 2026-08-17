@@ -1,14 +1,15 @@
+from __future__ import annotations
+
 import dataclasses
 import logging
 import re
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import flax.traverse_util
 import numpy as np
 
-import openpi.models.model as _model
-import openpi.shared.array_typing as at
-import openpi.shared.download as download
+if TYPE_CHECKING:
+    import openpi.shared.array_typing as at
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +51,22 @@ class CheckpointWeightLoader(WeightLoader):
     # fully match this expression. The default preserves historical LoRA-only
     # behavior; completion configs explicitly add ``completion_head/.*``.
     missing_regex: str = ".*lora.*"
+    # Frozen-head configs can opt into a fail-closed key audit. Legacy
+    # checkpoint loaders keep the historical permissive subset behavior.
+    reject_unexpected: bool = False
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
+        import openpi.models.model as _model  # noqa: PLC0415
+        import openpi.shared.download as download  # noqa: PLC0415
+
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=self.missing_regex,
+            reject_unexpected=self.reject_unexpected,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +78,8 @@ class PaliGemmaWeightLoader(WeightLoader):
     """
 
     def load(self, params: at.Params) -> at.Params:
+        import openpi.shared.download as download  # noqa: PLC0415
+
         path = download.maybe_download(
             "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz", gs={"token": "anon"}
         )
@@ -76,19 +90,33 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
-def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
+def _merge_params(
+    loaded_params: at.Params,
+    params: at.Params,
+    *,
+    missing_regex: str,
+    reject_unexpected: bool = False,
+) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
     Args:
         loaded_params: The parameters to merge.
         params: The reference parameters.
         missing_regex: A regex pattern for all missing keys that should be merged from the reference parameters.
+        reject_unexpected: Whether to reject checkpoint keys absent from the reference model.
 
     Returns:
         A new dictionary with the merged parameters.
     """
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+
+    if reject_unexpected:
+        unexpected = sorted(set(flat_loaded) - set(flat_ref))
+        if unexpected:
+            preview = ", ".join(unexpected[:10])
+            suffix = "" if len(unexpected) <= 10 else f", ... ({len(unexpected)} total)"
+            raise ValueError(f"checkpoint contains unexpected parameter keys: {preview}{suffix}")
 
     # First, take all weights that are a subset of the reference weights.
     result = {}

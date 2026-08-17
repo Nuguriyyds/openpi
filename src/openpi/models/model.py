@@ -1,5 +1,5 @@
 import abc
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
 import enum
 import logging
@@ -240,7 +240,7 @@ class BaseModelConfig(abc.ABC):
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
-        from openpi.models_pytorch import pi0_pytorch
+        from openpi.models_pytorch import pi0_pytorch  # noqa: PLC0415
 
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
@@ -285,11 +285,25 @@ class BaseModel(nnx.Module, abc.ABC):
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
 
 
+def _restore_args_tree(
+    item: at.PyTree,
+    *,
+    sharding: jax.sharding.Sharding | None,
+    restore_type: type[np.ndarray] | type[jax.Array],
+    dtype: jnp.dtype | Callable[[jax.tree_util.KeyPath], jnp.dtype | None] | None,
+) -> at.PyTree:
+    def restore_arg(path, _value):
+        leaf_dtype = dtype(path) if callable(dtype) else dtype
+        return ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=leaf_dtype)
+
+    return jax.tree_util.tree_map_with_path(restore_arg, item)
+
+
 def restore_params(
     params_path: pathlib.Path | str,
     *,
     restore_type: type[np.ndarray] | type[jax.Array] = jax.Array,
-    dtype: jnp.dtype | None = None,
+    dtype: jnp.dtype | Callable[[jax.tree_util.KeyPath], jnp.dtype | None] | None = None,
     sharding: jax.sharding.Sharding | None = None,
 ) -> at.Params:
     """Restores unstructured params PyTree from a checkpoint.
@@ -300,7 +314,8 @@ def restore_params(
     Args:
         params_path: The local path to the checkpoint directory.
         restore_type: The type to restore the params as. Can be set to `np.ndarray` to load the params as a numpy array.
-        dtype: The dtype to restore all params as. If not provided, will use the original dtype from the checkpoint.
+        dtype: The dtype to restore all params as, or a key-path callback for mixed-precision restore. If not provided,
+            uses each checkpoint leaf's original dtype.
         sharding: The sharding to use for the params. If not provided, the params will be replicated across all devices.
 
     Returns:
@@ -320,8 +335,11 @@ def restore_params(
             params_path,
             ocp.args.PyTreeRestore(
                 item=item,
-                restore_args=jax.tree.map(
-                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
+                restore_args=_restore_args_tree(
+                    item,
+                    sharding=sharding,
+                    restore_type=restore_type,
+                    dtype=dtype,
                 ),
             ),
         )["params"]

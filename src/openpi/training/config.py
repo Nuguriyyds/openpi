@@ -625,6 +625,37 @@ class TrainConfig:
                 raise ValueError("staged completion training is only supported for pi0.5")
             if self.completion.split_manifest_path is None:
                 raise ValueError("completion.split_manifest_path must be set for staged completion training")
+        if self.completion.uses_temporal_completion:
+            if self.training_time_rtc.enabled:
+                raise ValueError("temporal completion v1 must use the clean non-TTRTC checkpoint")
+            if getattr(completion_head, "variant", None) != "temporal_mlp":
+                raise ValueError("temporal completion requires completion_head.variant='temporal_mlp'")
+            if getattr(completion_head, "resolved_pooling", None) != "masked_mean":
+                raise ValueError("temporal completion requires masked-mean prefix pooling")
+            if self.batch_size != (
+                self.completion.temporal_positive_per_batch
+                + self.completion.temporal_hard_negative_per_batch
+                + self.completion.temporal_ordinary_negative_per_batch
+            ):
+                raise ValueError("temporal completion batch_size must equal the configured 21/21/22 composition")
+            if self.save_interval != self.completion.val_interval or self.keep_period != self.completion.val_interval:
+                raise ValueError(
+                    "temporal completion requires save_interval=keep_period=val_interval so every val-selected "
+                    "checkpoint is retained"
+                )
+            if self.num_train_steps % self.completion.val_interval:
+                raise ValueError("temporal completion num_train_steps must end on a validation/checkpoint interval")
+            if not isinstance(self.weight_loader, weight_loaders.CheckpointWeightLoader):
+                raise ValueError("temporal completion requires CheckpointWeightLoader for the clean backbone")
+            expected_params_path = self.completion.temporal_source_checkpoint_path.rstrip("/") + "/params"
+            if self.weight_loader.params_path.rstrip("/") != expected_params_path:
+                raise ValueError(
+                    "temporal completion weight_loader.params_path must match temporal_source_checkpoint_path/params"
+                )
+            if self.weight_loader.missing_regex != r"completion_head/.*":
+                raise ValueError("temporal completion may initialize only completion_head/.* from scratch")
+            if not self.weight_loader.reject_unexpected:
+                raise ValueError("temporal completion requires reject_unexpected=True for clean checkpoint loading")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -896,6 +927,122 @@ _CONFIGS = [
         fsdp_devices=4,
         checkpoint_base_dir="/mnt/data/models/openpi/checkpoints",
         wandb_enabled=False,
+    ),
+    # Clean, non-TTRTC breakfast backbone used to extract the frozen prefix
+    # features for temporal completion.  Register it here so extraction and
+    # training cannot silently construct different preprocessing configs.
+    TrainConfig(
+        name="pi05_730_breakfast_subtasks",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir=(
+                    "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
+                    "breakfast_subtasks_bs64_50k/49999/assets"
+                ),
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/dataset/ei/huggingface",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=64,
+        num_workers=4,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+        wandb_enabled=False,
+    ),
+    # Three-prefix temporal completion MLP.  The loader consumes only the
+    # immutable clean-prefix cache; raw data labels and all legacy completion
+    # samplers are intentionally bypassed.
+    TrainConfig(
+        name="pi05_agilex_breakfast_temporal_completion_head",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(
+                enabled=True,
+                variant="temporal_mlp",
+                pooling="masked_mean",
+                temporal_steps=3,
+                hidden_dim=128,
+                dropout_rate=0.1,
+            ),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir=(
+                    "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
+                    "breakfast_subtasks_bs64_50k/49999/assets"
+                ),
+                asset_id="agilex_make_breakfast_subtask_730",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/dataset/ei/huggingface",
+            ),
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            objective="binary",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v1.json"
+            ),
+            split_seed=42,
+            val_interval=200,
+            warmup_steps=50,
+            peak_lr=1e-4,
+            decay_lr=1e-5,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+            focal_gamma=0.0,
+            bce_pos_weight_override=1.0,
+            temporal_sampling=True,
+            temporal_feature_cache_path=(
+                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v2/features.npz"
+            ),
+            temporal_source_model_config_name="pi05_730_breakfast_subtasks",
+            temporal_input_mode="history",
+            temporal_history_steps=3,
+            temporal_stride_frames=15,
+            temporal_positive_per_batch=21,
+            temporal_hard_negative_per_batch=21,
+            temporal_ordinary_negative_per_batch=22,
+            temporal_hard_negative_ticks=4,
+            temporal_train_fraction=0.72,
+            temporal_val_fraction=0.08,
+            temporal_test_fraction=0.20,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(
+                enabled=True,
+                variant="temporal_mlp",
+                pooling="masked_mean",
+            ),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999/params",
+            missing_regex=r"completion_head/.*",
+            reject_unexpected=True,
+        ),
+        num_train_steps=2_000,
+        ema_decay=None,
+        batch_size=64,
+        log_interval=100,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=1,
+        # The compressed feature cache is resident in the parent process.
+        # Spawned workers would each pickle a full copy; numpy indexing is
+        # cheap enough that the locked temporal loader stays single-process.
+        num_workers=0,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),
     TrainConfig(
         name="pi05_agilex_breakfast_frozen_head_s1_action",
@@ -1655,6 +1802,24 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# Same-head current-prefix control: every field (including model structure,
+# initialization seed, sampler, clean source/cache, and training budget) is
+# inherited from the history experiment.  Only the input transform and config
+# namespace differ, so checkpoints and validation artifacts cannot collide.
+_TEMPORAL_HISTORY_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_agilex_breakfast_temporal_completion_head"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _TEMPORAL_HISTORY_CONFIG,
+        name="pi05_agilex_breakfast_temporal_completion_current_only_head",
+        completion=dataclasses.replace(
+            _TEMPORAL_HISTORY_CONFIG.completion,
+            temporal_input_mode="current_only",
+        ),
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
