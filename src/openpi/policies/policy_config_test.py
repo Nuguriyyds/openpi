@@ -25,3 +25,11 @@ def test_temporal_policy_restore_preserves_native_mixed_precision_checkpoint():
     )
     assert restore_args["params"]["completion_head"]["kernel"].dtype == jnp.float32
     assert restore_args["params"]["PaliGemma"]["kernel"].dtype == jnp.bfloat16
+
+    constant_dtype_args = model_api._restore_args_tree(  # noqa: SLF001
+        {"params": {"kernel": 0}},
+        sharding=None,
+        restore_type=jax.Array,
+        dtype=jnp.bfloat16,
+    )
+    assert constant_dtype_args["params"]["kernel"].dtype == jnp.bfloat16

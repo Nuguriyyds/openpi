@@ -292,8 +292,13 @@ def _restore_args_tree(
     restore_type: type[np.ndarray] | type[jax.Array],
     dtype: jnp.dtype | Callable[[jax.tree_util.KeyPath], jnp.dtype | None] | None,
 ) -> at.PyTree:
+    # JAX scalar dtype classes (for example ``jnp.bfloat16``) are callable,
+    # but they are constants, not key-path callbacks.  Checking ``callable``
+    # alone would invoke the dtype constructor with an Orbax ``DictKey``.
+    is_dtype_callback = callable(dtype) and not isinstance(dtype, type)
+
     def restore_arg(path, _value):
-        leaf_dtype = dtype(path) if callable(dtype) else dtype
+        leaf_dtype = dtype(path) if is_dtype_callback else dtype
         return ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=leaf_dtype)
 
     return jax.tree_util.tree_map_with_path(restore_arg, item)
