@@ -213,7 +213,17 @@ def save_temporal_feature_cache(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
     with temporary_path.open("wb") as file:
-        np.savez(file, metadata_json=np.asarray(metadata.to_json()), prefix_history=history, **_row_arrays(rows))
+        # The history member is GB-scale for the full breakfast set.  The
+        # uncompressed ZIP produced by ``np.savez`` can exceed the file-size
+        # /seek limits of the training volume while closing its central
+        # directory.  Compression keeps the same portable NPZ format and
+        # reduces the temporary file substantially.
+        np.savez_compressed(
+            file,
+            metadata_json=np.asarray(metadata.to_json()),
+            prefix_history=history,
+            **_row_arrays(rows),
+        )
     os.replace(temporary_path, output_path)
     return metadata
 
