@@ -2,8 +2,10 @@
 
 The script is intentionally read-only with respect to both LeRobot datasets.
 It derives each subtask's task index from its parquet rows (never from the
-episode number), verifies the corresponding prompt metadata, and accepts
-full-trajectory identity only through an explicit JSON map.
+episode number) and verifies the corresponding prompt metadata.  The default
+training mode splits logical four-subtask trajectories and needs no identity
+map.  Optional real full-video binding accepts identity only through an
+explicit JSON map.
 
 Identity-map schema::
 
@@ -46,7 +48,7 @@ import pyarrow.parquet as pq
 from openpi.training import temporal_completion_data as temporal_data
 
 IDENTITY_MAP_SCHEMA_VERSION = 3
-AUDIT_SUMMARY_SCHEMA_VERSION = 1
+AUDIT_SUMMARY_SCHEMA_VERSION = 2
 REQUIRED_METADATA_NAMES = ("info.json", "episodes.jsonl", "tasks.jsonl")
 
 
@@ -559,34 +561,50 @@ def build_manifest(
     *,
     subtask_root: str | os.PathLike[str],
     subtask_repo_id: str,
-    full_root: str | os.PathLike[str],
-    full_repo_id: str,
-    identity_map_path: str | os.PathLike[str],
+    full_root: str | os.PathLike[str] | None = None,
+    full_repo_id: str | None = None,
+    identity_map_path: str | os.PathLike[str] | None = None,
 ) -> tuple[temporal_data.TemporalCompletionManifest, Mapping[str, Any]]:
-    """Audits both sources and constructs a sealed in-memory manifest."""
+    """Audits source data and constructs a sealed in-memory manifest."""
 
     subtask_audit = audit_lerobot_dataset(subtask_root, repo_id=subtask_repo_id, subtask=True)
-    full_audit = audit_lerobot_dataset(full_root, repo_id=full_repo_id, subtask=False)
     groups = temporal_data.build_subtask_groups(subtask_audit.subtask_episodes)
-    identity_map = load_identity_matches(
-        identity_map_path,
-        groups=groups,
-        full_episodes=full_audit.full_episodes,
-    )
-    identities = temporal_data.build_trajectory_identities(
-        groups,
-        full_audit.full_episodes,
-        identity_map.matches,
-        identity_map.ambiguities,
-    )
-    manifest = temporal_data.create_temporal_manifest(
-        identities,
-        source_subtask_repo_id=subtask_repo_id,
-        source_subtask_root=subtask_audit.root,
-        source_full_repo_id=full_repo_id,
-        source_full_root=full_audit.root,
-        task_prompts=tuple(subtask_audit.prompts_by_task[index] for index in range(4)),
-    )
+    full_arguments = (full_root, full_repo_id, identity_map_path)
+    if any(value is not None for value in full_arguments) and not all(value is not None for value in full_arguments):
+        raise ValueError("--full-root, --full-repo-id, and --identity-map must be supplied together")
+
+    full_audit: DatasetAudit | None = None
+    identity_map: LoadedIdentityMap | None = None
+    if full_root is None:
+        manifest = temporal_data.create_subtask_temporal_manifest(
+            groups,
+            source_subtask_repo_id=subtask_repo_id,
+            source_subtask_root=subtask_audit.root,
+            task_prompts=tuple(subtask_audit.prompts_by_task[index] for index in range(4)),
+        )
+    else:
+        assert full_repo_id is not None
+        assert identity_map_path is not None
+        full_audit = audit_lerobot_dataset(full_root, repo_id=full_repo_id, subtask=False)
+        identity_map = load_identity_matches(
+            identity_map_path,
+            groups=groups,
+            full_episodes=full_audit.full_episodes,
+        )
+        identities = temporal_data.build_trajectory_identities(
+            groups,
+            full_audit.full_episodes,
+            identity_map.matches,
+            identity_map.ambiguities,
+        )
+        manifest = temporal_data.create_temporal_manifest(
+            identities,
+            source_subtask_repo_id=subtask_repo_id,
+            source_subtask_root=subtask_audit.root,
+            source_full_repo_id=full_repo_id,
+            source_full_root=full_audit.root,
+            task_prompts=tuple(subtask_audit.prompts_by_task[index] for index in range(4)),
+        )
     mapping_counts: dict[str, int] = {}
     exclusion_counts: dict[str, int] = {}
     for trajectory in manifest.trajectories:
@@ -603,15 +621,19 @@ def build_manifest(
             "metadata_files": [str(path) for path in subtask_audit.metadata_files],
             "ordered_prompts": [subtask_audit.prompts_by_task[index] for index in range(4)],
         },
-        "full": {
+        "trajectory_source": manifest.trajectory_source,
+        "full": None
+        if full_audit is None
+        else {
             "root": str(full_audit.root),
             "repo_id": full_repo_id,
             "episode_count": full_audit.episode_count,
             "metadata_files": [str(path) for path in full_audit.metadata_files],
         },
         "identity": {
-            "match_count": len(identity_map.matches),
-            "ambiguity_component_count": len(identity_map.ambiguities),
+            "required": identity_map is not None,
+            "match_count": 0 if identity_map is None else len(identity_map.matches),
+            "ambiguity_component_count": 0 if identity_map is None else len(identity_map.ambiguities),
             "mapping_status_counts": dict(sorted(mapping_counts.items())),
             "exclusion_reason_counts": dict(sorted(exclusion_counts.items())),
         },
@@ -624,9 +646,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--subtask-root", type=pathlib.Path, required=True)
     parser.add_argument("--subtask-repo-id", required=True)
-    parser.add_argument("--full-root", type=pathlib.Path, required=True)
-    parser.add_argument("--full-repo-id", required=True)
-    parser.add_argument("--identity-map", type=pathlib.Path, required=True)
+    parser.add_argument("--full-root", type=pathlib.Path)
+    parser.add_argument("--full-repo-id")
+    parser.add_argument("--identity-map", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument(
         "--audit-summary",
@@ -638,7 +660,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    source_roots = (args.subtask_root.resolve(), args.full_root.resolve())
+    source_roots = (
+        (args.subtask_root.resolve(),)
+        if args.full_root is None
+        else (
+            args.subtask_root.resolve(),
+            args.full_root.resolve(),
+        )
+    )
     output = _require_output_outside_sources(args.output, source_roots=source_roots, context="manifest output")
     audit_summary_path = None
     if args.audit_summary is not None:

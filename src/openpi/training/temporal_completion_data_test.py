@@ -347,6 +347,31 @@ def test_split_counts_for_736_are_exact_and_split_is_deterministic(tmp_path):
     assert not (split_ids["val"] & split_ids["test"])
 
 
+def test_subtask_logical_manifest_needs_no_full_identity_and_materializes_rows(tmp_path):
+    groups = temporal_data.build_subtask_groups(_episodes_for_groups(6, lengths=(45, 45, 45, 45)))
+
+    manifest = temporal_data.create_subtask_temporal_manifest(
+        groups,
+        source_subtask_repo_id="org/breakfast-subtasks",
+        source_subtask_root=tmp_path / "subtasks",
+        task_prompts=("task 0", "task 1", "task 2", "task 3"),
+    )
+
+    assert manifest.schema_version == 3
+    assert manifest.trajectory_source == "subtask_logical"
+    assert manifest.source_full_repo_id is None
+    assert manifest.source_full_root is None
+    assert manifest.split_counts == temporal_data.SplitCounts(train=4, val=1, test=1)
+    assert {record.mapping_status for record in manifest.trajectories} == {"subtask_only"}
+    assert all(record.full_episode_id is None for record in manifest.trajectories)
+
+    test_record = next(record for record in manifest.trajectories if record.split == "test")
+    rows = temporal_data.build_manifest_sample_rows(manifest, "test")
+    assert rows
+    assert {row.trajectory_id for row in rows} == {test_record.trajectory_id}
+    assert {row.full_episode_id for row in rows} == {test_record.group_id}
+
+
 def test_unmatched_full_is_quarantined_before_split(tmp_path):
     manifest = _manifest(tmp_path, count=10, extra_full=1)
 

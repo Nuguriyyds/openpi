@@ -21,13 +21,14 @@ TICK_STRIDE_FRAMES = 15
 TASKS_PER_TRAJECTORY = 4
 TEMPORAL_HISTORY_STEPS = 3
 SPLIT_SEED = 42
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 SPLIT_RATIOS: Mapping[str, float] = {"train": 0.72, "val": 0.08, "test": 0.20}
 
 SplitName = Literal["train", "val", "test"]
 SPLIT_NAMES: tuple[SplitName, ...] = ("train", "val", "test")
 SampleKind = Literal["positive", "hard_negative", "ordinary_negative"]
 MappingStatus = Literal["matched", "subtask_only", "full_only", "ambiguous"]
+TrajectorySource = Literal["subtask_logical", "full_identity"]
 
 
 def _require_exact_keys(value: Mapping[str, Any], expected: set[str], *, context: str) -> None:
@@ -560,11 +561,12 @@ class ManifestTrajectoryRecord:
 class TemporalCompletionManifest:
     source_subtask_repo_id: str
     source_subtask_root: str
-    source_full_repo_id: str
-    source_full_root: str
+    source_full_repo_id: str | None
+    source_full_root: str | None
     task_prompts: tuple[str, str, str, str]
     split_counts: SplitCounts
     trajectories: tuple[ManifestTrajectoryRecord, ...]
+    trajectory_source: TrajectorySource = "full_identity"
     schema_version: int = MANIFEST_SCHEMA_VERSION
     fps: int = FPS
     tick_stride_frames: int = TICK_STRIDE_FRAMES
@@ -577,6 +579,7 @@ class TemporalCompletionManifest:
             "source_subtask_root": self.source_subtask_root,
             "source_full_repo_id": self.source_full_repo_id,
             "source_full_root": self.source_full_root,
+            "trajectory_source": self.trajectory_source,
             "task_prompts": list(self.task_prompts),
             "fps": self.fps,
             "tick_stride_frames": self.tick_stride_frames,
@@ -597,6 +600,7 @@ class TemporalCompletionManifest:
             "source_subtask_root",
             "source_full_repo_id",
             "source_full_root",
+            "trajectory_source",
             "task_prompts",
             "fps",
             "tick_stride_frames",
@@ -612,8 +616,9 @@ class TemporalCompletionManifest:
             schema_version=int(value["schema_version"]),
             source_subtask_repo_id=str(value["source_subtask_repo_id"]),
             source_subtask_root=str(value["source_subtask_root"]),
-            source_full_repo_id=str(value["source_full_repo_id"]),
-            source_full_root=str(value["source_full_root"]),
+            source_full_repo_id=None if value["source_full_repo_id"] is None else str(value["source_full_repo_id"]),
+            source_full_root=None if value["source_full_root"] is None else str(value["source_full_root"]),
+            trajectory_source=value["trajectory_source"],
             task_prompts=tuple(str(item) for item in value["task_prompts"]),  # type: ignore[arg-type]
             fps=int(value["fps"]),
             tick_stride_frames=int(value["tick_stride_frames"]),
@@ -654,12 +659,13 @@ def create_temporal_manifest(
     *,
     source_subtask_repo_id: str,
     source_subtask_root: str | os.PathLike[str],
-    source_full_repo_id: str,
-    source_full_root: str | os.PathLike[str],
+    source_full_repo_id: str | None,
+    source_full_root: str | os.PathLike[str] | None,
     task_prompts: Sequence[str],
+    trajectory_source: TrajectorySource = "full_identity",
     split_seed: int = SPLIT_SEED,
 ) -> TemporalCompletionManifest:
-    """Quarantines invalid identities, then seals test before val/train."""
+    """Quarantines invalid trajectories, then seals test before val/train."""
 
     if split_seed != SPLIT_SEED:
         raise ValueError(f"temporal split_seed is locked to {SPLIT_SEED}, got {split_seed}")
@@ -677,8 +683,9 @@ def create_temporal_manifest(
 
     eligible: list[TrajectoryIdentityRecord] = []
     exclusion_by_id: dict[str, str] = {}
+    eligible_status = "matched" if trajectory_source == "full_identity" else "subtask_only"
     for identity in identities:
-        if identity.mapping_status != "matched":
+        if identity.mapping_status != eligible_status:
             exclusion_by_id[identity.trajectory_id] = identity.exclusion_reason or "unmatched_identity"
             continue
         assert identity.group is not None
@@ -710,14 +717,52 @@ def create_temporal_manifest(
         source_subtask_repo_id=source_subtask_repo_id,
         source_subtask_root=str(pathlib.Path(source_subtask_root).resolve()),
         source_full_repo_id=source_full_repo_id,
-        source_full_root=str(pathlib.Path(source_full_root).resolve()),
+        source_full_root=None if source_full_root is None else str(pathlib.Path(source_full_root).resolve()),
         task_prompts=task_prompts,  # type: ignore[arg-type]
         split_counts=counts,
         trajectories=records,
+        trajectory_source=trajectory_source,
         split_seed=split_seed,
     )
     validate_temporal_manifest(manifest)
     return manifest
+
+
+def create_subtask_temporal_manifest(
+    groups: Sequence[SubtaskGroupRecord],
+    *,
+    source_subtask_repo_id: str,
+    source_subtask_root: str | os.PathLike[str],
+    task_prompts: Sequence[str],
+    split_seed: int = SPLIT_SEED,
+) -> TemporalCompletionManifest:
+    """Seals a leakage-safe split over logical four-subtask trajectories.
+
+    This training-only mode deliberately does not claim correspondence with a
+    real full-video episode.  ``group_id`` is used as the stable trajectory
+    grouping key when sample rows are materialized.
+    """
+
+    identities = tuple(
+        TrajectoryIdentityRecord(
+            trajectory_id=f"subtask-{group.group_id:06d}",
+            mapping_status="subtask_only",
+            group=group,
+            full_episode=None,
+            exclusion_reason="full_identity_not_required_for_logical_training",
+        )
+        for group in groups
+    )
+    return create_temporal_manifest(
+        identities,
+        source_subtask_repo_id=source_subtask_repo_id,
+        source_subtask_root=source_subtask_root,
+        source_full_repo_id=None,
+        source_full_root=None,
+        task_prompts=task_prompts,
+        trajectory_source="subtask_logical",
+        split_seed=split_seed,
+    )
 
 
 def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
@@ -729,8 +774,15 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
         raise ValueError(f"manifest timing must be {FPS} fps with stride {TICK_STRIDE_FRAMES}")
     if manifest.split_seed != SPLIT_SEED:
         raise ValueError(f"manifest split_seed must be {SPLIT_SEED}")
-    if not manifest.source_subtask_repo_id or not manifest.source_full_repo_id:
-        raise ValueError("manifest source repo IDs must not be empty")
+    if not manifest.source_subtask_repo_id:
+        raise ValueError("manifest source_subtask_repo_id must not be empty")
+    if manifest.trajectory_source not in ("subtask_logical", "full_identity"):
+        raise ValueError(f"manifest has invalid trajectory_source {manifest.trajectory_source!r}")
+    if manifest.trajectory_source == "full_identity":
+        if not manifest.source_full_repo_id or not manifest.source_full_root:
+            raise ValueError("full_identity manifest requires a full dataset source")
+    elif manifest.source_full_repo_id is not None or manifest.source_full_root is not None:
+        raise ValueError("subtask_logical manifest must not bind a full dataset source")
     if len(manifest.task_prompts) != TASKS_PER_TRAJECTORY or any(
         not prompt.strip() for prompt in manifest.task_prompts
     ):
@@ -739,7 +791,7 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
         raise ValueError("manifest task prompts must be distinct")
     if not pathlib.Path(manifest.source_subtask_root).is_absolute():
         raise ValueError("manifest source_subtask_root must be absolute")
-    if not pathlib.Path(manifest.source_full_root).is_absolute():
+    if manifest.source_full_root is not None and not pathlib.Path(manifest.source_full_root).is_absolute():
         raise ValueError("manifest source_full_root must be absolute")
     seen_trajectory_ids: set[str] = set()
     seen_group_ids: set[int] = set()
@@ -778,7 +830,18 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
         elif record.full_length is not None:
             raise ValueError(f"trajectory {record.trajectory_id} has full_length without full_episode_id")
 
-        if record.mapping_status == "matched":
+        if manifest.trajectory_source == "subtask_logical" and record.mapping_status == "subtask_only":
+            if group is None or record.full_episode_id is not None:
+                raise ValueError(f"logical trajectory {record.trajectory_id} has invalid identity fields")
+            reasons = reachability_exclusion_reasons(group)
+            if record.split is None:
+                if not reasons or record.exclusion_reason != ";".join(reasons):
+                    raise ValueError(
+                        f"logical trajectory {record.trajectory_id} is unsplit without exact reachability quarantine"
+                    )
+            elif reasons or record.exclusion_reason is not None:
+                raise ValueError(f"split logical trajectory {record.trajectory_id} is invalid or quarantined")
+        elif record.mapping_status == "matched":
             if group is None or record.full_episode_id is None:
                 raise ValueError(f"matched trajectory {record.trajectory_id} lacks group/full identity")
             reasons = reachability_exclusion_reasons(group)
@@ -1003,12 +1066,13 @@ def build_manifest_sample_rows(manifest: TemporalCompletionManifest, split: Spli
     for record in manifest.trajectories:
         if record.split != split:
             continue
-        assert record.full_episode_id is not None
+        trajectory_numeric_id = record.full_episode_id if record.full_episode_id is not None else record.group_id
+        assert trajectory_numeric_id is not None
         rows.extend(
             build_temporal_sample_rows(
                 record.as_group(),
                 trajectory_id=record.trajectory_id,
-                full_episode_id=record.full_episode_id,
+                full_episode_id=trajectory_numeric_id,
                 split=split,
             )
         )

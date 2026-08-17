@@ -166,6 +166,59 @@ def test_cli_audits_parquet_identity_and_seals_trajectory_split(tmp_path, capsys
     assert json.loads(capsys.readouterr().out) == summary
 
 
+def test_cli_builds_subtask_logical_split_without_identity_map(tmp_path, capsys) -> None:
+    subtask_root = tmp_path / "subtasks"
+    _make_dataset(
+        subtask_root,
+        list(range(24)),
+        length=45,
+        task_by_episode={episode_id: episode_id % 4 for episode_id in range(24)},
+    )
+    output_path = tmp_path / "output" / "manifest.json"
+    summary_path = tmp_path / "output" / "audit.json"
+
+    build_manifest.main(
+        [
+            "--subtask-root",
+            str(subtask_root),
+            "--subtask-repo-id",
+            "test/subtasks",
+            "--output",
+            str(output_path),
+            "--audit-summary",
+            str(summary_path),
+        ]
+    )
+
+    manifest = temporal_data.load_temporal_manifest(output_path)
+    assert manifest.trajectory_source == "subtask_logical"
+    assert manifest.source_full_repo_id is None
+    assert manifest.split_counts.to_dict() == {"train": 4, "val": 1, "test": 1}
+    assert {record.mapping_status for record in manifest.trajectories} == {"subtask_only"}
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["trajectory_source"] == "subtask_logical"
+    assert summary["full"] is None
+    assert summary["identity"]["required"] is False
+    assert json.loads(capsys.readouterr().out) == summary
+
+
+def test_manifest_builder_rejects_partial_full_identity_arguments(tmp_path) -> None:
+    subtask_root = tmp_path / "subtasks"
+    _make_dataset(
+        subtask_root,
+        list(range(4)),
+        length=45,
+        task_by_episode={episode_id: episode_id % 4 for episode_id in range(4)},
+    )
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        build_manifest.build_manifest(
+            subtask_root=subtask_root,
+            subtask_repo_id="test/subtasks",
+            full_root=tmp_path / "full",
+        )
+
+
 def test_metadata_listing_includes_every_nested_regular_meta_file(tmp_path) -> None:
     root = tmp_path / "dataset"
     _make_dataset(root, [0], length=1, task_by_episode={0: 0})

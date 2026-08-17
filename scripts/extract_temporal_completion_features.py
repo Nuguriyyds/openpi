@@ -33,7 +33,7 @@ DEFAULT_CHECKPOINT = Path(
 )
 DEFAULT_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730")
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/dataset/ei/huggingface")
-DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2.json")
+DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json")
 DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz")
 
 
@@ -275,10 +275,10 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
         raise ValueError(
             f"dataset_root {dataset_root} does not match sealed manifest root {manifest.source_subtask_root}"
         )
-    assert_safe_output(
-        output,
-        [dataset_root, Path(manifest.source_full_root).resolve(), checkpoint, manifest_path.parent],
-    )
+    protected_roots = [dataset_root, checkpoint, manifest_path.parent]
+    if manifest.source_full_root is not None:
+        protected_roots.append(Path(manifest.source_full_root).resolve())
+    assert_safe_output(output, protected_roots)
 
     os.environ["HF_LEROBOT_HOME"] = str(args.hf_lerobot_home.resolve())
     config = training_config.get_config(args.config_name)

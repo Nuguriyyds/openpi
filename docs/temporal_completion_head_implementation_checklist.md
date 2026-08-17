@@ -175,14 +175,14 @@ prompt 必须在 `PromptFromLeRobotTask`、`InjectDefaultPrompt` 等自动 promp
 
 ### 4.1 划分单位
 
-唯一划分单位是已完成映射的真实完整 trajectory。每个 full episode 对应的四个 subtask episode、由它们生成的所有 tick、缓存特征和增强视图必须进入同一个 split。
+当前训练阶段唯一划分单位是由四个 subtask episode 组成的 logical trajectory。该 group 生成的所有 tick、缓存特征和 prompt 视图必须进入同一个 split，不要求先映射真实 full episode。
 
 划分前置条件：
 
-1. 先对齐 full episode 与四个 subtask episode。
-2. 只对 `mapping_status == matched` 且四段审计通过的 trajectory 划分。
-3. full-only、subtask-only、歧义匹配或异常轨迹进入 quarantine，不参与监督 train/val/test。
-4. 映射不能只依赖 `episode_id // 4`；还要用 metadata、task 顺序以及可用的状态/动作/图像边界证据校验。
+1. 每四个 subtask episode 组成一个 group，并用 parquet/metadata 校验 task 顺序为 0/1/2/3。
+2. 只对四段完整且每个正 tick 都满足三帧历史可达性的 logical trajectory 划分。
+3. 缺段、task 顺序错误、正 tick 不可达或其他异常轨迹进入 quarantine。
+4. 真实 full-video 评测前另做 identity mapping；full episode 继承对应 logical group 已封存的 split，不能重新随机划分。
 
 禁止：
 
@@ -215,7 +215,7 @@ test  = 20%
 
   对合法 trajectory 做固定 seed shuffle 后，依次分配 test、val、train，并把实际数量写入 manifest。不能依赖不同库的默认 `round` 行为。
 - 精确数量由合法 trajectory 数量决定；不要在代码中硬编码 736、530 等计数。
-- 若最终恰有 736 个合法 matched trajectory，预期计数是 `train=530, val=59, test=147`；代码仍需按通用取整规则计算并审计总和。
+- 若最终恰有 736 个合法 logical trajectory，预期计数是 `train=530, val=59, test=147`；代码仍需按通用取整规则计算并审计总和。
 - test manifest 创建后不可在训练脚本中重写。
 - 任何为超参数、checkpoint、阈值或模型选择读取 test label 的路径都应直接报错。
 
@@ -225,8 +225,9 @@ test  = 20%
 
 ```text
 schema_version
+trajectory_source = subtask_logical | full_identity
 source_subtask_repo_id / absolute_root
-source_full_repo_id / absolute_root
+source_full_repo_id / absolute_root (subtask_logical 时为 null)
 fps
 tick_stride_frames
 split_seed
@@ -238,12 +239,12 @@ lengths[4]
 boundaries[4]
 positive_ticks[4]
 split
-full_episode_id
+full_episode_id (subtask_logical 时为 null)
 mapping_status
 exclusion_reason (nullable)
 ```
 
-manifest 还应记录输入 metadata 文件的 hash 或稳定指纹，避免数据改变后继续使用旧划分。
+按当前决定不计算内容哈希；数据发生变化时必须主动重新生成版本化 manifest/cache。
 
 ## 5. 训练样本索引
 
@@ -585,7 +586,7 @@ controller 必须能运行在：
 - 建议新增 `scripts/build_temporal_completion_manifest.py`
   - 只读源数据，生成版本化 split/sample manifest。
 - 建议新增 `scripts/align_breakfast_trajectory_identity.py`
-  - 在 split 前建立 full episode 与 subtask group 的身份映射；输出 matched/quarantine 清单。
+  - 在真实 full-video 评测前建立 full episode 与已划分 subtask group 的身份映射；输出 matched/quarantine 清单并继承 group split。
 - 建议新增 `scripts/extract_temporal_prefix_features.py`
   - clean checkpoint 特征缓存。
 - 建议新增 `scripts/evaluate_temporal_completion.py`
@@ -623,8 +624,9 @@ controller 必须能运行在：
 - 同 trajectory 的所有 source episodes/ticks/prompts 同 split。
 - 比例取整和最终计数写入 manifest。
 - manifest schema、轨迹映射和 split 内容不合法时拒绝加载。
-- 737/736 的 unmatched 情况显式记录，不静默按 episode id 偏移。
-- full test episode 对应的四个 subtask episode 与 train subtask 集合交集必须为空。
+- logical training manifest 不读取或要求 full dataset/identity map。
+- full-video 评测 manifest 中，737/736 的 unmatched 情况显式记录，不静默按 episode id 偏移。
+- full episode 必须继承对应 logical group 的 split，不能在 identity mapping 后重新划分。
 
 ### sampler 单测
 
@@ -676,8 +678,9 @@ controller 必须能运行在：
 ## 14. 实现顺序
 
 1. **只读数据审计与 manifest**
-   - 审计 2944 subtask episode、736 group 和 737 full episode。
-   - 先完成 full episode ↔ subtask group 的 trajectory identity mapping；歧义/unmatched 进入 quarantine。
+   - 当前训练先审计 2944 subtask episode 和 736 logical group。
+   - 当前逻辑轨迹训练直接按四段 subtask group 划分，不要求 full episode identity mapping。
+   - 真实 full-video 评测前再建立 full episode ↔ subtask group identity mapping；歧义/unmatched 进入 quarantine。
    - 生成固定 72/8/20 split，不读取 test 特征做选择。
 2. **纯索引标签器**
    - 实现 logical trajectory、`Bi/Ci`、source mapping、prompt/reset 和 triplet index。
@@ -694,7 +697,8 @@ controller 必须能运行在：
 6. **prompt controller 与 closed-loop 评测**
    - 先在虚拟拼接轨迹上验证。
 7. **真实完整轨迹对齐与最终 test**
-   - 在 step 1 已确定的 identity pair 内做 full-video frame boundary alignment。
+   - 建立 full episode 与已封存 logical group 的 identity pair，再做 full-video frame boundary alignment。
+   - full episode 继承 logical group split；歧义/unmatched 只影响真实 full-video 评测资格，不回写训练 split。
    - 按 full-frame 边界重新计算真实完整轨迹的 `B_i/C_i`，不复用虚拟 concat 累计长度。
    - 冻结 threshold/trigger 规则后才运行 20% test。
 
@@ -705,8 +709,8 @@ controller 必须能运行在：
 - 所有纳入轨迹都有四个顺序正确的 subtask。
 - 每个 task 恰好一个正 tick，历史精确为前两个 2 Hz tick。
 - split 在 trajectory 层完全隔离；test 未被训练/阈值选择读取。
-- full test 对应的所有 subtask source episode 与 train source episode 零交集。
-- 737/736 mismatch 有明确审计报告和 exclusion/mapping 记录。
+- 进入 full-video test 后，对应 logical group 必须来自已封存 test split，与 train source episode 零交集。
+- 真实 full-video 评测阶段对 737/736 mismatch 给出明确审计报告和 exclusion/mapping 记录。
 
 训练层：
 

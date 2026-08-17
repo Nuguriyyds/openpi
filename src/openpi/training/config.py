@@ -991,7 +991,7 @@ _CONFIGS = [
             stage="head",
             objective="binary",
             split_manifest_path=(
-                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2.json"
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json"
             ),
             split_seed=42,
             val_interval=200,

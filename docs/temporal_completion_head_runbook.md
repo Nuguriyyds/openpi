@@ -7,7 +7,7 @@
 
 已实现：
 
-- full episode 与四段 subtask group 的证据绑定、歧义 quarantine、72/8/20 trajectory split；
+- 四段 subtask group 构成逻辑轨迹并做 72/8/20 trajectory split；
 - 严格全局 2 Hz tick、每个边界唯一正标签、同 prompt 三帧历史；
 - clean pi0.5 masked-mean prefix cache（feature-cache schema v3）；
 - FP32 temporal MLP、unweighted BCE、21/21/22 train sampler、自然 val/test；
@@ -30,12 +30,12 @@
 subtask dataset:
 /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730
 
-full dataset:
-/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730
-
 clean checkpoint:
 /mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999
 ```
+
+真实 full-video 评测阶段才额外读取
+`/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730`。
 
 所有生成物必须写到 `/mnt/data/models/wyt/...` 的新目录，不得写入或覆盖上述 dataset/checkpoint。
 
@@ -44,34 +44,30 @@ schema、显式路径/config、prompt、canonical rows、shape、dtype 和数值
 
 ## 运行顺序
 
-### 1. 准备 identity map
+### 1. 封存逻辑轨迹 manifest
 
-先生成人工审计过的 identity map schema v3。精确 JSON 结构见
-`scripts/build_temporal_completion_manifest.py` 顶部示例。它只记录明确的
-group/full episode 对应关系与歧义项，不需要证据文件哈希。
-
-### 2. 封存 manifest
+当前训练阶段不需要 identity map，也不读取 full dataset。脚本直接将每四个
+subtask episode 组成一条逻辑轨迹，再以轨迹为单位封存 train/val/test split。
 
 ```bash
 uv run scripts/build_temporal_completion_manifest.py \
   --subtask-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
   --subtask-repo-id modanqing/agilex_make_breakfast_subtask_730 \
-  --full-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730 \
-  --full-repo-id modanqing/agilex_make_breakfast_730 \
-  --identity-map /mnt/data/models/wyt/split_manifests/breakfast_identity_v3.json \
-  --output /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2.json \
-  --audit-summary /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2_audit.json
+  --output /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json \
+  --audit-summary /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3_audit.json
 ```
 
-必须人工检查 audit summary 中的 `matched/ambiguous/subtask_only/full_only` 数量和最终 train/val/test 数量。
+必须人工检查 audit summary 中的 group 数量、reachability exclusion 和最终 train/val/test 数量。
+只有以后进行真实 full-video 评测时，才同时传入 `--full-root`、`--full-repo-id`
+和 `--identity-map`，生成独立的 `full_identity` manifest。
 
-### 3. 提取一次共享 prefix cache
+### 2. 提取一次共享 prefix cache
 
 必须在最终代码版本上提取。代码不计算内容哈希；运行时通过 manifest 行、prompt、config 名称和 checkpoint 路径检查 cache。
 
 ```bash
 uv run scripts/extract_temporal_completion_features.py \
-  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v2.json \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json \
   --config-name pi05_730_breakfast_subtasks \
   --checkpoint /mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999 \
   --dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
@@ -80,7 +76,7 @@ uv run scripts/extract_temporal_completion_features.py \
 
 history/current-only 共用这一份 cache；不要复制数据集，也不要复用旧 10-frame positive cache。
 
-### 4. 拟合线性 current-prefix 信息 probe
+### 3. 拟合线性 current-prefix 信息 probe
 
 ```bash
 uv run scripts/fit_temporal_current_only_probe.py \
