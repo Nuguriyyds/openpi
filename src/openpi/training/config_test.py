@@ -26,7 +26,9 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
     assert not clean.training_time_rtc.enabled
     assert not clean.model.completion_head.enabled
     assert clean.data.repo_id == "modanqing/agilex_make_breakfast_subtask_730"
+    assert clean.data.assets.asset_id == "agilex_make_breakfast_subtasks"
     assert temporal.data.repo_id == clean.data.repo_id
+    assert temporal.data.assets.asset_id == clean.data.assets.asset_id
     assert not temporal.training_time_rtc.enabled
     assert temporal.completion.uses_temporal_completion
     assert not temporal.completion.requires_completion_labels

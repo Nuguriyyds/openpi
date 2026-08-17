@@ -941,7 +941,7 @@ _CONFIGS = [
                     "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
                     "breakfast_subtasks_bs64_50k/49999/assets"
                 ),
-                asset_id="agilex_make_breakfast_subtask_730",
+                asset_id="agilex_make_breakfast_subtasks",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -980,7 +980,7 @@ _CONFIGS = [
                     "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
                     "breakfast_subtasks_bs64_50k/49999/assets"
                 ),
-                asset_id="agilex_make_breakfast_subtask_730",
+                asset_id="agilex_make_breakfast_subtasks",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
