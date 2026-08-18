@@ -1,14 +1,25 @@
-"""Offline evaluation and visualization for completion head checkpoints.
+"""Offline evaluation and visualization for the single-frame completion head.
 
-Evaluates one or more S2 completion-head checkpoints on the held-out **test**
-split and writes complete, independent reports (HTML + JSON + JSONL + CSV).
+Evaluates one or more S2 completion-head checkpoints on a split selected from
+the persisted leak-free manifest (``--split {train,val,test}``; default
+``test``) and writes complete, independent reports (HTML + JSON + JSONL + CSV).
 Pass ``--export-mp4`` to additionally render one annotated MP4 per episode.
 
-The completion head outputs a binary "is the episode about to end?" logit per
-frame. Unlike the progress script (which predicts a continuous 0→1 curve),
-here the ground-truth label is 0 everywhere except the last 2 frames (=1).
-The visualisation therefore plots sigmoid scores and the 0/1 target, plus
-per-episode detection metrics (precision, recall, F1 at the best threshold).
+The head outputs a single binary "is the episode about to end?" logit per
+frame from the current frame's image and prompt alone (pi0.5 frozen prefix →
+completion head). This evaluator never defines or regenerates completion
+labels: it only reads the existing ``completion`` target that the labeled
+dataset already carries. The positive/negative rule for each episode is a
+property of the dataset (see ``openpi.training.completion_data``), not of this
+script.
+
+For ``--split train`` the evaluator answers two separate questions from one
+inference pass over every train frame: (1) how the model scores the full
+training trajectories (``metrics_all_frames``), and (2) whether it has fit the
+frames actually sampled during training (``metrics_train_sampled``). The
+training-sample membership is computed by reusing
+``build_boundary_train_sample_set`` with the stride / forced-first-N values
+taken from the training config, never by hand-rewriting the sampler rules.
 """
 
 from __future__ import annotations
@@ -41,8 +52,14 @@ DEFAULT_CHECKPOINT_BASE = Path("/mnt/data/models/wyt/checkpoints")
 DEFAULT_EVALUATION_BASE = Path("/mnt/data/models/wyt/evaluations")
 DEFAULT_DATASET_ROOT = Path("/mnt/data/models/wyt/data/agilex_make_breakfast_subtask_730_frozen_head")
 DEFAULT_CHECKPOINT_STEPS = ("200", "1000", "latest")
+DEFAULT_SPLIT = "test"
+SPLIT_CHOICES = ("train", "val", "test")
 TOP_VIDEO_KEY = "observation.image.top"
 LABEL_KEY = "completion"
+# Single-frame model description shown in every report header. Hard-coded so
+# the report can never accidentally advertise the temporal/three-frame scheme.
+MODEL_INPUT_DESCRIPTION = "current-frame prefix only"
+TRAIN_SAMPLE_RULE_DESCRIPTION = "all positives + stride-sampled negatives"
 
 
 def _list_collate(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -214,6 +231,118 @@ def _frame_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, float |
     }
 
 
+def _safe_percentile(values: np.ndarray, percentile: float) -> float | None:
+    if len(values) == 0:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=np.float64), percentile))
+
+
+def _average_precision(scores: np.ndarray, targets: np.ndarray) -> float | None:
+    """Area under the precision-recall curve (average precision).
+
+    Returns ``None`` when the slice contains only one class, so a degenerate
+    train subset can never crash the report. Computed by the standard
+    descending-score cumulative sum: AP = sum_k (R_k - R_{k-1}) * P_k.
+    """
+
+    positives = targets == 1
+    negative_count = int(np.sum(~positives))
+    positive_count = int(np.sum(positives))
+    if positive_count == 0 or negative_count == 0:
+        return None
+    order = np.argsort(-scores, kind="mergesort")
+    sorted_targets = targets[order]
+    cumulative_tp = np.cumsum(sorted_targets == 1)
+    cumulative_fp = np.cumsum(sorted_targets == 0)
+    recall = cumulative_tp / positive_count
+    precision = cumulative_tp / np.maximum(cumulative_tp + cumulative_fp, 1)
+    # Average precision: sum over recall deltas of precision at each new
+    # positive. Vectorized by only counting steps where recall increases.
+    recall_delta = np.concatenate(([recall[0]], np.diff(recall)))
+    return float(np.sum(recall_delta * precision))
+
+
+def _train_fit_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, Any]:
+    """Frame-level train-fit metrics with score-separation diagnostics.
+
+    Unlike ``_frame_metrics`` (the fixed test/episode metric set reused by the
+    boundary evaluator), this adds AUPRC, score percentiles, and the
+    ``positive_median - negative_p95`` separation gap requested for judging
+    whether the single-frame head has fit the training data. Single-class
+    slices return ``None`` for AUPRC/ROC-AUC instead of a placeholder.
+    """
+
+    logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+    scores = _sigmoid(logits)
+    positives = targets == 1
+    negatives = ~positives
+    positive_count = int(np.sum(positives))
+    negative_count = int(np.sum(negatives))
+    sample_count = len(targets)
+    bce = float(np.mean(np.logaddexp(0.0, logits) - targets * logits)) if sample_count else 0.0
+
+    positive_scores = scores[positives]
+    negative_scores = scores[negatives]
+
+    auprc = _average_precision(scores, targets)
+    if positive_count == 0 or negative_count == 0:
+        auc: float | None = None
+    else:
+        ranks = _rankdata(scores)
+        auc = float(
+            (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2)
+            / (positive_count * negative_count)
+        )
+
+    predictions_05 = scores >= 0.5
+    tp_05 = int(np.sum(np.logical_and(predictions_05, positives)))
+    fp_05 = int(np.sum(np.logical_and(predictions_05, negatives)))
+    fn_05 = int(np.sum(np.logical_and(~predictions_05, positives)))
+    tn_05 = int(np.sum(np.logical_and(~predictions_05, negatives)))
+    precision_05 = tp_05 / max(tp_05 + fp_05, 1)
+    recall_05 = tp_05 / max(tp_05 + fn_05, 1)
+    f1_05 = 2.0 * precision_05 * recall_05 / max(precision_05 + recall_05, np.finfo(np.float64).eps)
+    best_f1, best_threshold, best_precision, best_recall = _best_threshold_f1(scores, targets)
+
+    positive_p50 = _safe_percentile(positive_scores, 50)
+    negative_p95 = _safe_percentile(negative_scores, 95)
+    positive_median_minus_negative_p95: float | None
+    if positive_p50 is not None and negative_p95 is not None:
+        positive_median_minus_negative_p95 = float(positive_p50 - negative_p95)
+    else:
+        positive_median_minus_negative_p95 = None
+
+    return {
+        "sample_count": sample_count,
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "positive_fraction": float(positive_count / sample_count) if sample_count else 0.0,
+        "bce": bce,
+        "auprc": auprc,
+        "auc": auc,
+        "precision_at_0.5": precision_05,
+        "recall_at_0.5": recall_05,
+        "f1_at_0.5": f1_05,
+        "positive_score_mean": float(np.mean(positive_scores)) if positive_count else 0.0,
+        "positive_score_p10": _safe_percentile(positive_scores, 10),
+        "positive_score_p50": positive_p50,
+        "positive_score_p90": _safe_percentile(positive_scores, 90),
+        "negative_score_mean": float(np.mean(negative_scores)) if negative_count else 0.0,
+        "negative_score_p90": _safe_percentile(negative_scores, 90),
+        "negative_score_p95": negative_p95,
+        "negative_score_p99": _safe_percentile(negative_scores, 99),
+        "negative_score_max": float(np.max(negative_scores)) if negative_count else None,
+        "positive_median_minus_negative_p95": positive_median_minus_negative_p95,
+        # Diagnostic only — never used to choose the deployment threshold.
+        "best_f1": best_f1,
+        "best_threshold": best_threshold,
+        "best_precision": best_precision,
+        "best_recall": best_recall,
+        "confusion_matrix": {"tp": tp_05, "fp": fp_05, "fn": fn_05, "tn": tn_05},
+    }
+
+
 def _first_crossing(values: np.ndarray, threshold: float) -> int | None:
     indices = np.flatnonzero(values >= threshold)
     return None if len(indices) == 0 else int(indices[0])
@@ -355,6 +484,159 @@ def compute_metrics(prediction_file: Path, *, fps: float, threshold: float) -> d
     }
 
 
+def _train_fit_metric_set(
+    logits: np.ndarray,
+    targets: np.ndarray,
+    *,
+    episode_indices: np.ndarray,
+    task_indices: np.ndarray,
+    frame_indices: np.ndarray,
+) -> dict[str, Any]:
+    """Overall + per-task + per-episode train-fit metrics for one frame slice.
+
+    ``_train_fit_metrics`` is used at every level so AUPRC, score percentiles,
+    and the ``positive_median - negative_p95`` gap are reported uniformly.
+    Episodes are sorted by episode index; per-task keys are the task index as a
+    string (matching ``compute_metrics``).
+    """
+
+    episode_rows: list[dict[str, Any]] = []
+    for episode_index in sorted(np.unique(episode_indices).tolist()):
+        mask = episode_indices == episode_index
+        order = np.argsort(frame_indices[mask])
+        episode_task_indices = np.unique(task_indices[mask])
+        if len(episode_task_indices) != 1:
+            raise ValueError(f"Episode {episode_index}: expected one task index, got {episode_task_indices.tolist()}")
+        episode_rows.append(
+            {
+                "episode_index": int(episode_index),
+                "task_index": int(episode_task_indices[0]),
+                **_train_fit_metrics(logits[mask][order], targets[mask][order]),
+            }
+        )
+
+    per_task: dict[str, Any] = {}
+    for task_index in sorted(np.unique(task_indices).tolist()):
+        frame_mask = task_indices == task_index
+        per_task[str(int(task_index))] = _train_fit_metrics(logits[frame_mask], targets[frame_mask])
+
+    return {
+        "overall": _train_fit_metrics(logits, targets),
+        "per_task": per_task,
+        "episodes": episode_rows,
+    }
+
+
+def _compute_train_fit_metrics(prediction_file: Path) -> dict[str, Any]:
+    """Two train-fit metric sets from one prediction file.
+
+    ``metrics_all_frames`` scores every frame in the train split; the model is
+    expected to separate positives from negatives well here. ``metrics_train_sampled``
+    restricts to exactly the frames ``BoundaryCompletionSampler`` trained on
+    (``is_train_sample == True``): if the head has memorized the sampled set, its
+    numbers will look better here than on ``metrics_all_frames``. Both sets reuse
+    ``_train_fit_metrics`` (AUPRC, percentiles, separation gap); single-class
+    slices return ``None`` for AUPRC / ROC-AUC rather than a placeholder.
+    """
+
+    with np.load(prediction_file, allow_pickle=False) as values:
+        episode_indices = values["episode_index"]
+        task_indices = values["task_index"]
+        frame_indices = values["frame_index"]
+        logits = values["logit"]
+        targets = values["target"]
+        is_train_sample = values["is_train_sample"].astype(bool, copy=False)
+
+    logits = np.asarray(logits, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.int64)
+    sampled = np.asarray(is_train_sample, dtype=bool)
+
+    return {
+        "metrics_all_frames": _train_fit_metric_set(
+            logits,
+            targets,
+            episode_indices=episode_indices,
+            task_indices=task_indices,
+            frame_indices=frame_indices,
+        ),
+        "metrics_train_sampled": _train_fit_metric_set(
+            logits[sampled],
+            targets[sampled],
+            episode_indices=episode_indices[sampled],
+            task_indices=task_indices[sampled],
+            frame_indices=frame_indices[sampled],
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  Boundary train-sample mask (reuses the training sampler exactly)            #
+# --------------------------------------------------------------------------- #
+
+
+def _build_boundary_train_sample_sets(
+    dataset_meta: Any,
+    episode_ids: list[int],
+    *,
+    label_key: str,
+    stride: int,
+    forced_first_n: int,
+) -> dict[int, np.ndarray]:
+    """Per-episode local frame indices that ``BoundaryCompletionSampler`` used.
+
+    Mirrors ``evaluate_completion_boundary._build_sparse_sets`` but reads the
+    dataset root, per-episode parquet path, and episode length from the already
+    loaded ``LeRobotDatasetMetadata`` and forwards the dataset's
+    ``boundary_excluded_episode_indices`` so short / excluded episodes audit
+    exactly as they did during training. The sample set itself comes from
+    ``build_boundary_train_sample_set`` (all positives + every-stride ordinary
+    negatives + forced first-N negatives), never from a hand-rewritten rule.
+    """
+
+    from openpi.training import completion_data as _completion_data
+
+    root = Path(dataset_meta.root)
+    info = _read_json(root / "meta" / "info.json")
+    excluded_episode_ids = tuple(int(value) for value in info.get("boundary_excluded_episode_indices", []))
+
+    sample_sets: dict[int, np.ndarray] = {}
+    for episode_id in episode_ids:
+        parquet_path = root / dataset_meta.get_data_file_path(episode_id)
+        expected_length = int(dataset_meta.episodes[episode_id]["length"])
+        group_start = (episode_id // _completion_data.BOUNDARY_GROUP) * _completion_data.BOUNDARY_GROUP
+        group_episode_ids = tuple(range(group_start, group_start + _completion_data.BOUNDARY_GROUP))
+        group_position = episode_id % _completion_data.BOUNDARY_GROUP
+        audit = _completion_data.audit_boundary_completion_episode_parquet(
+            parquet_path,
+            episode_id=episode_id,
+            expected_length=expected_length,
+            group_episode_ids=group_episode_ids,
+            group_position=group_position,
+            label_key=label_key,
+            excluded_episode_ids=excluded_episode_ids,
+        )
+        sample_sets[episode_id] = _completion_data.build_boundary_train_sample_set(
+            audit, stride=stride, forced_first_n=forced_first_n
+        )
+    return sample_sets
+
+
+def _train_sample_mask(
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    sample_sets: dict[int, np.ndarray],
+) -> np.ndarray:
+    """Boolean mask selecting predictions that fall in the training sample sets."""
+
+    mask = np.zeros(len(episode_indices), dtype=bool)
+    for episode_id, sparse_frames in sample_sets.items():
+        episode_mask = episode_indices == episode_id
+        if not np.any(episode_mask):
+            continue
+        mask[episode_mask] = np.isin(frame_indices[episode_mask], sparse_frames)
+    return mask
+
+
 # --------------------------------------------------------------------------- #
 #  Checkpoint evaluation worker (runs in a subprocess)                         #
 # --------------------------------------------------------------------------- #
@@ -426,11 +708,16 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
     # the completion head both branch on it with a Python ``if train:``.
     compute_fn = nnx_utils.module_jit(model.compute_completion_logits, static_argnames="train")
 
-    # Determine test episodes from the split manifest.
+    # Determine the episodes to evaluate from the split manifest. ``--split`` is
+    # forwarded by the parent process; the boundary evaluator invokes this worker
+    # without it, so fall back to ``test`` to preserve the old behavior.
+    split = getattr(args, "split", DEFAULT_SPLIT)
+    if split not in SPLIT_CHOICES:
+        raise ValueError(f"unsupported split {split!r}; expected one of {SPLIT_CHOICES}")
     manifest_path = config.completion.split_manifest_path
     manifest = _completion_data.SplitManifest.from_dict(json.loads(Path(manifest_path).read_text(encoding="utf-8")))
-    test_episode_ids = manifest.episode_ids("test")
-    LOGGER.info("Test episodes (%d): %s", len(test_episode_ids), test_episode_ids)
+    episode_ids = list(manifest.episode_ids(split))
+    LOGGER.info("Split=%s episodes (%d): %s", split, len(episode_ids), episode_ids)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
     dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id)
@@ -440,14 +727,30 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
     episode_to = dataset.episode_data_index["to"]
 
     frame_specs: list[tuple[int, int, int]] = []  # (episode_index, local_frame, dataset_index)
-    for episode_index in test_episode_ids:
+    for episode_index in episode_ids:
         start = int(episode_from[episode_index])
         end = int(episode_to[episode_index])
         frame_specs.extend((episode_index, local_frame, start + local_frame) for local_frame in range(end - start))
 
+    # For the train split, mark which frames the BoundaryCompletionSampler
+    # actually trained on. The mask is computed by reusing the training sampler
+    # (build_boundary_train_sample_set) with the config's stride / forced-first-N
+    # values, so it can never drift from what training saw. val/test frames are
+    # never training samples, so the mask is left empty and filled with False.
+    train_sample_sets: dict[int, np.ndarray] = {}
+    if split == "train":
+        train_sample_sets = _build_boundary_train_sample_sets(
+            dataset_meta,
+            episode_ids,
+            label_key=config.completion.label_key,
+            stride=config.completion.negative_stride,
+            forced_first_n=config.completion.boundary_copy_frames,
+        )
+
     LOGGER.info(
-        "Evaluating %d test episodes (%d frames), batch_size=%d, data_workers=%d",
-        len(test_episode_ids),
+        "Evaluating %d %s-split episodes (%d frames), batch_size=%d, data_workers=%d",
+        len(episode_ids),
+        split,
         len(frame_specs),
         args.batch_size,
         args.num_workers,
@@ -538,16 +841,32 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
             LOGGER.info("Checkpoint %s: %d/%d frames", checkpoint_dir.name, completed, len(frame_specs))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    episode_index_array = np.asarray(result_episode_indices, dtype=np.int32)
+    frame_index_array = np.asarray(result_frame_indices, dtype=np.int32)
+    is_train_sample = _train_sample_mask(
+        episode_index_array,
+        frame_index_array,
+        train_sample_sets,
+    )
+    if split == "train":
+        sampled_count = int(np.sum(is_train_sample))
+        LOGGER.info(
+            "Train-sample mask: %d / %d frames are training samples",
+            sampled_count,
+            len(is_train_sample),
+        )
     with tempfile.TemporaryDirectory(prefix="completion-eval-") as tmp:
         local_output = Path(tmp) / "predictions.npz"
         np.savez_compressed(
             local_output,
-            episode_index=np.asarray(result_episode_indices, dtype=np.int32),
+            episode_index=episode_index_array,
             task_index=np.asarray(result_task_indices, dtype=np.int16),
-            frame_index=np.asarray(result_frame_indices, dtype=np.int32),
+            frame_index=frame_index_array,
             logit=np.asarray(result_logits, dtype=np.float32),
             target=np.asarray(result_targets, dtype=np.float32),
             infer_ms=np.asarray(result_infer_ms, dtype=np.float32),
+            is_train_sample=is_train_sample,
+            split=np.asarray(split),
         )
         with local_output.open("rb") as src, output_path.open("wb") as dst:
             shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
@@ -602,6 +921,13 @@ def _load_report_series(
         frame_indices = values["frame_index"]
         logits = values["logit"]
         targets = values["target"]
+        # Old (pre-split) prediction files lack the training-sample mask; treat
+        # every frame as a non-sample so the report still renders. Train-mode
+        # resume refuses such files earlier, so reaching here all-false is safe.
+        if "is_train_sample" in values.files:
+            is_train_sample = values["is_train_sample"].astype(bool, copy=False)
+        else:
+            is_train_sample = np.zeros(len(targets), dtype=bool)
 
     videos_dir = output_dir / "videos"
     if copy_videos:
@@ -640,6 +966,14 @@ def _load_report_series(
 
         episode_logits = logits[mask][order]
         episode_scores = _sigmoid(episode_logits)
+        episode_targets = targets[mask][order]
+        episode_sampled = is_train_sample[mask][order]
+        # Local frame indices (0..frame_count-1, the plot x-axis positions) that
+        # the BoundaryCompletionSampler trained on, split by their target label
+        # so the HTML can draw sampled positives and sampled negatives with
+        # distinct markers. Empty for val/test (mask is all False there).
+        sampled_positive_frames = np.flatnonzero(episode_sampled & (episode_targets == 1)).astype(int).tolist()
+        sampled_negative_frames = np.flatnonzero(episode_sampled & (episode_targets == 0)).astype(int).tolist()
         series.append(
             {
                 "episode_index": episode_index,
@@ -650,7 +984,9 @@ def _load_report_series(
                 "video": video_path,
                 "source_video": str(source_video),
                 "score": episode_scores.astype(float).tolist(),
-                "target": targets[mask][order].astype(float).tolist(),
+                "target": episode_targets.astype(float).tolist(),
+                "sampled_positive_frames": sampled_positive_frames,
+                "sampled_negative_frames": sampled_negative_frames,
                 "metrics": metrics_by_episode[episode_index],
             }
         )
@@ -723,6 +1059,10 @@ def _html_document(manifest: dict[str, Any]) -> str:
             .legend span::before {
               content: ""; display: inline-block; width: 18px; height: 3px; margin: 0 6px 3px 0; background: var(--line);
             }
+            .legend span.marker::before {
+              width: 10px; height: 10px; border-radius: 50%; margin: 0 8px 1px 0; background: var(--marker);
+            }
+            .legend span.marker.square::before { border-radius: 2px; }
             canvas {
               display: block; width: 100%; height: 290px; margin-top: 8px;
               border-radius: 10px; background: #10172a; cursor: crosshair;
@@ -738,7 +1078,11 @@ def _html_document(manifest: dict[str, Any]) -> str:
         <body>
           <main>
             <h1>Checkpoint <span id="checkpoint"></span> | completion head</h1>
-            <p class="subtitle">Held-out test episodes. Top camera and raw sigmoid scores vs binary target.</p>
+            <p class="subtitle">
+              Split: <strong id="split-label"></strong>
+              &middot; Model input: current-frame prefix only
+              &middot; Training sample rule: all positives + stride-sampled negatives
+            </p>
             <div class="toolbar">
               <div class="field">
                 <label for="episode-select">Episode</label>
@@ -763,7 +1107,9 @@ def _html_document(manifest: dict[str, Any]) -> str:
               <div class="legend">
                 <span style="--line:#66d9a5">Target (0/1)</span>
                 <span style="--line:#ffad5a">Predicted score (sigmoid)</span>
-                <span style="--line:#b49cff">Best threshold</span>
+                <span class="marker" style="--marker:#66d9a5">Sampled positive</span>
+                <span class="marker square" style="--marker:#5a8cff">Sampled negative</span>
+                <span style="--line:#b49cff">Threshold</span>
               </div>
               <canvas id="plot" aria-label="Score and target by frame"></canvas>
               <p class="hint">The vertical cursor follows the video. Click the curve to seek.</p>
@@ -886,6 +1232,27 @@ def _html_document(manifest: dict[str, Any]) -> str:
               drawSeries(episode.target, "#66d9a5", 2);
               drawSeries(episode.score, "#ffad5a", 2);
 
+              // Sampled training frames (train split only): a solid marker on
+              // the score curve for sampled positives, a different color/shape
+              // (square) for sampled negatives. Non-sampled frames stay as
+              // curve only. Both lists are empty for val/test splits.
+              function drawSampled(frames, color, shape) {
+                if (!frames) return;
+                frames.forEach(function(index) {
+                  var px = x(index), py = y(episode.score[index]);
+                  context.beginPath();
+                  context.fillStyle = color;
+                  if (shape === "square") {
+                    context.rect(px - 3.5, py - 3.5, 7, 7);
+                  } else {
+                    context.arc(px, py, 4, 0, Math.PI * 2);
+                  }
+                  context.fill();
+                });
+              }
+              drawSampled(episode.sampled_positive_frames, "#66d9a5", "circle");
+              drawSampled(episode.sampled_negative_frames, "#5a8cff", "square");
+
               const boundedFrame = Math.max(0, Math.min(episode.frame_count - 1, frame));
               const cursorX = x(boundedFrame);
               context.strokeStyle = "#eef2ff";
@@ -957,6 +1324,7 @@ def _html_document(manifest: dict[str, Any]) -> str:
               select.append(option);
             });
             document.getElementById("checkpoint").textContent = String(REPORT.checkpoint_step);
+            document.getElementById("split-label").textContent = String(REPORT.split || "test");
             select.addEventListener("change", function() { loadEpisode(Number(select.value)); });
             document.getElementById("previous").addEventListener("click", function() {
               loadEpisode(selectedIndex - 1);
@@ -1309,9 +1677,9 @@ def _export_mp4_report(
 # --------------------------------------------------------------------------- #
 
 
-def _comparison_row(step: int, metrics: dict[str, Any]) -> dict[str, Any]:
+def _comparison_row(step: int, metrics: dict[str, Any], *, split: str) -> dict[str, Any]:
     overall = metrics["overall"]
-    row: dict[str, Any] = {"checkpoint_step": step}
+    row: dict[str, Any] = {"checkpoint_step": step, "split": split}
     for key in (
         "frame_count",
         "positive_count",
@@ -1353,17 +1721,19 @@ def _write_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def _run_checkpoint_worker(
+def _checkpoint_worker_command(
     args: argparse.Namespace,
     *,
     checkpoint_dir: Path,
     prediction_file: Path,
-) -> None:
-    command = [
+) -> list[str]:
+    return [
         sys.executable,
         str(Path(__file__).resolve()),
         "--config-name",
         args.config_name,
+        "--split",
+        args.split,
         "--batch-size",
         str(args.batch_size),
         "--seed",
@@ -1375,10 +1745,132 @@ def _run_checkpoint_worker(
         "--worker-output",
         str(prediction_file),
     ]
+
+
+def _run_checkpoint_worker(
+    args: argparse.Namespace,
+    *,
+    checkpoint_dir: Path,
+    prediction_file: Path,
+) -> None:
+    command = _checkpoint_worker_command(args, checkpoint_dir=checkpoint_dir, prediction_file=prediction_file)
     environment = os.environ.copy()
     environment["HF_LEROBOT_HOME"] = str(args.hf_lerobot_home.resolve())
     LOGGER.info("Starting isolated checkpoint evaluation: %s", checkpoint_dir.name)
     subprocess.run(command, check=True, env=environment)
+
+
+# --------------------------------------------------------------------------- #
+#  Resume / report-episode selection                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _read_prediction_split(prediction_file: Path) -> str | None:
+    """Returns the split a prediction file was generated for, or ``None``.
+
+    ``None`` means the file predates the ``--split`` feature (old test-only
+    evaluator); such files carry no ``is_train_sample`` mask and cannot resume a
+    train run.
+    """
+
+    with np.load(prediction_file, allow_pickle=False) as values:
+        if "split" in values.files:
+            return str(values["split"])
+    return None
+
+
+def _assert_prediction_split_matches(prediction_file: Path, expected_split: str) -> None:
+    stored_split = _read_prediction_split(prediction_file)
+    if stored_split is None:
+        if expected_split == "train":
+            raise ValueError(
+                f"Cannot resume train evaluation from {prediction_file}: it predates the "
+                "split field and has no training-sample mask. Re-run without --resume."
+            )
+        if expected_split != "test":
+            raise ValueError(
+                f"Cannot resume {expected_split}-split evaluation from {prediction_file}: "
+                "it predates the split field."
+            )
+        LOGGER.warning("Resuming test evaluation from a legacy prediction file (no split field): %s", prediction_file)
+        return
+    if stored_split != expected_split:
+        raise ValueError(
+            f"Prediction file {prediction_file} was generated for split {stored_split!r}, "
+            f"cannot resume as {expected_split!r}."
+        )
+
+
+def _auto_select_episodes(series: list[dict[str, Any]], max_episodes: int) -> list[dict[str, Any]]:
+    """Deterministic, task-balanced subselection including best/median/worst BCE.
+
+    Reserves one slot each for the global lowest (best), median, and highest
+    (worst) episode BCE, then fills the remaining slots round-robin across the
+    four tasks (sorted task index), taking each task's episodes in ascending
+    BCE order and skipping any already selected. The result is sorted by
+    episode index for stable display.
+    """
+
+    by_episode = {ep["episode_index"]: ep for ep in series}
+    ordered_by_bce = sorted(series, key=lambda ep: (float(ep["metrics"]["bce"]), ep["episode_index"]))
+    selected_ids: set[int] = set()
+    ordered: list[int] = []
+
+    def take(ep: dict[str, Any]) -> None:
+        if ep["episode_index"] not in selected_ids:
+            selected_ids.add(ep["episode_index"])
+            ordered.append(ep["episode_index"])
+
+    if max_episodes >= 1 and ordered_by_bce:
+        take(ordered_by_bce[0])  # best (lowest BCE)
+    if max_episodes >= 2 and len(ordered_by_bce) > 1:
+        take(ordered_by_bce[-1])  # worst (highest BCE)
+    if max_episodes >= 3 and len(ordered_by_bce) > 2:
+        take(ordered_by_bce[len(ordered_by_bce) // 2])  # median
+
+    by_task: dict[int, list[dict[str, Any]]] = {}
+    for ep in series:
+        by_task.setdefault(int(ep["task_index"]), []).append(ep)
+    task_queues = {
+        task_index: iter(sorted(eps, key=lambda ep: (float(ep["metrics"]["bce"]), ep["episode_index"])))
+        for task_index, eps in by_task.items()
+    }
+
+    remaining = max_episodes - len(ordered)
+    while remaining > 0:
+        progressed = False
+        for task_index in sorted(task_queues):
+            if remaining <= 0:
+                break
+            candidate = next(task_queues[task_index], None)
+            if candidate is not None and candidate["episode_index"] not in selected_ids:
+                take(candidate)
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    return [by_episode[eid] for eid in sorted(ordered)]
+
+
+def _select_report_episodes(
+    series: list[dict[str, Any]],
+    *,
+    max_episodes: int,
+    episode_ids: tuple[int, ...],
+) -> list[dict[str, Any]]:
+    """Choose which episodes to visualize (HTML/MP4 only; never affects metrics)."""
+
+    if episode_ids:
+        wanted = {int(value) for value in episode_ids}
+        selected = [ep for ep in series if ep["episode_index"] in wanted]
+        missing = sorted(wanted - {ep["episode_index"] for ep in selected})
+        if missing:
+            raise ValueError(f"--report-episode-ids not found in this split: {missing}")
+        return selected
+    if max_episodes <= 0 or len(series) <= max_episodes:
+        return series
+    return _auto_select_episodes(series, max_episodes)
 
 
 def _run_evaluation(args: argparse.Namespace) -> Path:
@@ -1396,13 +1888,14 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     steps = _resolve_checkpoint_steps(checkpoint_root, args.checkpoints)
     if args.output_dir is None:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
-        output_dir = (args.evaluation_base / args.exp_name / timestamp).resolve()
+        output_dir = (args.evaluation_base / args.exp_name / args.split / timestamp).resolve()
     else:
         output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=args.resume)
     _setup_logging(output_dir)
     started_at = datetime.now(UTC)
     LOGGER.info("Evaluation output: %s", output_dir)
+    LOGGER.info("Split: %s", args.split)
     LOGGER.info("Dataset: %s", dataset_root)
     LOGGER.info("Checkpoint steps: %s", steps)
 
@@ -1414,6 +1907,7 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         checkpoint_output.mkdir(exist_ok=args.resume)
         prediction_file = checkpoint_output / "predictions.npz"
         if args.resume and prediction_file.is_file():
+            _assert_prediction_split_matches(prediction_file, args.split)
             LOGGER.info("Reusing completed checkpoint predictions: %s", prediction_file)
         else:
             _run_checkpoint_worker(
@@ -1423,55 +1917,73 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             )
 
         metrics = compute_metrics(prediction_file, fps=fps, threshold=args.threshold)
-        checkpoint_summary = {
+        checkpoint_summary: dict[str, Any] = {
             "checkpoint_step": step,
             "checkpoint_dir": str(checkpoint_dir),
             "dataset_root": str(dataset_root),
+            "split": args.split,
             "threshold": args.threshold,
             "overall": metrics["overall"],
             "per_task": metrics["per_task"],
         }
+        if args.split == "train":
+            # Two train-fit metric sets from the same predictions: all train
+            # frames vs only the frames the BoundaryCompletionSampler trained on.
+            train_fit = _compute_train_fit_metrics(prediction_file)
+            checkpoint_summary["metrics_all_frames"] = train_fit["metrics_all_frames"]
+            checkpoint_summary["metrics_train_sampled"] = train_fit["metrics_train_sampled"]
         _write_json(checkpoint_output / "summary.json", checkpoint_summary)
         _write_jsonl(checkpoint_output / "episodes.jsonl", metrics["episodes"])
 
         report_dir = checkpoint_output / "report"
-        series, _ = _load_report_series(
+        full_series, _ = _load_report_series(
             dataset_root,
             prediction_file,
             metrics["episodes"],
             output_dir=report_dir,
             copy_videos=args.copy_videos,
         )
+        # Visualize a capped, task-balanced subset for the train split (which has
+        # hundreds of episodes); this never trims inference, metrics, or npz.
+        report_series = _select_report_episodes(
+            full_series,
+            max_episodes=args.report_max_episodes,
+            episode_ids=args.report_episode_ids,
+        )
         manifest = {
             "checkpoint_step": step,
+            "split": args.split,
             "created_at_utc": datetime.now(UTC).isoformat(),
             "dataset_root": str(dataset_root),
             "threshold": args.threshold,
             "top_camera_key": TOP_VIDEO_KEY,
-            "episodes": series,
+            "episodes": report_series,
         }
         _write_html_report(report_dir, manifest)
         if args.export_mp4:
             _export_mp4_report(
-                series,
+                report_series,
                 report_dir / "mp4",
                 checkpoint_step=step,
                 threshold=args.threshold,
                 ffmpeg=args.ffmpeg,
             )
 
-        comparison_rows.append(_comparison_row(step, metrics))
+        comparison_rows.append(_comparison_row(step, metrics, split=args.split))
         checkpoint_summaries.append(
             {
                 **checkpoint_summary,
                 "checkpoint_output": str(checkpoint_output),
                 "html_report": str(report_dir / "index.html"),
                 "mp4_directory": str(report_dir / "mp4") if args.export_mp4 else None,
+                "reported_episode_count": len(report_series),
+                "total_episode_count": len(full_series),
             }
         )
         LOGGER.info(
-            "Completed checkpoint %s: AUC=%.4f best_f1=%.4f report=%s",
+            "Completed checkpoint %s (%s-split): AUC=%.4f best_f1=%.4f report=%s",
             step,
+            args.split,
             metrics["overall"]["auc"],
             metrics["overall"]["best_f1"],
             report_dir / "index.html",
@@ -1483,6 +1995,7 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
         "result": "success",
         "config_name": args.config_name,
         "experiment_name": args.exp_name,
+        "split": args.split,
         "dataset_root": str(dataset_root),
         "checkpoint_root": str(checkpoint_root),
         "checkpoint_steps": steps,
@@ -1492,6 +2005,8 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             "threshold": args.threshold,
             "copy_videos": args.copy_videos,
             "export_mp4": args.export_mp4,
+            "report_max_episodes": args.report_max_episodes,
+            "report_episode_ids": list(args.report_episode_ids),
         },
         "started_at_utc": started_at.isoformat(),
         "finished_at_utc": finished_at.isoformat(),
@@ -1511,6 +2026,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluation-base", type=Path, default=DEFAULT_EVALUATION_BASE)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--hf-lerobot-home", type=Path, default=DEFAULT_HF_LEROBOT_HOME)
+    parser.add_argument(
+        "--split",
+        choices=SPLIT_CHOICES,
+        default=DEFAULT_SPLIT,
+        help="Manifest split to evaluate (default: test). train runs every train frame and "
+        "adds the metrics_all_frames / metrics_train_sampled train-fit metric sets.",
+    )
     parser.add_argument(
         "--checkpoints",
         nargs="+",
@@ -1538,6 +2060,12 @@ def _parse_args() -> argparse.Namespace:
         help="Score threshold for detection metrics. The best-threshold F1 is always reported separately.",
     )
     parser.add_argument(
+        "--copy-videos",
+        dest="copy_videos",
+        action="store_true",
+        help="Copy dataset videos into each HTML report (overrides the train-split default).",
+    )
+    parser.add_argument(
         "--no-copy-videos",
         dest="copy_videos",
         action="store_false",
@@ -1546,12 +2074,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--export-mp4",
         action="store_true",
-        help="Also export one top-camera-plus-score MP4 for every test episode and checkpoint.",
+        help="Also export one top-camera-plus-score MP4 for every reported episode and checkpoint.",
     )
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable used by --export-mp4.")
+    parser.add_argument(
+        "--report-max-episodes",
+        type=int,
+        default=0,
+        help="Cap the number of episodes visualized in the HTML/MP4 report (0 = all). "
+        "Never affects inference, metrics, or predictions.npz.",
+    )
+    parser.add_argument(
+        "--report-episode-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Visualize exactly these episode indices (overrides --report-max-episodes).",
+    )
     parser.add_argument("--worker-checkpoint", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
-    parser.set_defaults(copy_videos=True)
+    # copy_videos defaults to None so the split can pick a sensible default: the
+    # train split has hundreds of episodes, so copying every video is wasteful
+    # unless explicitly requested.
+    parser.set_defaults(copy_videos=None)
     args = parser.parse_args()
 
     if args.batch_size < 1:
@@ -1562,8 +2107,14 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--threshold must be in (0, 1]")
     if not args.checkpoints:
         parser.error("--checkpoints cannot be empty")
+    if args.report_max_episodes < 0:
+        parser.error("--report-max-episodes must be non-negative")
     if (args.worker_checkpoint is None) != (args.worker_output is None):
         parser.error("--worker-checkpoint and --worker-output must be provided together")
+    if args.copy_videos is None:
+        args.copy_videos = args.split != "train"
+    if args.report_episode_ids is None:
+        args.report_episode_ids = ()
     return args
 
 
