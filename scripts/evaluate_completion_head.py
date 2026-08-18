@@ -225,7 +225,7 @@ def _frame_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, float |
     best_f1, best_threshold, best_precision, best_recall = _best_threshold_f1(scores, targets)
     auc = _roc_auc(scores, targets)
     return {
-        "frame_count": int(len(targets)),
+        "frame_count": len(targets),
         "positive_count": positive_count,
         "negative_count": negative_count,
         "bce": bce,
@@ -967,6 +967,7 @@ def _load_report_series(
     if copy_videos:
         videos_dir.mkdir(parents=True, exist_ok=True)
 
+    copied_videos = 0
     series: list[dict[str, Any]] = []
     for episode_index in sorted(metrics_by_episode.keys()):
         mask = episode_indices == episode_index
@@ -993,7 +994,11 @@ def _load_report_series(
             raise FileNotFoundError(f"Top-camera video not found: {source_video}")
         if copy_videos:
             destination = videos_dir / f"episode_{episode_index:06d}.mp4"
-            shutil.copy2(source_video, destination)
+            # Idempotent: skip re-copying on --resume so regenerating a report
+            # (e.g. changing --report-max-episodes) never re-reads the source videos.
+            if not destination.is_file():
+                shutil.copy2(source_video, destination)
+                copied_videos += 1
             video_path = destination.relative_to(output_dir).as_posix()
         else:
             video_path = source_video.as_uri()
@@ -1023,6 +1028,12 @@ def _load_report_series(
                 "sampled_negative_frames": sampled_negative_frames,
                 "metrics": metrics_by_episode[episode_index],
             }
+        )
+    if copy_videos:
+        LOGGER.info(
+            "Report videos: copied %d, reused %d already-present",
+            copied_videos,
+            len(series) - copied_videos,
         )
     return series, info
 

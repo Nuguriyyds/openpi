@@ -505,6 +505,67 @@ def test_load_report_series_attaches_sampled_frames(tmp_path):
     assert episode["sampled_negative_frames"] == [0]
 
 
+def _make_video_dataset(tmp_path: Path) -> tuple[Path, Path]:
+    """Minimal dataset (1 episode, 4 frames) with a top-camera video file."""
+
+    root = tmp_path / "dataset"
+    (root / "videos" / "chunk-0" / "episode_000000").mkdir(parents=True)
+    (root / "meta").mkdir(parents=True)
+    info = {
+        "fps": 10.0,
+        "chunks_size": 1000,
+        "video_path": "videos/chunk-{episode_chunk}/episode_{episode_index:06d}/{video_key}.mp4",
+    }
+    (root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    (root / "meta" / "tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task": "make breakfast"}) + "\n", encoding="utf-8"
+    )
+    (root / "meta" / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": 0, "length": 4, "task_index": 0}) + "\n", encoding="utf-8"
+    )
+    (root / "videos" / "chunk-0" / "episode_000000" / f"{ech.TOP_VIDEO_KEY}.mp4").write_bytes(b"video-bytes")
+    prediction_file = tmp_path / "predictions.npz"
+    np.savez_compressed(
+        prediction_file,
+        episode_index=np.array([0, 0, 0, 0], dtype=np.int32),
+        task_index=np.array([0, 0, 0, 0], dtype=np.int16),
+        frame_index=np.array([0, 1, 2, 3], dtype=np.int32),
+        logit=np.array([-2.0, -2.0, -2.0, 2.0], dtype=np.float32),
+        target=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        is_train_sample=np.array([1, 0, 0, 1], dtype=bool),
+        split=np.asarray("train"),
+    )
+    return root, prediction_file
+
+
+def test_load_report_series_copy_videos_is_idempotent(tmp_path):
+    root, prediction_file = _make_video_dataset(tmp_path)
+    report_dir = tmp_path / "report"
+    episode_metrics = [{"episode_index": 0, "task_index": 0, "bce": 0.1, "auc": 1.0, "best_f1": 1.0}]
+
+    first, _ = ech._load_report_series(  # noqa: SLF001
+        root, prediction_file, episode_metrics, output_dir=report_dir, copy_videos=True
+    )
+    copied_video = report_dir / "videos" / "episode_000000.mp4"
+    assert copied_video.is_file()
+    # HTML references the video by a relative path, not a file:// URI.
+    assert first[0]["video"] == "videos/episode_000000.mp4"
+    assert not first[0]["video"].startswith("file://")
+
+    # Mark the copied video; a re-copy would overwrite this marker back to the
+    # source bytes (shutil.copy2 preserves the source's content, not ours).
+    with copied_video.open("ab") as handle:
+        handle.write(b"-marker")
+    marked = copied_video.read_bytes()
+
+    # Second call (simulating --resume) must NOT re-copy the already-present video.
+    second, _ = ech._load_report_series(  # noqa: SLF001
+        root, prediction_file, episode_metrics, output_dir=report_dir, copy_videos=True
+    )
+    assert copied_video.read_bytes() == marked  # marker survived -> not re-copied
+    assert second[0]["video"] == "videos/episode_000000.mp4"
+
+
 # --------------------------------------------------------------------------- #
 #  Evaluation-scope group selection (--train-group-count)                       #
 # --------------------------------------------------------------------------- #
