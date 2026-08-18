@@ -82,7 +82,8 @@ class _LogisticProbe:
         standardized = (np.asarray(values, dtype=np.float32) - self.mean) / self.scale
         logits = standardized @ self.weight + self.bias
         logits = np.clip(logits, -80.0, 80.0)
-        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float64)
+        positive = (1.0 / (1.0 + np.exp(-logits))).astype(np.float64)
+        return np.stack([1.0 - positive, positive], axis=1)
 
 
 def _integer(value: Any, *, context: str) -> int:
@@ -503,6 +504,66 @@ def extract_prefix_features(
     return features, int(model.prefix_feature_dim)
 
 
+def save_feature_cache(
+    path: Path,
+    features: Mapping[tuple[int, int], np.ndarray],
+    *,
+    feature_dim: int,
+) -> None:
+    """Save the extracted frame features before any classifier is fitted."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = sorted(features)
+    if not keys:
+        raise ValueError("cannot save an empty feature cache")
+    matrix = np.asarray([features[key] for key in keys], dtype=np.float32)
+    if matrix.shape != (len(keys), feature_dim) or not np.isfinite(matrix).all():
+        raise ValueError(f"invalid feature matrix for cache: {matrix.shape}")
+    np.savez_compressed(
+        path,
+        episode_index=np.asarray([key[0] for key in keys], dtype=np.int32),
+        frame_index=np.asarray([key[1] for key in keys], dtype=np.int32),
+        feature=matrix,
+    )
+    print(f"Saved prefix feature cache to {path} ({len(keys)} frames)")
+
+
+def load_feature_cache(
+    path: Path,
+    expected_keys: Sequence[tuple[int, int]],
+    *,
+    feature_dim: int | None = None,
+) -> tuple[dict[tuple[int, int], np.ndarray], int]:
+    """Load a simple cache and fail if it does not match this exact request set."""
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as values:
+        for name in ("episode_index", "frame_index", "feature"):
+            if name not in values:
+                raise ValueError(f"feature cache {path} lacks {name!r}")
+        episode_indices = np.asarray(values["episode_index"], dtype=np.int64)
+        frame_indices = np.asarray(values["frame_index"], dtype=np.int64)
+        matrix = np.asarray(values["feature"], dtype=np.float32)
+    if episode_indices.ndim != 1 or frame_indices.shape != episode_indices.shape:
+        raise ValueError(f"feature cache {path} has malformed frame keys")
+    if matrix.ndim != 2 or matrix.shape[0] != len(episode_indices):
+        raise ValueError(f"feature cache {path} has malformed feature shape {matrix.shape}")
+    if feature_dim is not None and matrix.shape[1] != feature_dim:
+        raise ValueError(f"feature cache feature_dim {matrix.shape[1]} != requested {feature_dim}")
+    keys = list(zip(episode_indices.tolist(), frame_indices.tolist(), strict=True))
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"feature cache {path} contains duplicate frame keys")
+    expected = sorted(set(expected_keys))
+    if sorted(keys) != expected:
+        raise ValueError(
+            f"feature cache {path} keys do not match this run: cached={len(keys)}, expected={len(expected)}"
+        )
+    features = {key: matrix[index] for index, key in enumerate(keys)}
+    print(f"Loaded prefix feature cache from {path} ({len(features)} frames)")
+    return features, int(matrix.shape[1])
+
+
 def _episode_arrays(
     specs: Sequence[EpisodeSpec],
     features: Mapping[tuple[int, int], np.ndarray],
@@ -710,7 +771,14 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     info = _read_json(args.dataset_root / "meta" / "info.json")
     for spec in specs:
         _validate_selected_parquet(args.dataset_root, info, spec)
-    features, feature_dim = extract_prefix_features(args, specs)
+    requested_keys = [(spec.episode_index, frame_index) for spec in specs for frame_index in spec.requested_frames]
+    feature_cache = args.features_cache.resolve()
+    if feature_cache.is_file() and not args.refresh_features and not args.dry_run:
+        features, feature_dim = load_feature_cache(feature_cache, requested_keys)
+    else:
+        features, feature_dim = extract_prefix_features(args, specs)
+        if not args.dry_run:
+            save_feature_cache(feature_cache, features, feature_dim=feature_dim)
 
     if args.dry_run:
         sample = specs[0]
@@ -792,6 +860,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-name", default=DEFAULT_CONFIG_NAME)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--features-cache",
+        type=Path,
+        default=None,
+        help="Simple NPZ cache for extracted prefix features (defaults beside --output).",
+    )
+    parser.add_argument(
+        "--refresh-features",
+        action="store_true",
+        help="Ignore an existing --features-cache and extract prefix features again.",
+    )
     parser.add_argument("--max-groups", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -808,7 +887,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    run(_parser().parse_args())
+    args = _parser().parse_args()
+    if args.features_cache is None:
+        args.features_cache = args.output.with_name("prefix_features.npz")
+    run(args)
 
 
 if __name__ == "__main__":
