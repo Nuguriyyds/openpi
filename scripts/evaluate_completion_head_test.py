@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import random
 import sys
 
 import numpy as np
@@ -261,16 +262,34 @@ def test_assert_split_match_raises_on_mismatch(tmp_path):
     path = tmp_path / "predictions.npz"
     _write_predictions(path, split="train")
     with pytest.raises(ValueError, match="split 'train'"):
-        ech._assert_prediction_split_matches(path, "test")  # noqa: SLF001
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="test",
+            train_group_count=0,
+            train_group_seed=42,
+            expected_scope=None,
+        )
 
 
 def test_assert_split_match_refuses_legacy_npz_in_train_mode(tmp_path):
     path = tmp_path / "legacy.npz"
     np.savez_compressed(path, logit=np.zeros(1, dtype=np.float32))
     with pytest.raises(ValueError, match="predates the split field"):
-        ech._assert_prediction_split_matches(path, "train")  # noqa: SLF001
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="train",
+            train_group_count=0,
+            train_group_seed=42,
+            expected_scope=None,
+        )
     # A legacy test-only file may still resume a test run.
-    ech._assert_prediction_split_matches(path, "test")  # noqa: SLF001
+    ech._assert_prediction_scope_matches(  # noqa: SLF001
+        path,
+        expected_split="test",
+        train_group_count=0,
+        train_group_seed=42,
+        expected_scope=None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -470,9 +489,7 @@ def test_load_report_series_attaches_sampled_frames(tmp_path):
         is_train_sample=np.array([1, 0, 0, 1], dtype=bool),
         split=np.asarray("train"),
     )
-    episode_metrics = [
-        {"episode_index": 0, "task_index": 0, "bce": 0.1, "auc": 1.0, "best_f1": 1.0}
-    ]
+    episode_metrics = [{"episode_index": 0, "task_index": 0, "bce": 0.1, "auc": 1.0, "best_f1": 1.0}]
     report_dir = tmp_path / "report"
     series, _ = ech._load_report_series(  # noqa: SLF001
         root,
@@ -486,3 +503,459 @@ def test_load_report_series_attaches_sampled_frames(tmp_path):
     # Frame 3 is a sampled positive (target 1, sampled); frame 0 a sampled negative.
     assert episode["sampled_positive_frames"] == [3]
     assert episode["sampled_negative_frames"] == [0]
+
+
+# --------------------------------------------------------------------------- #
+#  Evaluation-scope group selection (--train-group-count)                       #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeGroup:
+    """Stand-in for completion_data.TaskGroup (group_id + episode_ids)."""
+
+    def __init__(self, group_id: int, episode_ids: tuple[int, ...]):
+        self.group_id = group_id
+        self.episode_ids = tuple(episode_ids)
+
+
+class _FakeManifest:
+    """Stand-in for completion_data.SplitManifest (splits mapping)."""
+
+    def __init__(self, splits: dict[str, tuple[_FakeGroup, ...]]):
+        self.splits = splits
+
+
+def _fake_manifest(n_train_groups: int, *, n_test_groups: int = 3) -> _FakeManifest:
+    """Build a fake manifest with 4-episode groups (BOUNDARY_GROUP == 4)."""
+
+    def build(count: int) -> tuple[_FakeGroup, ...]:
+        return tuple(_FakeGroup(group_id=g, episode_ids=tuple(range(g * 4, g * 4 + 4))) for g in range(count))
+
+    return _FakeManifest({"train": build(n_train_groups), "val": (), "test": build(n_test_groups)})
+
+
+def _scope(group_ids, episode_ids, *, count, seed, split="train") -> ech.EvaluationScope:
+    return ech.EvaluationScope(
+        split=split,
+        groups=(),
+        episode_ids=tuple(episode_ids),
+        group_ids=tuple(group_ids),
+        requested_group_count=count,
+        group_seed=seed,
+        is_full_split=count == 0,
+    )
+
+
+def _write_scoped_npz(
+    path: Path,
+    *,
+    group_ids,
+    count: int,
+    seed: int,
+    split: str = "train",
+) -> ech.EvaluationScope:
+    """Write a minimal npz carrying group-sampling scope arrays.
+
+    Returns the matching ``EvaluationScope`` so resume tests can pass it as the
+    expected scope. Only the scope arrays matter here; the frame arrays are
+    placeholders because ``_assert_prediction_scope_matches`` never reads them.
+    """
+
+    episode_ids = [eid for g in group_ids for eid in range(g * 4, g * 4 + 4)]
+    np.savez_compressed(
+        path,
+        episode_index=np.array(episode_ids[:1], dtype=np.int32),
+        task_index=np.array([0], dtype=np.int16),
+        frame_index=np.array([0], dtype=np.int32),
+        logit=np.array([0.0], dtype=np.float32),
+        target=np.array([0.0], dtype=np.float32),
+        infer_ms=np.array([0.0], dtype=np.float32),
+        is_train_sample=np.array([0], dtype=bool),
+        split=np.asarray(split),
+        selected_group_ids=np.asarray(group_ids, dtype=np.int64),
+        selected_episode_ids=np.asarray(episode_ids, dtype=np.int64),
+        requested_train_group_count=np.asarray(count, dtype=np.int64),
+        train_group_seed=np.asarray(seed, dtype=np.int64),
+    )
+    return _scope(group_ids, episode_ids, count=count, seed=seed, split=split)
+
+
+# --- CLI defaults / validation ---------------------------------------------- #
+
+
+def test_train_group_count_defaults_to_zero():
+    args = _parse(["--worker-checkpoint", "x", "--worker-output", "y"])
+    assert args.train_group_count == 0
+
+
+def test_train_group_seed_defaults_to_42_and_is_independent_of_model_seed():
+    args = _parse(["--seed", "7", "--worker-checkpoint", "x", "--worker-output", "y"])
+    assert args.seed == 7
+    assert args.train_group_seed == 42
+
+
+def test_parse_train_group_count_requires_train_split():
+    with pytest.raises(SystemExit):
+        _parse(["--split", "test", "--train-group-count", "5", "--worker-checkpoint", "x", "--worker-output", "y"])
+
+
+def test_parse_train_group_count_negative_rejected():
+    with pytest.raises(SystemExit):
+        _parse(["--split", "train", "--train-group-count", "-1", "--worker-checkpoint", "x", "--worker-output", "y"])
+
+
+def test_parse_train_group_count_zero_allowed_on_non_train_split():
+    # count == 0 means "no sampling" and is allowed for any split.
+    args = _parse(["--split", "test", "--train-group-count", "0", "--worker-checkpoint", "x", "--worker-output", "y"])
+    assert args.train_group_count == 0
+
+
+def test_report_max_episodes_is_independent_of_train_group_count():
+    args = _parse(
+        [
+            "--split",
+            "train",
+            "--train-group-count",
+            "20",
+            "--report-max-episodes",
+            "5",
+            "--worker-checkpoint",
+            "x",
+            "--worker-output",
+            "y",
+        ]
+    )
+    assert args.train_group_count == 20
+    assert args.report_max_episodes == 5
+
+
+# --- _select_evaluation_groups (pure) --------------------------------------- #
+
+
+def test_select_groups_zero_returns_all_in_manifest_order():
+    groups = _fake_manifest(5).splits["train"]
+    selected = ech._select_evaluation_groups(groups, group_count=0, seed=42)  # noqa: SLF001
+    assert selected == tuple(groups)
+    assert [g.group_id for g in selected] == [0, 1, 2, 3, 4]
+
+
+def test_select_groups_deterministic_for_same_seed_and_count():
+    groups = _fake_manifest(30).splits["train"]
+    first = ech._select_evaluation_groups(groups, group_count=10, seed=42)  # noqa: SLF001
+    second = ech._select_evaluation_groups(groups, group_count=10, seed=42)  # noqa: SLF001
+    assert [g.group_id for g in first] == [g.group_id for g in second]
+
+
+def test_select_groups_different_seed_yields_different_groups():
+    groups = _fake_manifest(30).splits["train"]
+    first = ech._select_evaluation_groups(groups, group_count=10, seed=42)  # noqa: SLF001
+    second = ech._select_evaluation_groups(groups, group_count=10, seed=7)  # noqa: SLF001
+    assert [g.group_id for g in first] != [g.group_id for g in second]
+
+
+def test_select_groups_twenty_groups_yield_exactly_eighty_episodes():
+    groups = _fake_manifest(40).splits["train"]
+    selected = ech._select_evaluation_groups(groups, group_count=20, seed=42)  # noqa: SLF001
+    episodes = [eid for g in selected for eid in g.episode_ids]
+    assert len(selected) == 20
+    assert len(episodes) == 80
+
+
+def test_select_groups_keeps_all_four_episodes_of_each_group():
+    groups = _fake_manifest(40).splits["train"]
+    selected = ech._select_evaluation_groups(groups, group_count=20, seed=42)  # noqa: SLF001
+    for group in selected:
+        assert len(group.episode_ids) == 4
+
+
+def test_select_groups_has_no_duplicate_group_or_episode():
+    groups = _fake_manifest(40).splits["train"]
+    selected = ech._select_evaluation_groups(groups, group_count=20, seed=42)  # noqa: SLF001
+    group_ids = [g.group_id for g in selected]
+    episodes = [eid for g in selected for eid in g.episode_ids]
+    assert len(group_ids) == len(set(group_ids))
+    assert len(episodes) == len(set(episodes))
+
+
+def test_select_groups_result_is_sorted_by_group_id():
+    groups = _fake_manifest(40).splits["train"]
+    selected = ech._select_evaluation_groups(groups, group_count=20, seed=42)  # noqa: SLF001
+    group_ids = [g.group_id for g in selected]
+    assert group_ids == sorted(group_ids)
+
+
+def test_select_groups_count_exceeding_available_raises_without_truncation():
+    groups = _fake_manifest(5).splits["train"]
+    with pytest.raises(ValueError, match="only has 5"):
+        ech._select_evaluation_groups(groups, group_count=6, seed=42)  # noqa: SLF001
+
+
+def test_select_groups_negative_count_raises():
+    groups = _fake_manifest(5).splits["train"]
+    with pytest.raises(ValueError, match="non-negative"):
+        ech._select_evaluation_groups(groups, group_count=-1, seed=42)  # noqa: SLF001
+
+
+def test_select_groups_does_not_touch_global_random_state():
+    random.seed(123)
+    before = random.getstate()
+    groups = _fake_manifest(40).splits["train"]
+    ech._select_evaluation_groups(groups, group_count=20, seed=42)  # noqa: SLF001
+    after = random.getstate()
+    assert before == after
+
+
+# --- _resolve_evaluation_scope (worker + parent share this) ----------------- #
+
+
+def test_resolve_scope_test_split_ignores_group_count():
+    manifest = _fake_manifest(40, n_test_groups=3)
+    scope = ech._resolve_evaluation_scope(  # noqa: SLF001
+        manifest, "test", train_group_count=20, train_group_seed=42
+    )
+    assert scope.is_full_split is True
+    assert scope.requested_group_count == 0
+    assert len(scope.group_ids) == 3
+    assert len(scope.episode_ids) == 12
+
+
+def test_resolve_scope_train_zero_is_full_split():
+    manifest = _fake_manifest(40)
+    scope = ech._resolve_evaluation_scope(  # noqa: SLF001
+        manifest, "train", train_group_count=0, train_group_seed=42
+    )
+    assert scope.is_full_split is True
+    assert scope.requested_group_count == 0
+    assert len(scope.group_ids) == 40
+    assert len(scope.episode_ids) == 160
+
+
+def test_resolve_scope_train_sampled_is_partial_and_unsorted_input_safe():
+    manifest = _fake_manifest(40)
+    scope = ech._resolve_evaluation_scope(  # noqa: SLF001
+        manifest, "train", train_group_count=20, train_group_seed=42
+    )
+    assert scope.is_full_split is False
+    assert scope.requested_group_count == 20
+    assert scope.group_ids == tuple(sorted(scope.group_ids))
+    assert len(scope.episode_ids) == 80
+
+
+def test_resolve_scope_episode_ids_come_only_from_selected_groups():
+    manifest = _fake_manifest(40)
+    scope = ech._resolve_evaluation_scope(  # noqa: SLF001
+        manifest, "train", train_group_count=20, train_group_seed=42
+    )
+    selected = set(scope.group_ids)
+    for group in manifest.splits["train"]:
+        if group.group_id in selected:
+            assert set(group.episode_ids).issubset(scope.episode_ids)
+        else:
+            assert not set(group.episode_ids).intersection(scope.episode_ids)
+
+
+# --- worker command forwarding ---------------------------------------------- #
+
+
+def test_worker_command_forwards_train_group_count_and_seed():
+    args = _parse(
+        [
+            "--split",
+            "train",
+            "--train-group-count",
+            "20",
+            "--train-group-seed",
+            "7",
+            "--worker-checkpoint",
+            "x",
+            "--worker-output",
+            "y",
+        ]
+    )
+    command = ech._checkpoint_worker_command(  # noqa: SLF001
+        args, checkpoint_dir=Path("/ckpt/200"), prediction_file=Path("/out/predictions.npz")
+    )
+    assert command[command.index("--train-group-count") + 1] == "20"
+    assert command[command.index("--train-group-seed") + 1] == "7"
+
+
+# --- npz scope round-trip + summary ----------------------------------------- #
+
+
+def test_read_prediction_scope_arrays_roundtrip(tmp_path):
+    path = tmp_path / "predictions.npz"
+    _write_scoped_npz(path, group_ids=[3, 7], count=2, seed=9)
+    scope = ech._read_prediction_scope_arrays(path)  # noqa: SLF001
+    assert scope is not None
+    assert scope["group_ids"] == (3, 7)
+    assert scope["requested_count"] == 2
+    assert scope["seed"] == 9
+    assert len(scope["episode_ids"]) == 8
+
+
+def test_read_prediction_scope_arrays_none_for_legacy_npz(tmp_path):
+    path = tmp_path / "legacy.npz"
+    _write_predictions(path, split="train")  # no scope arrays
+    assert ech._read_prediction_scope_arrays(path) is None  # noqa: SLF001
+
+
+def test_build_evaluation_scope_summary_from_sampled_npz(tmp_path):
+    path = tmp_path / "predictions.npz"
+    _write_scoped_npz(path, group_ids=[3, 7], count=2, seed=9)
+    summary = ech._build_evaluation_scope_summary(path, split="train", train_group_seed=9)  # noqa: SLF001
+    assert summary["split"] == "train"
+    assert summary["requested_group_count"] == 2
+    assert summary["selected_group_count"] == 2
+    assert summary["selected_episode_count"] == 8
+    assert summary["group_sample_seed"] == 9
+    assert summary["selected_group_ids"] == [3, 7]
+    assert summary["is_full_split"] is False
+
+
+def test_build_evaluation_scope_summary_legacy_npz_is_full_split(tmp_path):
+    path = tmp_path / "legacy.npz"
+    _write_predictions(path, split="test")  # no scope arrays
+    summary = ech._build_evaluation_scope_summary(path, split="test", train_group_seed=42)  # noqa: SLF001
+    assert summary["is_full_split"] is True
+    assert summary["selected_group_count"] is None
+    assert summary["requested_group_count"] == 0
+
+
+# --- resume scope validation ------------------------------------------------ #
+
+
+def test_assert_scope_match_accepts_matching_scope(tmp_path):
+    path = tmp_path / "predictions.npz"
+    expected = _write_scoped_npz(path, group_ids=[0, 1, 2], count=3, seed=42)
+    # No raise when npz scope matches the current request exactly.
+    ech._assert_prediction_scope_matches(  # noqa: SLF001
+        path,
+        expected_split="train",
+        train_group_count=3,
+        train_group_seed=42,
+        expected_scope=expected,
+    )
+
+
+def test_assert_scope_match_refuses_count_mismatch(tmp_path):
+    path = tmp_path / "predictions.npz"
+    _write_scoped_npz(path, group_ids=[0, 1], count=2, seed=42)
+    expected = _scope([0, 1], list(range(8)), count=3, seed=42)  # request count=3
+    with pytest.raises(ValueError, match="train_group_count=2"):
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="train",
+            train_group_count=3,
+            train_group_seed=42,
+            expected_scope=expected,
+        )
+
+
+def test_assert_scope_match_refuses_seed_mismatch(tmp_path):
+    path = tmp_path / "predictions.npz"
+    _write_scoped_npz(path, group_ids=[0, 1], count=2, seed=42)
+    expected = _scope([0, 1], list(range(8)), count=2, seed=7)  # request seed=7
+    with pytest.raises(ValueError, match="train_group_seed=42"):
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="train",
+            train_group_count=2,
+            train_group_seed=7,
+            expected_scope=expected,
+        )
+
+
+def test_assert_scope_match_refuses_group_id_mismatch(tmp_path):
+    path = tmp_path / "predictions.npz"
+    _write_scoped_npz(path, group_ids=[0, 1], count=2, seed=42)
+    # Same count + seed, but the expected selection picked different groups.
+    expected = _scope([2, 3], list(range(8, 16)), count=2, seed=42)
+    with pytest.raises(ValueError, match="group IDs"):
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="train",
+            train_group_count=2,
+            train_group_seed=42,
+            expected_scope=expected,
+        )
+
+
+def test_assert_scope_match_refuses_sampled_npz_resumed_as_full_split(tmp_path):
+    path = tmp_path / "predictions.npz"
+    _write_scoped_npz(path, group_ids=[0, 1], count=2, seed=42)
+    with pytest.raises(ValueError, match="group-sampled run"):
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="train",
+            train_group_count=0,
+            train_group_seed=42,
+            expected_scope=None,
+        )
+
+
+def test_assert_scope_match_refuses_sampled_request_on_scopeless_npz(tmp_path):
+    path = tmp_path / "predictions.npz"
+    # Has a split field but no scope arrays (older --split-only npz).
+    _write_predictions(path, split="train")
+    with pytest.raises(ValueError, match="lacks group-sampling scope"):
+        ech._assert_prediction_scope_matches(  # noqa: SLF001
+            path,
+            expected_split="train",
+            train_group_count=2,
+            train_group_seed=42,
+            expected_scope=_scope([0, 1], list(range(8)), count=2, seed=42),
+        )
+
+
+# --- metrics_scope label + no-hash guarantee -------------------------------- #
+
+
+def test_metrics_scope_labels_present_in_source():
+    source = Path(__file__).resolve().parent.joinpath("evaluate_completion_head.py").read_text(encoding="utf-8")
+    assert '"selected_train_groups"' in source
+    # The non-sampled label is an f-string template: f"full_{args.split}_split".
+    assert "full_{args.split}_split" in source
+
+
+def test_no_sha256_or_hashlib_in_source():
+    source = Path(__file__).resolve().parent.joinpath("evaluate_completion_head.py").read_text(encoding="utf-8")
+    assert "sha256" not in source.lower()
+    assert "hashlib" not in source
+
+
+# --- HTML train-subset rendering -------------------------------------------- #
+
+
+def test_html_renders_train_subset_template_from_scope():
+    manifest = {
+        "checkpoint_step": 200,
+        "split": "train",
+        "created_at_utc": "2026-08-18T00:00:00Z",
+        "dataset_root": "/data",
+        "threshold": 0.5,
+        "top_camera_key": ech.TOP_VIDEO_KEY,
+        "evaluation_scope": {
+            "split": "train",
+            "requested_group_count": 20,
+            "selected_group_count": 20,
+            "selected_episode_count": 80,
+            "group_sample_seed": 42,
+            "selected_group_ids": list(range(20)),
+            "selected_episode_ids": list(range(80)),
+            "is_full_split": False,
+        },
+        "metrics_scope": "selected_train_groups",
+        "episodes": [_fake_episode(0, 0)],
+    }
+    html = ech._html_document(manifest)  # noqa: SLF001
+    # The JS template and the embedded scope values are both present.
+    assert "Train subset:" in html
+    assert "groups /" in html
+    assert '"selected_group_count":20' in html
+    assert '"is_full_split":false' in html
+
+
+def test_html_has_train_subset_span_and_is_full_split_guard():
+    html = _render_html(split="train")
+    assert 'id="train-subset"' in html
+    assert "is_full_split" in html

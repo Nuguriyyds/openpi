@@ -20,28 +20,39 @@ frames actually sampled during training (``metrics_train_sampled``). The
 training-sample membership is computed by reusing
 ``build_boundary_train_sample_set`` with the stride / forced-first-N values
 taken from the training config, never by hand-rewriting the sampler rules.
+
+For large train splits, ``--train-group-count`` samples whole ``TaskGroup``s
+(four contiguous episodes each) directly from ``manifest.splits["train"]`` with
+an independent ``--train-group-seed``. Selection happens before any video decode
+or model forward, so inference, metrics, npz, and HTML all cover exactly the
+selected episodes. This is distinct from ``--report-max-episodes``, which only
+caps the HTML/MP4 visualization and never trims inference. ``metrics_all_frames``
+then means "all frames in the selected groups", labelled ``metrics_scope =
+"selected_train_groups"``.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import csv
-from datetime import UTC, datetime
+from datetime import UTC
+from datetime import datetime
 import json
 import logging
 import math
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
-
 
 LOGGER = logging.getLogger("completion_head_evaluation")
 
@@ -291,8 +302,7 @@ def _train_fit_metrics(logits: np.ndarray, targets: np.ndarray) -> dict[str, Any
     else:
         ranks = _rankdata(scores)
         auc = float(
-            (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2)
-            / (positive_count * negative_count)
+            (np.sum(ranks[positives]) - positive_count * (positive_count + 1) / 2) / (positive_count * negative_count)
         )
 
     predictions_05 = scores >= 0.5
@@ -673,9 +683,8 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
 
     import openpi.models.model as model_api
     from openpi.policies import policy_config
-    from openpi.training import config as training_config
-    from openpi.training import completion_data as _completion_data
     import openpi.shared.nnx_utils as nnx_utils
+    from openpi.training import config as training_config
 
     checkpoint_dir = Path(args.worker_checkpoint).resolve()
     output_path = Path(args.worker_output).resolve()
@@ -710,13 +719,34 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
 
     # Determine the episodes to evaluate from the split manifest. ``--split`` is
     # forwarded by the parent process; the boundary evaluator invokes this worker
-    # without it, so fall back to ``test`` to preserve the old behavior.
+    # without it, so fall back to ``test`` to preserve the old behavior. Group
+    # sampling (--train-group-count) is resolved BEFORE building the episode list
+    # so video decode, the model forward, npz, metrics, and HTML all cover exactly
+    # the selected episodes (never the whole train split).
     split = getattr(args, "split", DEFAULT_SPLIT)
+    train_group_count = getattr(args, "train_group_count", 0)
+    train_group_seed = getattr(args, "train_group_seed", 42)
     if split not in SPLIT_CHOICES:
         raise ValueError(f"unsupported split {split!r}; expected one of {SPLIT_CHOICES}")
-    manifest_path = config.completion.split_manifest_path
-    manifest = _completion_data.SplitManifest.from_dict(json.loads(Path(manifest_path).read_text(encoding="utf-8")))
-    episode_ids = list(manifest.episode_ids(split))
+    if train_group_count != 0 and split != "train":
+        raise ValueError(f"--train-group-count requires --split train, got split={split!r}")
+    manifest = _load_split_manifest(args.config_name)
+    scope = _resolve_evaluation_scope(
+        manifest,
+        split,
+        train_group_count=train_group_count,
+        train_group_seed=train_group_seed,
+    )
+    selected_groups = scope.groups
+    episode_ids = list(scope.episode_ids)
+    if split == "train" and not scope.is_full_split:
+        LOGGER.info(
+            "Selected %d / %d train groups (seed=%d)",
+            len(selected_groups),
+            len(manifest.splits["train"]),
+            train_group_seed,
+        )
+        LOGGER.info("Selected group IDs: %s", list(scope.group_ids))
     LOGGER.info("Split=%s episodes (%d): %s", split, len(episode_ids), episode_ids)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
@@ -867,6 +897,10 @@ def _evaluate_checkpoint_worker(args: argparse.Namespace) -> int:
             infer_ms=np.asarray(result_infer_ms, dtype=np.float32),
             is_train_sample=is_train_sample,
             split=np.asarray(split),
+            selected_group_ids=np.asarray(scope.group_ids, dtype=np.int64),
+            selected_episode_ids=np.asarray(scope.episode_ids, dtype=np.int64),
+            requested_train_group_count=np.asarray(scope.requested_group_count, dtype=np.int64),
+            train_group_seed=np.asarray(scope.group_seed, dtype=np.int64),
         )
         with local_output.open("rb") as src, output_path.open("wb") as dst:
             shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
@@ -1079,7 +1113,7 @@ def _html_document(manifest: dict[str, Any]) -> str:
           <main>
             <h1>Checkpoint <span id="checkpoint"></span> | completion head</h1>
             <p class="subtitle">
-              Split: <strong id="split-label"></strong>
+              Split: <strong id="split-label"></strong><span id="train-subset"></span>
               &middot; Model input: current-frame prefix only
               &middot; Training sample rule: all positives + stride-sampled negatives
             </p>
@@ -1325,6 +1359,12 @@ def _html_document(manifest: dict[str, Any]) -> str:
             });
             document.getElementById("checkpoint").textContent = String(REPORT.checkpoint_step);
             document.getElementById("split-label").textContent = String(REPORT.split || "test");
+            var scope = REPORT.evaluation_scope;
+            var subset = document.getElementById("train-subset");
+            if (scope && !scope.is_full_split && scope.split === "train") {
+              subset.textContent = " · Train subset: " + scope.selected_group_count
+                + " groups / " + scope.selected_episode_count + " episodes";
+            }
             select.addEventListener("change", function() { loadEpisode(Number(select.value)); });
             document.getElementById("previous").addEventListener("click", function() {
               loadEpisode(selectedIndex - 1);
@@ -1734,6 +1774,10 @@ def _checkpoint_worker_command(
         args.config_name,
         "--split",
         args.split,
+        "--train-group-count",
+        str(getattr(args, "train_group_count", 0)),
+        "--train-group-seed",
+        str(getattr(args, "train_group_seed", 42)),
         "--batch-size",
         str(args.batch_size),
         "--seed",
@@ -1761,6 +1805,124 @@ def _run_checkpoint_worker(
 
 
 # --------------------------------------------------------------------------- #
+#  Evaluation-scope group selection (shared by worker + parent)                #
+# --------------------------------------------------------------------------- #
+
+
+class EvaluationScope(NamedTuple):
+    """Which episodes a checkpoint evaluation covers, after optional group sampling."""
+
+    split: str
+    groups: tuple[Any, ...]
+    episode_ids: tuple[int, ...]
+    group_ids: tuple[int, ...]
+    requested_group_count: int
+    group_seed: int
+    is_full_split: bool
+
+
+def _select_evaluation_groups(
+    groups: Sequence[Any],
+    *,
+    group_count: int,
+    seed: int,
+) -> tuple[Any, ...]:
+    """Pure, deterministic selection of evaluation task groups.
+
+    ``group_count == 0`` returns every group in manifest order (no sampling).
+    Otherwise ``group_count`` groups are drawn without replacement using an
+    independent ``random.Random(seed)`` (never the global RNG) and the result is
+    sorted by ``group_id`` so the order is stable and independent of the sampling
+    order. Requesting more groups than available is an error -- there is no
+    silent truncation. Each selected group is kept whole (all four episodes).
+    """
+
+    if group_count < 0:
+        raise ValueError(f"group_count must be non-negative, got {group_count}")
+    if group_count == 0:
+        return tuple(groups)
+    available = len(groups)
+    if group_count > available:
+        raise ValueError(
+            f"Requested {group_count} train groups but the split only has {available}; "
+            "reduce --train-group-count or use 0 for the full split."
+        )
+    rng = random.Random(seed)
+    sampled = rng.sample(list(groups), group_count)
+    return tuple(sorted(sampled, key=lambda group: int(group.group_id)))
+
+
+def _resolve_evaluation_scope(
+    manifest: Any,
+    split: str,
+    *,
+    train_group_count: int,
+    train_group_seed: int,
+) -> EvaluationScope:
+    """Resolve the episodes/groups a run covers from the split manifest.
+
+    Group sampling only applies to the train split; val/test always use the full
+    split (``train_group_count`` is ignored there). The result is the single
+    source of truth shared by the worker (which writes it into the npz) and the
+    parent (which uses it for resume validation).
+    """
+
+    if split not in SPLIT_CHOICES:
+        raise ValueError(f"unsupported split {split!r}; expected one of {SPLIT_CHOICES}")
+    if split == "train":
+        groups = _select_evaluation_groups(
+            manifest.splits["train"],
+            group_count=train_group_count,
+            seed=train_group_seed,
+        )
+        requested_count = train_group_count
+        group_seed = train_group_seed
+        is_full_split = train_group_count == 0
+    else:
+        groups = tuple(manifest.splits[split])
+        requested_count = 0
+        group_seed = train_group_seed
+        is_full_split = True
+    episode_ids = tuple(int(eid) for group in groups for eid in group.episode_ids)
+    group_ids = tuple(int(group.group_id) for group in groups)
+    return EvaluationScope(
+        split=split,
+        groups=groups,
+        episode_ids=episode_ids,
+        group_ids=group_ids,
+        requested_group_count=requested_count,
+        group_seed=group_seed,
+        is_full_split=is_full_split,
+    )
+
+
+def _evaluation_scope_to_summary(scope: EvaluationScope) -> dict[str, Any]:
+    """Serialize an ``EvaluationScope`` to the JSON-friendly ``evaluation_scope`` block."""
+
+    return {
+        "split": scope.split,
+        "requested_group_count": scope.requested_group_count,
+        "selected_group_count": len(scope.group_ids),
+        "selected_episode_count": len(scope.episode_ids),
+        "group_sample_seed": scope.group_seed,
+        "selected_group_ids": list(scope.group_ids),
+        "selected_episode_ids": list(scope.episode_ids),
+        "is_full_split": scope.is_full_split,
+    }
+
+
+def _load_split_manifest(config_name: str) -> Any:
+    """Load the leak-free split manifest named by a training config (lazy import)."""
+
+    from openpi.training import completion_data as _completion_data
+    from openpi.training import config as training_config
+
+    config = training_config.get_config(config_name)
+    manifest_path = config.completion.split_manifest_path
+    return _completion_data.SplitManifest.from_dict(json.loads(Path(manifest_path).read_text(encoding="utf-8")))
+
+
+# --------------------------------------------------------------------------- #
 #  Resume / report-episode selection                                           #
 # --------------------------------------------------------------------------- #
 
@@ -1779,25 +1941,127 @@ def _read_prediction_split(prediction_file: Path) -> str | None:
     return None
 
 
-def _assert_prediction_split_matches(prediction_file: Path, expected_split: str) -> None:
+def _read_prediction_scope_arrays(prediction_file: Path) -> dict[str, Any] | None:
+    """Read group-sampling scope arrays from a prediction file.
+
+    Returns ``None`` for files predating the group-sampling feature (no
+    ``selected_group_ids`` array). Files written by this version always carry
+    ``selected_group_ids`` / ``selected_episode_ids`` /
+    ``requested_train_group_count`` / ``train_group_seed`` together.
+    """
+
+    with np.load(prediction_file, allow_pickle=False) as values:
+        if "selected_group_ids" not in values.files:
+            return None
+        return {
+            "group_ids": tuple(int(value) for value in values["selected_group_ids"]),
+            "episode_ids": tuple(int(value) for value in values["selected_episode_ids"]),
+            "requested_count": int(values["requested_train_group_count"]),
+            "seed": int(values["train_group_seed"]),
+        }
+
+
+def _build_evaluation_scope_summary(
+    prediction_file: Path,
+    *,
+    split: str,
+    train_group_seed: int,
+) -> dict[str, Any]:
+    """Build the ``evaluation_scope`` block for summaries/HTML from the npz.
+
+    The npz is the source of truth for what was actually inferred. Legacy files
+    (no scope arrays) produce a minimal full-split scope.
+    """
+
+    scope = _read_prediction_scope_arrays(prediction_file)
+    if scope is None:
+        return {
+            "split": split,
+            "requested_group_count": 0,
+            "selected_group_count": None,
+            "selected_episode_count": None,
+            "group_sample_seed": train_group_seed,
+            "selected_group_ids": [],
+            "selected_episode_ids": [],
+            "is_full_split": True,
+        }
+    return {
+        "split": split,
+        "requested_group_count": int(scope["requested_count"]),
+        "selected_group_count": len(scope["group_ids"]),
+        "selected_episode_count": len(scope["episode_ids"]),
+        "group_sample_seed": int(scope["seed"]),
+        "selected_group_ids": list(scope["group_ids"]),
+        "selected_episode_ids": list(scope["episode_ids"]),
+        "is_full_split": int(scope["requested_count"]) == 0,
+    }
+
+
+def _assert_prediction_scope_matches(
+    prediction_file: Path,
+    *,
+    expected_split: str,
+    train_group_count: int,
+    train_group_seed: int,
+    expected_scope: EvaluationScope | None,
+) -> None:
+    """Refuse to resume if the npz's evaluation scope does not match this run.
+
+    The split field and the group-sampling scope (selected group/episode IDs,
+    requested count, seed) must all agree. Files that predate the scope arrays
+    can only resume full-split (count == 0) runs; a group-sampled run must
+    re-run without ``--resume``.
+    """
+
     stored_split = _read_prediction_split(prediction_file)
+    scope = _read_prediction_scope_arrays(prediction_file)
     if stored_split is None:
-        if expected_split == "train":
+        # Truly legacy file (predates --split). Only full test runs may resume.
+        if train_group_count > 0:
             raise ValueError(
-                f"Cannot resume train evaluation from {prediction_file}: it predates the "
-                "split field and has no training-sample mask. Re-run without --resume."
+                f"Cannot resume group-sampled train run from {prediction_file}: it predates "
+                "the split/scope fields. Re-run without --resume."
             )
         if expected_split != "test":
             raise ValueError(
-                f"Cannot resume {expected_split}-split evaluation from {prediction_file}: "
-                "it predates the split field."
+                f"Cannot resume {expected_split}-split evaluation from {prediction_file}: it predates the split field."
             )
-        LOGGER.warning("Resuming test evaluation from a legacy prediction file (no split field): %s", prediction_file)
+        LOGGER.warning(
+            "Resuming test evaluation from a legacy prediction file (no split field): %s",
+            prediction_file,
+        )
         return
     if stored_split != expected_split:
         raise ValueError(
             f"Prediction file {prediction_file} was generated for split {stored_split!r}, "
             f"cannot resume as {expected_split!r}."
+        )
+    if train_group_count > 0:
+        if scope is None:
+            raise ValueError(
+                f"Cannot resume group-sampled train run from {prediction_file}: it lacks "
+                "group-sampling scope metadata. Re-run without --resume."
+            )
+        if expected_scope is None:
+            raise ValueError("expected_scope must be provided when train_group_count > 0")
+        if scope["requested_count"] != train_group_count:
+            raise ValueError(
+                f"Cannot resume: npz used train_group_count={scope['requested_count']}, requested {train_group_count}."
+            )
+        if scope["seed"] != train_group_seed:
+            raise ValueError(f"Cannot resume: npz used train_group_seed={scope['seed']}, requested {train_group_seed}.")
+        if list(scope["group_ids"]) != list(expected_scope.group_ids):
+            raise ValueError(
+                f"Cannot resume: npz selected group IDs {list(scope['group_ids'])} differ "
+                f"from the expected {list(expected_scope.group_ids)}."
+            )
+        if list(scope["episode_ids"]) != list(expected_scope.episode_ids):
+            raise ValueError("Cannot resume: npz selected episode IDs differ from the expected set.")
+    elif scope is not None and scope["requested_count"] != 0:
+        # The npz was a group-sampled run; refuse to silently resume as a full split.
+        raise ValueError(
+            f"Cannot resume full train split from {prediction_file}: it was a group-sampled "
+            f"run (count={scope['requested_count']}, seed={scope['seed']}). Re-run without --resume."
         )
 
 
@@ -1899,15 +2163,43 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
     LOGGER.info("Dataset: %s", dataset_root)
     LOGGER.info("Checkpoint steps: %s", steps)
 
+    metrics_scope = (
+        "selected_train_groups" if args.split == "train" and args.train_group_count > 0 else f"full_{args.split}_split"
+    )
+    # For group-sampled train runs, resolve the expected scope once (this also
+    # validates that the requested count does not exceed the available train
+    # groups) so resume can compare it against each npz before reusing it.
+    expected_scope: EvaluationScope | None = None
+    if args.split == "train" and args.train_group_count > 0:
+        expected_scope = _resolve_evaluation_scope(
+            _load_split_manifest(args.config_name),
+            args.split,
+            train_group_count=args.train_group_count,
+            train_group_seed=args.train_group_seed,
+        )
+        LOGGER.info(
+            "Expected train scope: %d groups, %d episodes (seed=%d)",
+            len(expected_scope.group_ids),
+            len(expected_scope.episode_ids),
+            args.train_group_seed,
+        )
+
     comparison_rows: list[dict[str, Any]] = []
     checkpoint_summaries: list[dict[str, Any]] = []
+    run_evaluation_scope: dict[str, Any] | None = None
     for step in steps:
         checkpoint_dir = checkpoint_root / str(step)
         checkpoint_output = output_dir / f"checkpoint_{step}"
         checkpoint_output.mkdir(exist_ok=args.resume)
         prediction_file = checkpoint_output / "predictions.npz"
         if args.resume and prediction_file.is_file():
-            _assert_prediction_split_matches(prediction_file, args.split)
+            _assert_prediction_scope_matches(
+                prediction_file,
+                expected_split=args.split,
+                train_group_count=args.train_group_count,
+                train_group_seed=args.train_group_seed,
+                expected_scope=expected_scope,
+            )
             LOGGER.info("Reusing completed checkpoint predictions: %s", prediction_file)
         else:
             _run_checkpoint_worker(
@@ -1917,6 +2209,13 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             )
 
         metrics = compute_metrics(prediction_file, fps=fps, threshold=args.threshold)
+        evaluation_scope = _build_evaluation_scope_summary(
+            prediction_file,
+            split=args.split,
+            train_group_seed=args.train_group_seed,
+        )
+        if run_evaluation_scope is None:
+            run_evaluation_scope = evaluation_scope
         checkpoint_summary: dict[str, Any] = {
             "checkpoint_step": step,
             "checkpoint_dir": str(checkpoint_dir),
@@ -1925,6 +2224,8 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             "threshold": args.threshold,
             "overall": metrics["overall"],
             "per_task": metrics["per_task"],
+            "evaluation_scope": evaluation_scope,
+            "metrics_scope": metrics_scope,
         }
         if args.split == "train":
             # Two train-fit metric sets from the same predictions: all train
@@ -1957,6 +2258,8 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             "dataset_root": str(dataset_root),
             "threshold": args.threshold,
             "top_camera_key": TOP_VIDEO_KEY,
+            "evaluation_scope": evaluation_scope,
+            "metrics_scope": metrics_scope,
             "episodes": report_series,
         }
         _write_html_report(report_dir, manifest)
@@ -2007,7 +2310,11 @@ def _run_evaluation(args: argparse.Namespace) -> Path:
             "export_mp4": args.export_mp4,
             "report_max_episodes": args.report_max_episodes,
             "report_episode_ids": list(args.report_episode_ids),
+            "train_group_count": args.train_group_count,
+            "train_group_seed": args.train_group_seed,
         },
+        "evaluation_scope": run_evaluation_scope,
+        "metrics_scope": metrics_scope,
         "started_at_utc": started_at.isoformat(),
         "finished_at_utc": finished_at.isoformat(),
         "elapsed_seconds": (finished_at - started_at).total_seconds(),
@@ -2032,6 +2339,22 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_SPLIT,
         help="Manifest split to evaluate (default: test). train runs every train frame and "
         "adds the metrics_all_frames / metrics_train_sampled train-fit metric sets.",
+    )
+    parser.add_argument(
+        "--train-group-count",
+        type=int,
+        default=0,
+        help="Sample this many whole TaskGroups (4 episodes each) directly from "
+        "manifest.splits['train'] before any video decode / model forward, so inference, "
+        "metrics, npz, and HTML cover exactly the selected groups. 0 = the full split (no "
+        "sampling). Requires --split train. Unlike --report-max-episodes (which only caps "
+        "HTML/MP4 display and never trims inference), this reduces the data actually scored.",
+    )
+    parser.add_argument(
+        "--train-group-seed",
+        type=int,
+        default=42,
+        help="Independent RNG seed for --train-group-count sampling (decoupled from --seed).",
     )
     parser.add_argument(
         "--checkpoints",
@@ -2109,6 +2432,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--checkpoints cannot be empty")
     if args.report_max_episodes < 0:
         parser.error("--report-max-episodes must be non-negative")
+    if args.train_group_count < 0:
+        parser.error("--train-group-count must be non-negative")
+    if args.train_group_count > 0 and args.split != "train":
+        parser.error("--train-group-count requires --split train")
     if (args.worker_checkpoint is None) != (args.worker_output is None):
         parser.error("--worker-checkpoint and --worker-output must be provided together")
     if args.copy_videos is None:
