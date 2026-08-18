@@ -512,20 +512,22 @@ def save_feature_cache(
 ) -> None:
     """Save the extracted frame features before any classifier is fitted."""
 
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"feature cache path exists but is not a directory: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
     keys = sorted(features)
     if not keys:
         raise ValueError("cannot save an empty feature cache")
     matrix = np.asarray([features[key] for key in keys], dtype=np.float32)
     if matrix.shape != (len(keys), feature_dim) or not np.isfinite(matrix).all():
         raise ValueError(f"invalid feature matrix for cache: {matrix.shape}")
-    np.savez_compressed(
-        path,
-        episode_index=np.asarray([key[0] for key in keys], dtype=np.int32),
-        frame_index=np.asarray([key[1] for key in keys], dtype=np.int32),
-        feature=matrix,
-    )
-    print(f"Saved prefix feature cache to {path} ({len(keys)} frames)")
+    # Keep each member as a plain NPY file.  Some mounted /mnt filesystems do
+    # not support the seek pattern used by ZIP-based np.savez_compressed.
+    np.save(path / "feature.npy", matrix)
+    np.save(path / "episode_index.npy", np.asarray([key[0] for key in keys], dtype=np.int32))
+    np.save(path / "frame_index.npy", np.asarray([key[1] for key in keys], dtype=np.int32))
+    print(f"Saved prefix feature cache directory to {path} ({len(keys)} frames)")
 
 
 def load_feature_cache(
@@ -536,15 +538,15 @@ def load_feature_cache(
 ) -> tuple[dict[tuple[int, int], np.ndarray], int]:
     """Load a simple cache and fail if it does not match this exact request set."""
 
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with np.load(path, allow_pickle=False) as values:
-        for name in ("episode_index", "frame_index", "feature"):
-            if name not in values:
-                raise ValueError(f"feature cache {path} lacks {name!r}")
-        episode_indices = np.asarray(values["episode_index"], dtype=np.int64)
-        frame_indices = np.asarray(values["frame_index"], dtype=np.int64)
-        matrix = np.asarray(values["feature"], dtype=np.float32)
+    if not path.is_dir():
+        raise FileNotFoundError(f"feature cache directory not found: {path}")
+    members = {name: path / f"{name}.npy" for name in ("episode_index", "frame_index", "feature")}
+    missing = [name for name, member in members.items() if not member.is_file()]
+    if missing:
+        raise ValueError(f"feature cache {path} is incomplete; missing {missing}")
+    episode_indices = np.asarray(np.load(members["episode_index"], allow_pickle=False), dtype=np.int64)
+    frame_indices = np.asarray(np.load(members["frame_index"], allow_pickle=False), dtype=np.int64)
+    matrix = np.asarray(np.load(members["feature"], allow_pickle=False), dtype=np.float32)
     if episode_indices.ndim != 1 or frame_indices.shape != episode_indices.shape:
         raise ValueError(f"feature cache {path} has malformed frame keys")
     if matrix.ndim != 2 or matrix.shape[0] != len(episode_indices):
@@ -560,7 +562,7 @@ def load_feature_cache(
             f"feature cache {path} keys do not match this run: cached={len(keys)}, expected={len(expected)}"
         )
     features = {key: matrix[index] for index, key in enumerate(keys)}
-    print(f"Loaded prefix feature cache from {path} ({len(features)} frames)")
+    print(f"Loaded prefix feature cache directory from {path} ({len(features)} frames)")
     return features, int(matrix.shape[1])
 
 
@@ -773,7 +775,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         _validate_selected_parquet(args.dataset_root, info, spec)
     requested_keys = [(spec.episode_index, frame_index) for spec in specs for frame_index in spec.requested_frames]
     feature_cache = args.features_cache.resolve()
-    if feature_cache.is_file() and not args.refresh_features and not args.dry_run:
+    if feature_cache.is_dir() and not args.refresh_features and not args.dry_run:
         features, feature_dim = load_feature_cache(feature_cache, requested_keys)
     else:
         features, feature_dim = extract_prefix_features(args, specs)
@@ -864,7 +866,7 @@ def _parser() -> argparse.ArgumentParser:
         "--features-cache",
         type=Path,
         default=None,
-        help="Simple NPZ cache for extracted prefix features (defaults beside --output).",
+        help="Directory cache for extracted prefix features (defaults beside --output).",
     )
     parser.add_argument(
         "--refresh-features",
@@ -889,7 +891,7 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     if args.features_cache is None:
-        args.features_cache = args.output.with_name("prefix_features.npz")
+        args.features_cache = args.output.with_name("prefix_features")
     run(args)
 
 
