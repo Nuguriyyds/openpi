@@ -71,6 +71,20 @@ class DatasetAudit:
     task_by_group_position: tuple[int, int, int, int]
 
 
+@dataclasses.dataclass(frozen=True)
+class _LogisticProbe:
+    mean: np.ndarray
+    scale: np.ndarray
+    weight: np.ndarray
+    bias: float
+
+    def predict_proba(self, values: np.ndarray) -> np.ndarray:
+        standardized = (np.asarray(values, dtype=np.float32) - self.mean) / self.scale
+        logits = standardized @ self.weight + self.bias
+        logits = np.clip(logits, -80.0, 80.0)
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float64)
+
+
 def _integer(value: Any, *, context: str) -> int:
     array = np.asarray(value)
     if array.size != 1:
@@ -516,15 +530,104 @@ def _episode_arrays(
 
 
 def _ranking_metrics(labels: np.ndarray, scores: np.ndarray) -> dict[str, float]:
-    from sklearn.metrics import accuracy_score  # noqa: PLC0415
-    from sklearn.metrics import average_precision_score  # noqa: PLC0415
-    from sklearn.metrics import roc_auc_score  # noqa: PLC0415
-
+    labels = np.asarray(labels, dtype=np.int8)
+    scores = np.asarray(scores, dtype=np.float64)
+    order = np.argsort(-scores, kind="stable")
+    ordered_labels = labels[order]
+    positive_count = int(np.sum(ordered_labels))
+    if positive_count == 0 or positive_count == len(ordered_labels):
+        raise ValueError("probe metric inputs must contain both classes")
+    precision = np.cumsum(ordered_labels) / np.arange(1, len(ordered_labels) + 1)
+    auprc = float(np.sum(precision[ordered_labels == 1]) / positive_count)
+    positive_scores = scores[labels == 1]
+    negative_scores = scores[labels == 0]
+    comparisons = positive_scores[:, None] - negative_scores[None, :]
+    roc_auc = float(np.mean(comparisons > 0.0) + 0.5 * np.mean(comparisons == 0.0))
     return {
-        "auprc": float(average_precision_score(labels, scores)),
-        "roc_auc": float(roc_auc_score(labels, scores)),
-        "accuracy_at_0_5": float(accuracy_score(labels, scores >= 0.5)),
+        "auprc": auprc,
+        "roc_auc": roc_auc,
+        "accuracy_at_0_5": float(np.mean((scores >= 0.5) == labels)),
     }
+
+
+def _fit_logistic(values: np.ndarray, labels: np.ndarray, *, seed: int) -> _LogisticProbe:
+    """Fits a small L2 logistic probe without requiring scikit-learn.
+
+    The clean environment used for prefix extraction does not necessarily have
+    sklearn installed.  JAX is already required by the frozen pi0.5 forward,
+    so a fixed-seed, full-batch Adam fit keeps this diagnostic self-contained
+    while preserving the requested StandardScaler + C=1 logistic objective.
+    """
+
+    del seed  # zero initialization and full-batch updates are deterministic
+    values = np.asarray(values, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.float32)
+    mean = values.mean(axis=0, dtype=np.float64).astype(np.float32)
+    scale = values.std(axis=0, dtype=np.float64).astype(np.float32)
+    scale[scale < 1e-6] = 1.0
+    standardized = ((values - mean) / scale).astype(np.float32)
+
+    import jax  # noqa: PLC0415
+    import jax.numpy as jnp  # noqa: PLC0415
+
+    x = jnp.asarray(standardized)
+    y = jnp.asarray(labels)
+    sample_count = float(len(labels))
+    regularization = 1.0 / sample_count  # C=1 in sklearn's sum-loss convention
+    weight = jnp.zeros((standardized.shape[1],), dtype=jnp.float32)
+    bias = jnp.asarray(0.0, dtype=jnp.float32)
+    first_m = jnp.zeros_like(weight)
+    first_mb = jnp.asarray(0.0, dtype=jnp.float32)
+    second_m = jnp.zeros_like(weight)
+    second_mb = jnp.asarray(0.0, dtype=jnp.float32)
+
+    def loss_fn(current_weight: jax.Array, current_bias: jax.Array) -> jax.Array:
+        logits = x @ current_weight + current_bias
+        data_loss = jnp.mean(jnp.maximum(logits, 0.0) - logits * y + jnp.log1p(jnp.exp(-jnp.abs(logits))))
+        return data_loss + 0.5 * regularization * jnp.sum(current_weight * current_weight)
+
+    @jax.jit
+    def update(
+        current_weight: jax.Array,
+        current_bias: jax.Array,
+        current_first_m: jax.Array,
+        current_first_mb: jax.Array,
+        current_second_m: jax.Array,
+        current_second_mb: jax.Array,
+        step: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        _, (gradient, gradient_b) = jax.value_and_grad(loss_fn, argnums=(0, 1))(current_weight, current_bias)
+        beta1 = 0.9
+        beta2 = 0.999
+        first_m = beta1 * current_first_m + (1.0 - beta1) * gradient
+        first_mb = beta1 * current_first_mb + (1.0 - beta1) * gradient_b
+        second_m = beta2 * current_second_m + (1.0 - beta2) * gradient * gradient
+        second_mb = beta2 * current_second_mb + (1.0 - beta2) * gradient_b * gradient_b
+        step_float = step.astype(jnp.float32)
+        first_hat = first_m / (1.0 - beta1**step_float)
+        first_hat_b = first_mb / (1.0 - beta1**step_float)
+        second_hat = second_m / (1.0 - beta2**step_float)
+        second_hat_b = second_mb / (1.0 - beta2**step_float)
+        learning_rate = 0.03
+        current_weight = current_weight - learning_rate * first_hat / (jnp.sqrt(second_hat) + 1e-8)
+        current_bias = current_bias - learning_rate * first_hat_b / (jnp.sqrt(second_hat_b) + 1e-8)
+        return current_weight, current_bias, first_m, first_mb, second_m, second_mb
+
+    for step in range(1, 1001):
+        weight, bias, first_m, first_mb, second_m, second_mb = update(
+            weight,
+            bias,
+            first_m,
+            first_mb,
+            second_m,
+            second_mb,
+            jnp.asarray(step, dtype=jnp.float32),
+        )
+    weight = np.asarray(jax.block_until_ready(weight), dtype=np.float32)
+    bias = float(np.asarray(jax.block_until_ready(bias)))
+    if not np.isfinite(weight).all() or not np.isfinite(bias):
+        raise ValueError("logistic probe produced non-finite parameters")
+    return _LogisticProbe(mean=mean, scale=scale, weight=weight, bias=bias)
 
 
 def _evaluate_probe(
@@ -535,10 +638,6 @@ def _evaluate_probe(
     mode: str,
     seed: int,
 ) -> dict[str, Any]:
-    from sklearn.linear_model import LogisticRegression  # noqa: PLC0415
-    from sklearn.pipeline import make_pipeline  # noqa: PLC0415
-    from sklearn.preprocessing import StandardScaler  # noqa: PLC0415
-
     train = _episode_arrays(train_specs, features)
     test = _episode_arrays(test_specs, features)
     train_positive = train[f"{mode}_positive"]
@@ -547,11 +646,7 @@ def _evaluate_probe(
     test_hard = test[f"{mode}_hard"]
     x_train = np.concatenate([train_hard, train_positive], axis=0)
     y_train = np.concatenate([np.zeros(len(train_hard), dtype=np.int8), np.ones(len(train_positive), dtype=np.int8)])
-    classifier = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(C=1.0, max_iter=2000, class_weight=None, random_state=seed),
-    )
-    classifier.fit(x_train, y_train)
+    classifier = _fit_logistic(x_train, y_train, seed=seed)
 
     def evaluate_subset(indices: np.ndarray) -> dict[str, Any]:
         hard_scores = classifier.predict_proba(test_hard[indices])[:, 1]
@@ -650,6 +745,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     test_specs = tuple(spec for spec in specs if spec.group_index in test_group_set)
     metrics: dict[str, Any] = {
         "protocol": "hard_positive_prefix_probe_v1",
+        "classifier": "L2 logistic probe, StandardScaler, C=1, JAX Adam optimizer",
         "dataset_root": str(args.dataset_root),
         "config_name": args.config_name,
         "checkpoint": str(args.checkpoint),
