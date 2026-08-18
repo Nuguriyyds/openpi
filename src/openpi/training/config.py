@@ -1004,7 +1004,7 @@ _CONFIGS = [
             bce_pos_weight_override=1.0,
             temporal_sampling=True,
             temporal_feature_cache_path=(
-                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz"
+                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/features.npz"
             ),
             temporal_source_model_config_name="pi05_730_breakfast_subtasks",
             temporal_input_mode="history",

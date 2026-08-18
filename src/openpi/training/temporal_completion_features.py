@@ -7,13 +7,16 @@ import dataclasses
 import json
 import os
 import pathlib
+import shutil
+import tempfile
 from typing import Any
 
 import numpy as np
 
 import openpi.training.temporal_completion_data as _temporal_data
 
-FEATURE_CACHE_SCHEMA_VERSION = 3
+FEATURE_CACHE_SCHEMA_VERSION = 4
+FEATURE_CACHE_STORAGE_FORMAT = "directory_npy_v1"
 PREPROCESS_PROTOCOL_VERSION = 1
 POOLING_METHOD = "masked_mean_fp32"
 SUPPORTED_FEATURE_DTYPES = (np.dtype(np.float16), np.dtype(np.float32))
@@ -39,6 +42,7 @@ class TemporalFeatureCacheMetadata:
     feature_dim: int
     row_count: int
     schema_version: int = FEATURE_CACHE_SCHEMA_VERSION
+    storage_format: str = FEATURE_CACHE_STORAGE_FORMAT
     preprocess_protocol_version: int = PREPROCESS_PROTOCOL_VERSION
     pooling_method: str = POOLING_METHOD
     history_steps: int = _temporal_data.TEMPORAL_HISTORY_STEPS
@@ -49,6 +53,10 @@ class TemporalFeatureCacheMetadata:
         if self.schema_version != FEATURE_CACHE_SCHEMA_VERSION:
             raise ValueError(
                 f"feature cache schema_version must be {FEATURE_CACHE_SCHEMA_VERSION}, got {self.schema_version}"
+            )
+        if self.storage_format != FEATURE_CACHE_STORAGE_FORMAT:
+            raise ValueError(
+                f"feature cache storage_format must be {FEATURE_CACHE_STORAGE_FORMAT!r}, got {self.storage_format!r}"
             )
         if self.preprocess_protocol_version != PREPROCESS_PROTOCOL_VERSION:
             raise ValueError(
@@ -211,21 +219,48 @@ def save_temporal_feature_cache(
     if output_path.exists():
         raise FileExistsError(f"refusing to overwrite sealed temporal feature cache: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
-    with temporary_path.open("wb") as file:
-        # The history member is GB-scale for the full breakfast set.  The
-        # uncompressed ZIP produced by ``np.savez`` can exceed the file-size
-        # /seek limits of the training volume while closing its central
-        # directory.  Compression keeps the same portable NPZ format and
-        # reduces the temporary file substantially.
-        np.savez_compressed(
-            file,
-            metadata_json=np.asarray(metadata.to_json()),
-            prefix_history=history,
-            **_row_arrays(rows),
-        )
-    os.replace(temporary_path, output_path)
+    temporary_path = pathlib.Path(
+        tempfile.mkdtemp(prefix=f".{output_path.name}.{os.getpid()}.", dir=output_path.parent)
+    )
+    try:
+        (temporary_path / "metadata.json").write_text(metadata.to_json() + "\n", encoding="utf-8")
+        np.save(temporary_path / "prefix_history.npy", history, allow_pickle=False)
+        for name, values in _row_arrays(rows).items():
+            np.save(temporary_path / f"{name}.npy", values, allow_pickle=False)
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path.exists():
+            shutil.rmtree(temporary_path)
     return metadata
+
+
+class _NpyArrayDirectory:
+    """Small NpzFile-compatible view over the directory cache members."""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self._root = root
+        self.files = tuple(
+            name
+            for name in (
+                "trajectory_id",
+                "full_episode_id",
+                "task_index",
+                "split",
+                "logical_tick",
+                "label",
+                "sample_kind",
+                "boundary_tick",
+                "prompt_index",
+                "history_logical_ticks",
+                "source_episode_ids",
+                "source_frame_indices",
+                "terminal_hold_flags",
+            )
+            if (root / f"{name}.npy").is_file()
+        )
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        return np.load(self._root / f"{name}.npy", allow_pickle=False, mmap_mode="r")
 
 
 def load_temporal_feature_cache(
@@ -237,17 +272,25 @@ def load_temporal_feature_cache(
 ) -> TemporalFeatureCache:
     """Loads and fully audits a cache before exposing any training samples."""
 
-    with np.load(path, allow_pickle=False) as arrays:
-        if "metadata_json" not in arrays.files or "prefix_history" not in arrays.files:
-            raise ValueError("temporal feature cache lacks metadata_json or prefix_history")
-        metadata_value = arrays["metadata_json"]
-        if metadata_value.ndim != 0:
-            raise ValueError("feature cache metadata_json must be a scalar string")
-        metadata = TemporalFeatureCacheMetadata.from_json(str(metadata_value.item()))
-        rows = _rows_from_arrays(arrays)
-        # NpzFile materialises an owning ndarray for each member.  Retain that
-        # array directly; an additional copy briefly doubles a GB-scale cache.
-        prefix_history = arrays["prefix_history"]
+    cache_path = pathlib.Path(path)
+    if cache_path.is_dir():
+        metadata_path = cache_path / "metadata.json"
+        history_path = cache_path / "prefix_history.npy"
+        if not metadata_path.is_file() or not history_path.is_file():
+            raise ValueError("directory feature cache lacks metadata.json or prefix_history.npy")
+        metadata = TemporalFeatureCacheMetadata.from_json(metadata_path.read_text(encoding="utf-8"))
+        rows = _rows_from_arrays(_NpyArrayDirectory(cache_path))
+        prefix_history = np.load(history_path, allow_pickle=False, mmap_mode="r")
+    else:
+        with np.load(cache_path, allow_pickle=False) as arrays:
+            if "metadata_json" not in arrays.files or "prefix_history" not in arrays.files:
+                raise ValueError("temporal feature cache lacks metadata_json or prefix_history")
+            metadata_value = arrays["metadata_json"]
+            if metadata_value.ndim != 0:
+                raise ValueError("feature cache metadata_json must be a scalar string")
+            metadata = TemporalFeatureCacheMetadata.from_json(str(metadata_value.item()))
+            rows = _rows_from_arrays(arrays)
+            prefix_history = arrays["prefix_history"]
     cache = TemporalFeatureCache(metadata=metadata, rows=rows, prefix_history=prefix_history)
     cache.validate(manifest)
     if expected_checkpoint_path is not None and metadata.checkpoint_path != expected_checkpoint_path:

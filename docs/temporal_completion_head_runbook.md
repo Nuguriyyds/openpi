@@ -9,7 +9,7 @@
 
 - 四段 subtask group 构成逻辑轨迹并做 72/8/20 trajectory split；
 - 严格全局 2 Hz tick、每个边界唯一正标签、同 prompt 三帧历史；
-- clean pi0.5 masked-mean prefix cache（feature-cache schema v3）；
+- clean pi0.5 masked-mean prefix cache（feature-cache schema v4，目录化 `.npy` 存储）；
 - FP32 temporal MLP、unweighted BCE、21/21/22 train sampler、自然 val/test；
 - history 与 same-head current-only 两个完全同结构消融；
 - train-only current-prefix 线性信息 probe；
@@ -71,16 +71,18 @@ uv run scripts/extract_temporal_completion_features.py \
   --config-name pi05_730_breakfast_subtasks \
   --checkpoint /mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999 \
   --dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
-  --output /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/features.npz
 ```
 
 history/current-only 共用这一份 cache；不要复制数据集，也不要复用旧 10-frame positive cache。
+`features.npz` 在当前 schema v4 中是一个目录名，内部包含 `metadata.json`、
+`prefix_history.npy` 和各索引列的 `.npy` 文件，不再使用大型 ZIP 文件。
 
 ### 3. 拟合线性 current-prefix 信息 probe
 
 ```bash
 uv run scripts/fit_temporal_current_only_probe.py \
-  --output /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/current_only_linear_probe.npz
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/current_only_linear_probe.npz
 ```
 
 该 probe 仅用自然 train 拟合、自然 val 选 L2；不会索引 test。它用于表示信息量诊断，不替代下面的 same-head MLP 消融。
@@ -112,8 +114,8 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py \
 uv run scripts/evaluate_temporal_completion.py \
   --config-name pi05_agilex_breakfast_temporal_completion_head \
   --checkpoint-root /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_completion_head/history_seed42 \
-  --current-only-cache /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz \
-  --current-only-probe-weights /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/current_only_linear_probe.npz \
+  --current-only-cache /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/features.npz \
+  --current-only-probe-weights /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/current_only_linear_probe.npz \
   --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_seed42.json
 ```
 

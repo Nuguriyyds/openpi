@@ -37,6 +37,9 @@ def test_feature_cache_round_trip_and_split_dataset(tmp_path):
         model_config_name="clean",
         checkpoint_path="/checkpoint/49999",
     )
+    assert path.is_dir()
+    assert (path / "metadata.json").is_file()
+    assert (path / "prefix_history.npy").is_file()
     loaded = features.load_temporal_feature_cache(
         path,
         manifest=manifest,

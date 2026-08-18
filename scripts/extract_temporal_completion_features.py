@@ -34,7 +34,7 @@ DEFAULT_CHECKPOINT = Path(
 DEFAULT_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730")
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/dataset/ei/huggingface")
 DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json")
-DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v3/features.npz")
+DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/features.npz")
 
 
 @dataclasses.dataclass(frozen=True, order=True)
