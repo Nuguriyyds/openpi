@@ -46,6 +46,19 @@ SPLIT_CHOICES = ("val", "test")
 PREDICTION_SCHEMA_VERSION = 1
 
 
+def _report_split(report: Mapping[str, Any], split: str) -> Mapping[str, Any]:
+    """Return one report split, accepting the evaluator's ``validation`` name."""
+
+    oracle_prompt = report.get("oracle_prompt")
+    if not isinstance(oracle_prompt, Mapping):
+        raise ValueError("evaluation report oracle_prompt must be an object")
+    report_key = "validation" if split == "val" else split
+    value = oracle_prompt.get(report_key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"evaluation report lacks oracle_prompt.{report_key}")
+    return value
+
+
 def _read_report(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"evaluation report not found: {path}")
@@ -57,8 +70,7 @@ def _read_report(path: Path) -> dict[str, Any]:
     if not isinstance(value.get("threshold_selection"), dict):
         raise ValueError("evaluation report lacks threshold_selection")
     for split in SPLIT_CHOICES:
-        if not isinstance(value["oracle_prompt"].get(split), dict):
-            raise ValueError(f"evaluation report lacks oracle_prompt.{split}")
+        _report_split(value, split)
     return value
 
 
@@ -237,9 +249,8 @@ def _group_payload(
 
 def _metric_cards(report: Mapping[str, Any]) -> dict[str, dict[str, float | None]]:
     cards: dict[str, dict[str, float | None]] = {}
-    oracle = report["oracle_prompt"]
     for split in SPLIT_CHOICES:
-        overall = oracle[split]["overall"]
+        overall = _report_split(report, split)["overall"]
         keys = (
             "natural/auprc",
             "natural/roc_auc",
