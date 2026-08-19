@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 import dataclasses
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ DEFAULT_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_m
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/dataset/ei/huggingface")
 DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json")
 DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v5/features.npz")
+PARTIAL_CACHE_VERSION = 1
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -178,6 +180,98 @@ def assert_safe_output(output: Path, protected_roots: Sequence[Path]) -> None:
             raise ValueError(f"refusing to write feature cache inside protected source/checkpoint root: {root}")
 
 
+def _partial_cache_dir(output: Path) -> Path:
+    """Returns the restartable, batch-level cache directory for ``output``."""
+
+    return output.with_name(output.name + ".partial")
+
+
+def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> None:
+    """Writes progress metadata without leaving a half-written JSON file."""
+
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _open_partial_feature_cache(
+    output: Path,
+    *,
+    manifest: Path,
+    checkpoint: Path,
+    config_name: str,
+    total_keys: int,
+    feature_dim: int,
+    storage_dtype: np.dtype[Any],
+) -> tuple[np.memmap, int, Path]:
+    """Opens or creates the resumable FP32 unique-feature cache.
+
+    The cache is intentionally simple: a preallocated ``.npy`` memmap and a
+    small progress JSON.  A batch is considered complete only after its
+    features have been flushed and the progress JSON has been atomically
+    advanced.  If extraction is interrupted, the next invocation recomputes
+    at most the in-flight batch and resumes from the last completed one.
+    """
+
+    partial_dir = _partial_cache_dir(output)
+    metadata_path = partial_dir / "progress.json"
+    feature_path = partial_dir / "unique_features.npy"
+    expected = {
+        "version": PARTIAL_CACHE_VERSION,
+        "manifest": str(manifest),
+        "checkpoint": str(checkpoint),
+        "config_name": config_name,
+        "total_keys": int(total_keys),
+        "feature_dim": int(feature_dim),
+        "storage_dtype": str(storage_dtype),
+    }
+
+    if partial_dir.exists():
+        if not partial_dir.is_dir():
+            raise ValueError(f"partial feature cache path is not a directory: {partial_dir}")
+        if not metadata_path.is_file() or not feature_path.is_file():
+            raise ValueError(f"partial feature cache is incomplete: {partial_dir}")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"partial feature cache progress is invalid: {metadata_path}") from exc
+        for key, value in expected.items():
+            if metadata.get(key) != value:
+                raise ValueError(
+                    f"partial feature cache does not match this extraction for {key}: "
+                    f"{metadata.get(key)!r} != {value!r}; remove {partial_dir} to restart"
+                )
+        completed = int(metadata.get("completed_keys", -1))
+        if completed < 0 or completed > total_keys:
+            raise ValueError(f"partial feature cache has invalid completed_keys={completed}")
+        features = np.lib.format.open_memmap(feature_path, mode="r+")
+        if features.shape != (total_keys, feature_dim) or features.dtype != np.float32:
+            raise ValueError(
+                f"partial feature array has shape/dtype {features.shape}/{features.dtype}, "
+                f"expected {(total_keys, feature_dim)}/float32"
+            )
+        print(f"Resuming prefix extraction from {completed}/{total_keys} cached features: {partial_dir}")
+        return features, completed, partial_dir
+
+    partial_dir.mkdir(parents=True, exist_ok=False)
+    features = np.lib.format.open_memmap(
+        feature_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_keys, feature_dim),
+    )
+    _write_json_atomically(partial_dir / "progress.json", {**expected, "completed_keys": 0})
+    print(f"Created resumable prefix extraction cache: {partial_dir}")
+    return features, 0, partial_dir
+
+
+def _mark_partial_progress(partial_dir: Path, completed_keys: int) -> None:
+    metadata_path = partial_dir / "progress.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["completed_keys"] = int(completed_keys)
+    _write_json_atomically(metadata_path, metadata)
+
+
 def _evaluation_repack() -> Any:
     # Keep heavy OpenPI/JAX imports out of module import so pure planning tests
     # run without accelerator dependencies.
@@ -248,7 +342,12 @@ def _validate_clean_runtime(config: Any, *, config_name: str, checkpoint: Path, 
 
 
 def extract_temporal_features(args: argparse.Namespace) -> Path:
-    """Restores the clean model and writes one immutable temporal cache."""
+    """Restores the clean model and writes one immutable temporal cache.
+
+    Prefix features are persisted after every successful batch under
+    ``<output>.partial/``.  Re-running after an interruption resumes from that
+    cache instead of recomputing completed VLM batches.
+    """
 
     # These imports initialize JAX/LeRobot and therefore belong only in the
     # real extraction path, after CLI validation.
@@ -279,6 +378,8 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
     if manifest.source_full_root is not None:
         protected_roots.append(Path(manifest.source_full_root).resolve())
     assert_safe_output(output, protected_roots)
+    partial_output = _partial_cache_dir(output)
+    assert_safe_output(partial_output, protected_roots)
 
     os.environ["HF_LEROBOT_HOME"] = str(args.hf_lerobot_home.resolve())
     config = training_config.get_config(args.config_name)
@@ -328,57 +429,70 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
         return module.compute_prefix_feature(jax.random.key(0), observation, train=False)
 
     compute_fn = jax.jit(compute_prefix)
-    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, root=dataset_root)
-    episode_from = dataset.episode_data_index["from"]
-    episode_to = dataset.episode_data_index["to"]
-    feature_chunks: list[np.ndarray] = []
-
-    for batch_start in range(0, len(plan.keys), args.batch_size):
-        batch_keys = plan.keys[batch_start : batch_start + args.batch_size]
-        if len(set(batch_keys)) != len(batch_keys):
-            raise AssertionError("internal extraction batch contains duplicate source/frame/prompt keys")
-        transformed: list[dict[str, Any]] = []
-        for key in batch_keys:
-            start = _scalar_int(episode_from[key.source_episode_id])
-            stop = _scalar_int(episode_to[key.source_episode_id])
-            dataset_index = start + key.source_frame_index
-            if dataset_index < start or dataset_index >= stop:
-                raise ValueError(
-                    f"manifest source frame {key.source_episode_id}:{key.source_frame_index} is outside [{start}, {stop})"
-                )
-            sample = dict(dataset[dataset_index])
-            if _scalar_int(sample["episode_index"]) != key.source_episode_id:
-                raise ValueError("source dataset episode_index disagrees with manifest reference")
-            if _scalar_int(sample["frame_index"]) != key.source_frame_index:
-                raise ValueError("source dataset frame_index disagrees with manifest reference")
-
-            # This assignment is deliberately before repack, AgileX, normalize,
-            # resize, and tokenizer transforms.  It makes the subtask prompt
-            # explicit before any automatic prompt transform runs.
-            sample["prompt"] = key.prompt
-            transformed.append(policy._input_transform(sample))  # noqa: SLF001
-
-        batched_inputs = jax.tree.map(
-            lambda *values: jnp.asarray(np.stack([np.asarray(value) for value in values], axis=0)),
-            *transformed,
-        )
-        observation = model_api.Observation.from_dict(batched_inputs)
-        batch_features = np.asarray(jax.block_until_ready(compute_fn(state, observation)))
-        expected_shape = (len(batch_keys), int(model.prefix_feature_dim))
-        if batch_features.shape != expected_shape:
-            raise ValueError(f"compute_prefix_feature returned {batch_features.shape}, expected {expected_shape}")
-        if batch_features.dtype != np.float32:
-            raise ValueError(f"compute_prefix_feature must return FP32, got {batch_features.dtype}")
-        if not np.isfinite(batch_features).all():
-            raise ValueError("compute_prefix_feature returned non-finite values")
-        feature_chunks.append(batch_features)
-
-        completed = batch_start + len(batch_keys)
-        if batch_start == 0 or completed % (args.batch_size * 25) == 0 or completed == len(plan.keys):
-            print(f"Extracted {completed}/{len(plan.keys)} unique prompt-conditioned prefix features")
-
-    unique_features = np.concatenate(feature_chunks, axis=0)
     storage_dtype = np.float16 if args.storage_dtype == "float16" else np.float32
+    unique_features, completed_keys, partial_dir = _open_partial_feature_cache(
+        output,
+        manifest=manifest_path,
+        checkpoint=checkpoint,
+        config_name=args.config_name,
+        total_keys=len(plan.keys),
+        feature_dim=int(model.prefix_feature_dim),
+        storage_dtype=np.dtype(storage_dtype),
+    )
+
+    if completed_keys < len(plan.keys):
+        dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, root=dataset_root)
+        episode_from = dataset.episode_data_index["from"]
+        episode_to = dataset.episode_data_index["to"]
+
+        for batch_start in range(completed_keys, len(plan.keys), args.batch_size):
+            batch_keys = plan.keys[batch_start : batch_start + args.batch_size]
+            if len(set(batch_keys)) != len(batch_keys):
+                raise AssertionError("internal extraction batch contains duplicate source/frame/prompt keys")
+            transformed: list[dict[str, Any]] = []
+            for key in batch_keys:
+                start = _scalar_int(episode_from[key.source_episode_id])
+                stop = _scalar_int(episode_to[key.source_episode_id])
+                dataset_index = start + key.source_frame_index
+                if dataset_index < start or dataset_index >= stop:
+                    raise ValueError(
+                        f"manifest source frame {key.source_episode_id}:{key.source_frame_index} "
+                        f"is outside [{start}, {stop})"
+                    )
+                sample = dict(dataset[dataset_index])
+                if _scalar_int(sample["episode_index"]) != key.source_episode_id:
+                    raise ValueError("source dataset episode_index disagrees with manifest reference")
+                if _scalar_int(sample["frame_index"]) != key.source_frame_index:
+                    raise ValueError("source dataset frame_index disagrees with manifest reference")
+
+                # This assignment is deliberately before repack, AgileX, normalize,
+                # resize, and tokenizer transforms.  It makes the subtask prompt
+                # explicit before any automatic prompt transform runs.
+                sample["prompt"] = key.prompt
+                transformed.append(policy._input_transform(sample))  # noqa: SLF001
+
+            batched_inputs = jax.tree.map(
+                lambda *values: jnp.asarray(np.stack([np.asarray(value) for value in values], axis=0)),
+                *transformed,
+            )
+            observation = model_api.Observation.from_dict(batched_inputs)
+            batch_features = np.asarray(jax.block_until_ready(compute_fn(state, observation)))
+            expected_shape = (len(batch_keys), int(model.prefix_feature_dim))
+            if batch_features.shape != expected_shape:
+                raise ValueError(f"compute_prefix_feature returned {batch_features.shape}, expected {expected_shape}")
+            if batch_features.dtype != np.float32:
+                raise ValueError(f"compute_prefix_feature must return FP32, got {batch_features.dtype}")
+            if not np.isfinite(batch_features).all():
+                raise ValueError("compute_prefix_feature returned non-finite values")
+
+            completed = batch_start + len(batch_keys)
+            unique_features[batch_start:completed] = batch_features
+            unique_features.flush()
+            _mark_partial_progress(partial_dir, completed)
+            if batch_start == 0 or completed % (args.batch_size * 25) == 0 or completed == len(plan.keys):
+                print(f"Extracted and cached {completed}/{len(plan.keys)} unique prompt-conditioned prefix features")
+
+    unique_features.flush()
     prefix_history = assemble_prefix_history(plan, unique_features, storage_dtype=storage_dtype)
     metadata = temporal_features.save_temporal_feature_cache(
         output,

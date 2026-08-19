@@ -41,6 +41,9 @@ uv run scripts/extract_temporal_completion_features.py \
 
 提取只运行 clean prefix forward，不运行 action sampling，不读取 action hidden。history/current-only 共用这份 cache。
 
+提取过程会在目标旁边增量写入 `<output>.partial/unique_features.npy` 和
+`<output>.partial/progress.json`。每个 batch 完成后才推进进度；如果进程中断，重新执行同一条命令会从最近一个已完成 batch 继续，不会重新提取已经落盘的 prefix。最终 `features.npz` 写成功后，目标文件仍按不可覆盖处理。
+
 ## 3. 训练 history head
 
 ```bash
