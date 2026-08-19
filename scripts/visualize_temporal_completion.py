@@ -22,9 +22,13 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+import contextlib
 import html
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -123,6 +127,7 @@ def _load_prediction_sidecar(
                 "boundary_frame",
                 "label",
                 "sample_kind",
+                "logit",
                 "score",
             }
             if set(arrays.files) != required:
@@ -136,13 +141,17 @@ def _rows_to_payload(
     rows: Sequence[temporal_data.TemporalSampleRow],
     scores: np.ndarray,
     *,
+    logits: np.ndarray,
     split: str,
 ) -> dict[str, np.ndarray]:
     score_array = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if len(rows) != score_array.size:
-        raise ValueError(f"row/score length mismatch for {split}: {len(rows)} vs {score_array.size}")
-    if not np.isfinite(score_array).all():
-        raise ValueError(f"non-finite scores in {split} predictions")
+    logit_array = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if len(rows) != score_array.size or score_array.size != logit_array.size:
+        raise ValueError(
+            f"row/prediction length mismatch for {split}: {len(rows)} vs {score_array.size}/{logit_array.size}"
+        )
+    if not np.isfinite(score_array).all() or not np.isfinite(logit_array).all():
+        raise ValueError(f"non-finite predictions in {split} predictions")
     episode_keys = np.asarray(
         [f"{row.trajectory_id}/subtask-{row.subtask_episode_id}/task-{row.task_index}" for row in rows]
     )
@@ -156,6 +165,7 @@ def _rows_to_payload(
         "boundary_frame": np.asarray([row.boundary_tick for row in rows], dtype=np.int64),
         "label": np.asarray([row.label for row in rows], dtype=np.int8),
         "sample_kind": np.asarray([row.sample_kind for row in rows]),
+        "logit": logit_array,
         "score": score_array,
     }
 
@@ -171,7 +181,64 @@ def _merge_payloads(payloads: Sequence[dict[str, np.ndarray]]) -> dict[str, np.n
 
 def _save_prediction_sidecar(path: Path, metadata: Mapping[str, str | int], payload: Mapping[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, metadata_json=np.asarray(json.dumps(dict(metadata), sort_keys=True)), **payload)
+    # Some /mnt/data mounts reject the seek performed by zipfile while closing
+    # an npz written in place.  Build the archive on the local filesystem and
+    # copy the completed bytes to the requested destination instead.
+    file_descriptor, temporary_name = tempfile.mkstemp(prefix="temporal-completion-", suffix=".npz")
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        np.savez_compressed(
+            temporary_path, metadata_json=np.asarray(json.dumps(dict(metadata), sort_keys=True)), **payload
+        )
+        shutil.copyfile(temporary_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+
+
+def _save_prediction_json(
+    path: Path, report_path: Path, report: Mapping[str, Any], payload: Mapping[str, np.ndarray]
+) -> None:
+    """Save the row-level values used by the HTML in a portable JSON file."""
+
+    rows = [
+        {
+            "split": str(payload["split"][index]),
+            "episode_key": str(payload["episode_key"][index]),
+            "trajectory_id": str(payload["trajectory_id"][index]),
+            "subtask_episode_id": int(payload["subtask_episode_id"][index]),
+            "task_index": int(payload["task_index"][index]),
+            "current_frame": int(payload["current_frame"][index]),
+            "boundary_frame": int(payload["boundary_frame"][index]),
+            "label": int(payload["label"][index]),
+            "sample_kind": str(payload["sample_kind"][index]),
+            "logit": float(payload["logit"][index]),
+            "score": float(payload["score"][index]),
+        }
+        for index in range(len(payload["score"]))
+    ]
+    document = {
+        "schema_version": 1,
+        "source_report": str(report_path.resolve()),
+        "config_name": str(report["bindings"]["config_name"]),
+        "checkpoint_path": str(report["bindings"]["checkpoint_path"]),
+        "feature_cache_path": str(report["bindings"]["feature_cache_path"]),
+        "threshold_selection": report["threshold_selection"],
+        "metrics": {split: _report_split(report, split) for split in SPLIT_CHOICES},
+        "rows": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
 
 
 def _compute_predictions(
@@ -211,7 +278,7 @@ def _compute_predictions(
             input_mode=config.completion.temporal_input_mode,
         )
         scores = temporal_metrics.stable_sigmoid(logits)
-        all_payloads.append(_rows_to_payload(rows, scores, split=split))
+        all_payloads.append(_rows_to_payload(rows, scores, logits=logits, split=split))
     return _merge_payloads(all_payloads)
 
 
@@ -408,6 +475,11 @@ def visualize(args: argparse.Namespace) -> Path:
             _save_prediction_sidecar(prediction_path, metadata, payload)
         print(f"Reused prediction sidecar: {prediction_path}")
 
+    if args.predictions_json is not None:
+        predictions_json = args.predictions_json.resolve()
+        _save_prediction_json(predictions_json, report_path, report, payload)
+        print(f"Wrote row-level prediction JSON: {predictions_json}")
+
     document = _html_document(report, payload, max_episodes=args.max_episodes, task_index=args.task_index)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
@@ -430,6 +502,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=int, default=64, help="Prefix-head inference batch size")
     parser.add_argument("--predictions-cache", type=Path, help="Optional path for the reusable score sidecar")
+    parser.add_argument(
+        "--predictions-json",
+        type=Path,
+        help="Optional portable JSON containing every plotted row and its logit/sigmoid score",
+    )
     return parser
 
 
