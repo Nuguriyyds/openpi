@@ -32,7 +32,15 @@ import numpy as np
 from openpi.training import temporal_completion_data as temporal_data
 from openpi.training import temporal_completion_features as temporal_features
 from openpi.training import temporal_completion_metrics as temporal_metrics
-from scripts import evaluate_temporal_completion as evaluator
+
+try:
+    from scripts import evaluate_temporal_completion as evaluator
+except ModuleNotFoundError as error:
+    # ``uv run scripts/foo.py`` puts ``scripts/`` (not the repository root) on
+    # sys.path, so the sibling evaluator is importable by its plain module name.
+    if error.name != "scripts":
+        raise
+    import evaluate_temporal_completion as evaluator  # type: ignore[no-redef]
 
 SPLIT_CHOICES = ("val", "test")
 PREDICTION_SCHEMA_VERSION = 1
