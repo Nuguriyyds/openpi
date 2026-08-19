@@ -36,7 +36,7 @@ DEFAULT_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_m
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/dataset/ei/huggingface")
 DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json")
 DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v5/features.npz")
-PARTIAL_CACHE_VERSION = 1
+PARTIAL_CACHE_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -194,6 +194,82 @@ def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+@dataclasses.dataclass
+class _PartialFeatureCache:
+    """Small batch files plus progress metadata for restartable extraction."""
+
+    partial_dir: Path
+    total_keys: int
+    feature_dim: int
+    completed_keys: int
+
+    @property
+    def batches_dir(self) -> Path:
+        return self.partial_dir / "batches"
+
+    def _batch_path(self, start: int, end: int) -> Path:
+        return self.batches_dir / f"batch_{start:012d}_{end:012d}.npy"
+
+    def write_batch(self, start: int, features: np.ndarray) -> int:
+        values = np.asarray(features, dtype=np.float32)
+        if values.ndim != 2 or values.shape[1] != self.feature_dim:
+            raise ValueError(
+                f"partial feature batch has shape {values.shape}, expected [batch, {self.feature_dim}]"
+            )
+        if not np.isfinite(values).all():
+            raise ValueError("partial feature batch contains non-finite values")
+        if start != self.completed_keys:
+            raise ValueError(f"partial feature batch starts at {start}, expected {self.completed_keys}")
+        end = start + values.shape[0]
+        if end > self.total_keys:
+            raise ValueError(f"partial feature batch ends at {end}, beyond {self.total_keys} keys")
+
+        self.batches_dir.mkdir(parents=True, exist_ok=True)
+        destination = self._batch_path(start, end)
+        temporary = destination.with_name(destination.name + ".tmp")
+        with temporary.open("wb") as stream:
+            np.save(stream, values, allow_pickle=False)
+        os.replace(temporary, destination)
+        self.completed_keys = end
+        _mark_partial_progress(self.partial_dir, self.completed_keys)
+        return end
+
+    def load_features(self) -> np.ndarray:
+        """Loads completed small batches into the final contiguous FP32 array."""
+
+        features = np.empty((self.total_keys, self.feature_dim), dtype=np.float32)
+        cursor = 0
+        batch_paths = sorted(self.batches_dir.glob("batch_*.npy"))
+        for batch_path in batch_paths:
+            name = batch_path.stem
+            try:
+                _, start_text, end_text = name.split("_")
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise ValueError(f"invalid partial feature batch filename: {batch_path.name}") from exc
+            if end <= cursor:
+                continue
+            if start != cursor or end > self.completed_keys:
+                if start >= self.completed_keys:
+                    continue
+                raise ValueError(
+                    f"partial feature batches are not contiguous at {batch_path.name}; expected start {cursor}"
+                )
+            values = np.load(batch_path, allow_pickle=False)
+            if values.shape != (end - start, self.feature_dim) or values.dtype != np.float32:
+                raise ValueError(
+                    f"partial feature batch {batch_path.name} has shape/dtype {values.shape}/{values.dtype}, "
+                    f"expected {(end - start, self.feature_dim)}/float32"
+                )
+            features[start:end] = values
+            cursor = end
+            if cursor == self.completed_keys:
+                break
+        if cursor != self.completed_keys:
+            raise ValueError(f"partial feature cache ends at {cursor}, progress says {self.completed_keys}")
+        return features
+
+
 def _open_partial_feature_cache(
     output: Path,
     *,
@@ -203,19 +279,18 @@ def _open_partial_feature_cache(
     total_keys: int,
     feature_dim: int,
     storage_dtype: np.dtype[Any],
-) -> tuple[np.memmap, int, Path]:
+) -> _PartialFeatureCache:
     """Opens or creates the resumable FP32 unique-feature cache.
 
-    The cache is intentionally simple: a preallocated ``.npy`` memmap and a
-    small progress JSON.  A batch is considered complete only after its
-    features have been flushed and the progress JSON has been atomically
-    advanced.  If extraction is interrupted, the next invocation recomputes
-    at most the in-flight batch and resumes from the last completed one.
+    The cache is intentionally simple: one small ``.npy`` file per completed
+    batch and a small progress JSON.  This avoids relying on a large mmap,
+    which is not supported reliably by every server filesystem.  A batch is
+    considered complete only after its file is closed and progress JSON has
+    been atomically advanced.
     """
 
     partial_dir = _partial_cache_dir(output)
     metadata_path = partial_dir / "progress.json"
-    feature_path = partial_dir / "unique_features.npy"
     expected = {
         "version": PARTIAL_CACHE_VERSION,
         "manifest": str(manifest),
@@ -229,40 +304,41 @@ def _open_partial_feature_cache(
     if partial_dir.exists():
         if not partial_dir.is_dir():
             raise ValueError(f"partial feature cache path is not a directory: {partial_dir}")
-        if not metadata_path.is_file() or not feature_path.is_file():
-            raise ValueError(f"partial feature cache is incomplete: {partial_dir}")
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"partial feature cache progress is invalid: {metadata_path}") from exc
-        for key, value in expected.items():
-            if metadata.get(key) != value:
-                raise ValueError(
-                    f"partial feature cache does not match this extraction for {key}: "
-                    f"{metadata.get(key)!r} != {value!r}; remove {partial_dir} to restart"
-                )
-        completed = int(metadata.get("completed_keys", -1))
-        if completed < 0 or completed > total_keys:
-            raise ValueError(f"partial feature cache has invalid completed_keys={completed}")
-        features = np.lib.format.open_memmap(feature_path, mode="r+")
-        if features.shape != (total_keys, feature_dim) or features.dtype != np.float32:
-            raise ValueError(
-                f"partial feature array has shape/dtype {features.shape}/{features.dtype}, "
-                f"expected {(total_keys, feature_dim)}/float32"
-            )
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"partial feature cache progress is invalid: {metadata_path}") from exc
+            for key, value in expected.items():
+                if metadata.get(key) != value:
+                    raise ValueError(
+                        f"partial feature cache does not match this extraction for {key}: "
+                        f"{metadata.get(key)!r} != {value!r}; remove {partial_dir} to restart"
+                    )
+            completed = int(metadata.get("completed_keys", -1))
+            if completed < 0 or completed > total_keys:
+                raise ValueError(f"partial feature cache has invalid completed_keys={completed}")
+        else:
+            # The previous memmap implementation could leave an empty
+            # ``unique_features.npy`` after the filesystem rejected mmap
+            # creation.  It contains no usable features, so recover this
+            # exact interrupted state by switching the directory to the
+            # batch-file format.
+            stale_memmap = partial_dir / "unique_features.npy"
+            if stale_memmap.exists():
+                stale_memmap.unlink()
+            completed = 0
+            _write_json_atomically(partial_dir / "progress.json", {**expected, "completed_keys": 0})
+        (partial_dir / "batches").mkdir(parents=True, exist_ok=True)
+        cache = _PartialFeatureCache(partial_dir, total_keys, feature_dim, completed)
         print(f"Resuming prefix extraction from {completed}/{total_keys} cached features: {partial_dir}")
-        return features, completed, partial_dir
+        return cache
 
     partial_dir.mkdir(parents=True, exist_ok=False)
-    features = np.lib.format.open_memmap(
-        feature_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(total_keys, feature_dim),
-    )
+    (partial_dir / "batches").mkdir(parents=True, exist_ok=False)
     _write_json_atomically(partial_dir / "progress.json", {**expected, "completed_keys": 0})
     print(f"Created resumable prefix extraction cache: {partial_dir}")
-    return features, 0, partial_dir
+    return _PartialFeatureCache(partial_dir, total_keys, feature_dim, 0)
 
 
 def _mark_partial_progress(partial_dir: Path, completed_keys: int) -> None:
@@ -430,7 +506,7 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
 
     compute_fn = jax.jit(compute_prefix)
     storage_dtype = np.float16 if args.storage_dtype == "float16" else np.float32
-    unique_features, completed_keys, partial_dir = _open_partial_feature_cache(
+    partial_cache = _open_partial_feature_cache(
         output,
         manifest=manifest_path,
         checkpoint=checkpoint,
@@ -439,6 +515,7 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
         feature_dim=int(model.prefix_feature_dim),
         storage_dtype=np.dtype(storage_dtype),
     )
+    completed_keys = partial_cache.completed_keys
 
     if completed_keys < len(plan.keys):
         dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, root=dataset_root)
@@ -486,13 +563,12 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
                 raise ValueError("compute_prefix_feature returned non-finite values")
 
             completed = batch_start + len(batch_keys)
-            unique_features[batch_start:completed] = batch_features
-            unique_features.flush()
-            _mark_partial_progress(partial_dir, completed)
+            if partial_cache.write_batch(batch_start, batch_features) != completed:
+                raise AssertionError("partial feature cache progress advanced unexpectedly")
             if batch_start == 0 or completed % (args.batch_size * 25) == 0 or completed == len(plan.keys):
                 print(f"Extracted and cached {completed}/{len(plan.keys)} unique prompt-conditioned prefix features")
 
-    unique_features.flush()
+    unique_features = partial_cache.load_features()
     prefix_history = assemble_prefix_history(plan, unique_features, storage_dtype=storage_dtype)
     metadata = temporal_features.save_temporal_feature_cache(
         output,
