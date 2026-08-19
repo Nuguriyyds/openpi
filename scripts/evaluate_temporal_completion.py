@@ -47,7 +47,7 @@ class ValidationArtifact:
 
     checkpoint_step: int
     last_validated_checkpoint_step: int
-    validation_rank: tuple[float, float, float, float]
+    validation_rank: tuple[float, float, float]
     threshold_selection: temporal_metrics.ThresholdSelection
     feature_cache_schema_version: int
     feature_cache_model_config_name: str
@@ -168,8 +168,8 @@ def load_validation_artifact(
     if last_validated_step < step:
         raise ValueError("last_validated_checkpoint_step cannot precede the selected checkpoint_step")
     rank_value = value["validation_rank"]
-    if not isinstance(rank_value, list) or len(rank_value) != 4:
-        raise ValueError("best_temporal_validation validation_rank must contain exactly four numbers")
+    if not isinstance(rank_value, list) or len(rank_value) != 3:
+        raise ValueError("best_temporal_validation validation_rank must contain exactly three numbers")
     if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in rank_value):
         raise ValueError("best_temporal_validation validation_rank must contain only numbers")
     if not all(math.isfinite(float(item)) for item in rank_value):

@@ -3,7 +3,7 @@
 Protocol (version 1)
 --------------------
 
-* Read the same temporal-v3 prefix cache and manifest as the temporal MLP.
+* Read the same subtask-reverse temporal prefix cache and manifest as the temporal MLP.
 * Use only ``prefix_history[:, -1, :]``.  Every natural train row is used once
   in each deterministic full-batch objective; no temporal history is exposed.
 * Fit L2-regularised logistic probes for the fixed ``L2_CANDIDATES`` below.

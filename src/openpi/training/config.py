@@ -627,7 +627,7 @@ class TrainConfig:
                 raise ValueError("completion.split_manifest_path must be set for staged completion training")
         if self.completion.uses_temporal_completion:
             if self.training_time_rtc.enabled:
-                raise ValueError("temporal completion v1 must use the clean non-TTRTC checkpoint")
+                raise ValueError("subtask temporal completion must use the clean non-TTRTC checkpoint")
             if getattr(completion_head, "variant", None) != "temporal_mlp":
                 raise ValueError("temporal completion requires completion_head.variant='temporal_mlp'")
             if getattr(completion_head, "resolved_pooling", None) != "masked_mean":
@@ -637,7 +637,7 @@ class TrainConfig:
                 + self.completion.temporal_hard_negative_per_batch
                 + self.completion.temporal_ordinary_negative_per_batch
             ):
-                raise ValueError("temporal completion batch_size must equal the configured 21/21/22 composition")
+                raise ValueError("temporal completion batch_size must equal the configured 32/16/16 composition")
             if self.save_interval != self.completion.val_interval or self.keep_period != self.completion.val_interval:
                 raise ValueError(
                     "temporal completion requires save_interval=keep_period=val_interval so every val-selected "
@@ -991,7 +991,7 @@ _CONFIGS = [
             stage="head",
             objective="binary",
             split_manifest_path=(
-                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json"
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json"
             ),
             split_seed=42,
             val_interval=200,
@@ -1004,16 +1004,16 @@ _CONFIGS = [
             bce_pos_weight_override=1.0,
             temporal_sampling=True,
             temporal_feature_cache_path=(
-                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/features.npz"
+                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v5/features.npz"
             ),
             temporal_source_model_config_name="pi05_730_breakfast_subtasks",
             temporal_input_mode="history",
             temporal_history_steps=3,
             temporal_stride_frames=15,
-            temporal_positive_per_batch=21,
-            temporal_hard_negative_per_batch=21,
-            temporal_ordinary_negative_per_batch=22,
-            temporal_hard_negative_ticks=4,
+            temporal_positive_per_batch=32,
+            temporal_hard_negative_per_batch=16,
+            temporal_ordinary_negative_per_batch=16,
+            temporal_hard_negative_ticks=1,
             temporal_train_fraction=0.72,
             temporal_val_fraction=0.08,
             temporal_test_fraction=0.20,
@@ -1038,9 +1038,8 @@ _CONFIGS = [
         save_interval=200,
         keep_period=200,
         fsdp_devices=1,
-        # The compressed feature cache is resident in the parent process.
-        # Spawned workers would each pickle a full copy; numpy indexing is
-        # cheap enough that the locked temporal loader stays single-process.
+        # Cached prefix histories are indexed in-process; no worker copies are
+        # needed for the subtask reverse-sampling loader.
         num_workers=0,
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),

@@ -5,12 +5,12 @@ and the clean checkpoint.  It expands the canonical rows from a sealed
 temporal manifest, de-duplicates exact ``(episode, frame, logical prompt)``
 requests, evaluates the clean pi0.5 prefix in deterministic inference mode,
 then reassembles the features in canonical ``[row, oldest..current, dim]``
-order.
+order.  Every request belongs to one raw subtask episode and uses that
+episode's own prompt; no cross-subtask source or prompt is ever constructed.
 
 The supervision fields on a row are never consulted while selecting or
-extracting features.  In particular, a post-boundary source frame belonging
-to the next raw subtask is still evaluated with the previous logical task's
-prompt when the manifest requests it.
+extracting features.  The row's explicit source episode/frame references and
+task prompt are the only model-input identity.
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ DEFAULT_CHECKPOINT = Path(
 )
 DEFAULT_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730")
 DEFAULT_HF_LEROBOT_HOME = Path("/mnt/data/dataset/ei/huggingface")
-DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v3.json")
-DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v4/features.npz")
+DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json")
+DEFAULT_OUTPUT = Path("/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_v5/features.npz")
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -214,7 +214,7 @@ def _scalar_int(value: Any) -> int:
 
 def _validate_clean_runtime(config: Any, *, config_name: str, checkpoint: Path, manifest: Any) -> Any:
     if config.name != config_name or config_name != DEFAULT_CONFIG_NAME:
-        raise ValueError(f"temporal v1 extraction is locked to clean config {DEFAULT_CONFIG_NAME!r}")
+        raise ValueError(f"subtask temporal extraction is locked to clean config {DEFAULT_CONFIG_NAME!r}")
     if bool(getattr(getattr(config, "training_time_rtc", None), "enabled", False)):
         raise ValueError("clean temporal prefix extraction forbids TTRTC")
     completion_head = getattr(config.model, "completion_head", None)
@@ -316,7 +316,7 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
         sample_kwargs={},
     )
     if bool(getattr(policy, "_is_pytorch_model", False)):
-        raise ValueError("temporal v1 prefix extraction requires the JAX clean checkpoint")
+        raise ValueError("subtask temporal prefix extraction requires the JAX clean checkpoint")
     model = policy._model  # noqa: SLF001
     if not hasattr(model, "compute_prefix_feature"):
         raise ValueError("loaded clean pi0.5 model lacks compute_prefix_feature")
@@ -353,8 +353,8 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
                 raise ValueError("source dataset frame_index disagrees with manifest reference")
 
             # This assignment is deliberately before repack, AgileX, normalize,
-            # resize, and tokenizer transforms.  It overrides the raw episode's
-            # task even when a boundary row reads pixels from the next subtask.
+            # resize, and tokenizer transforms.  It makes the subtask prompt
+            # explicit before any automatic prompt transform runs.
             sample["prompt"] = key.prompt
             transformed.append(policy._input_transform(sample))  # noqa: SLF001
 

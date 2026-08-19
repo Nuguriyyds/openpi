@@ -69,16 +69,18 @@ def test_train_batch_has_exact_composition_unique_positives_and_paired_hard_nega
         ordinary = [row for row in selected if row.sample_kind == "ordinary_negative"]
 
         assert len(batch) == 64
-        assert (len(positives), len(hard), len(ordinary)) == (21, 21, 22)
-        assert len({_event(row) for row in positives}) == 21
-        assert {_event(row) for row in hard} == {_event(row) for row in positives}
-
-        expected_task_counts = dict.fromkeys(_sampler.TEMPORAL_TASK_INDICES, 5)
-        expected_task_counts[batch_index] = 6
+        assert (len(positives), len(hard), len(ordinary)) == (32, 16, 16)
+        assert len({(row.trajectory_id, row.task_index) for row in selected}) == 32
         assert {
             task_index: sum(row.task_index == task_index for row in positives)
             for task_index in _sampler.TEMPORAL_TASK_INDICES
-        } == expected_task_counts
+        } == dict.fromkeys(_sampler.TEMPORAL_TASK_INDICES, 8)
+        assert all(
+            (row.trajectory_id, row.task_index, row.boundary_tick)
+            in {_event(positive) for positive in positives}
+            for row in hard
+        )
+        del batch_index
 
 
 def test_task_remainder_rotates_evenly_across_batches_and_epochs():
@@ -93,7 +95,7 @@ def test_task_remainder_rotates_evenly_across_batches_and_epochs():
                 if row.sample_kind == "positive":
                     task_totals[row.task_index] += 1
 
-    assert task_totals == {0: 105, 1: 105, 2: 105, 3: 105}
+    assert task_totals == {0: 160, 1: 160, 2: 160, 3: 160}
 
 
 def test_ordinary_negatives_maximise_distinct_trajectories():
@@ -102,7 +104,7 @@ def test_ordinary_negatives_maximise_distinct_trajectories():
     batch = next(iter(sampler))
     ordinary = [rows[index] for index in batch if rows[index].sample_kind == "ordinary_negative"]
 
-    assert len({row.trajectory_id for row in ordinary}) == 22
+    assert len({(row.trajectory_id, row.task_index) for row in ordinary}) == 16
 
 
 def test_seed_epoch_and_resume_are_reproducible():
@@ -147,11 +149,11 @@ def test_train_sampler_rejects_non_train_rows():
     [
         (
             lambda rows: rows.__setitem__(1, dataclasses.replace(rows[1], logical_tick=rows[1].boundary_tick - 75)),
-            "1-4 ticks",
+            "exactly E-15",
         ),
         (
-            lambda rows: rows.__setitem__(5, dataclasses.replace(rows[5], logical_tick=rows[5].boundary_tick - 15)),
-            "duplicate temporal candidate row",
+            lambda rows: rows.__setitem__(4, dataclasses.replace(rows[4], logical_tick=rows[4].boundary_tick - 1)),
+            "positive endpoint",
         ),
         (
             lambda rows: rows.__setitem__(0, dataclasses.replace(rows[0], label=0)),
@@ -159,7 +161,7 @@ def test_train_sampler_rejects_non_train_rows():
         ),
         (
             lambda rows: rows.__setitem__(0, dataclasses.replace(rows[0], logical_tick=rows[0].logical_tick + 1)),
-            "logical_tick must equal boundary_tick",
+            "positive endpoint",
         ),
     ],
 )
@@ -176,44 +178,28 @@ def test_duplicate_positive_event_fails_closed():
         _sampler.TemporalCompletionBatchSampler([*rows, rows[0]], seed=1)
 
 
-def test_missing_event_local_hard_falls_back_to_same_task_other_trajectory():
-    rows = _make_rows(trajectory_count=6)
+def test_missing_event_local_hard_fails_closed():
+    rows = _make_rows(trajectory_count=8)
     event = _event(rows[0])
     without_pair = [row for row in rows if not (row.sample_kind == "hard_negative" and _event(row) == event)]
-    sampler = _sampler.TemporalCompletionBatchSampler(without_pair, seed=1, batches_per_epoch=1)
-    batch = next(iter(sampler))
-    selected = [without_pair[index] for index in batch]
-    audit = sampler.audit_batch(batch)
-
-    assert event in {
-        (key.trajectory_id, key.task_index, key.boundary_tick) for key in sampler.events_without_local_hard
-    }
-    assert event in {_event(row) for row in selected if row.sample_kind == "positive"}
-    assert event not in {_event(row) for row in selected if row.sample_kind == "hard_negative"}
-    assert sum(row.sample_kind == "hard_negative" and row.task_index == 0 for row in selected) == 6
-    assert audit == _sampler.TemporalBatchAudit(
-        positive_count=21,
-        hard_negative_count=21,
-        ordinary_negative_count=22,
-        event_local_hard_count=20,
-        same_task_fallback_hard_count=1,
-        positive_task_counts=(6, 5, 5, 5),
-    )
+    del event
+    with pytest.raises(ValueError, match="task 0 hard pool has only 7"):
+        _sampler.TemporalCompletionBatchSampler(without_pair, seed=1, batches_per_epoch=1)
 
 
 def test_missing_entire_task_hard_pool_fails_closed():
     rows = [row for row in _make_rows() if not (row.sample_kind == "hard_negative" and row.task_index == 3)]
-    with pytest.raises(ValueError, match=r"no hard negatives.*\[3\]"):
+    with pytest.raises(ValueError, match=r"task 3 hard pool has only 0"):
         _sampler.TemporalCompletionBatchSampler(rows, seed=1)
 
 
-def test_each_task_requires_six_unique_positive_events():
+def test_each_task_requires_eight_unique_positive_events():
     rows = [
         row
-        for row in _make_rows(trajectory_count=6)
+        for row in _make_rows(trajectory_count=8)
         if not (row.trajectory_id == "trajectory-5" and row.task_index == 3)
     ]
-    with pytest.raises(ValueError, match="task 3 has only 5 unique positive events"):
+    with pytest.raises(ValueError, match="task 3 needs at least 8 positive"):
         _sampler.TemporalCompletionBatchSampler(rows, seed=1)
 
 
@@ -222,9 +208,9 @@ def test_natural_eval_batches_preserve_all_rows_once_and_keep_partial_batch():
     sampler = _sampler.NaturalTemporalEvalBatchSampler(rows, batch_size=9)
     batches = list(sampler)
 
-    assert len(batches) == 4
+    assert len(batches) == 2
     assert [index for batch in batches for index in batch] == list(range(len(rows)))
-    assert len(batches[-1]) == 1
+    assert len(batches[-1]) == 7
 
 
 def test_distributed_loading_is_explicitly_rejected():

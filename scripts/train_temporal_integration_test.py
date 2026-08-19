@@ -116,6 +116,7 @@ def _validation_rows() -> tuple[temporal_completion_data.TemporalSampleRow, ...]
     rows = []
     for tick in (30, 45, 60):
         label = int(tick == 60)
+        sample_kind = "positive" if label else ("hard_negative" if tick == 45 else "ordinary_negative")
         rows.append(
             temporal_completion_data.TemporalSampleRow(
                 trajectory_id="tiny-val-trajectory",
@@ -124,7 +125,7 @@ def _validation_rows() -> tuple[temporal_completion_data.TemporalSampleRow, ...]
                 split="val",
                 logical_tick=tick,
                 label=label,
-                sample_kind="positive" if label else "hard_negative",
+                sample_kind=sample_kind,
                 boundary_tick=60,
                 prompt_index=0,
                 history_logical_ticks=(tick - 30, tick - 15, tick),
@@ -213,19 +214,17 @@ def test_cached_temporal_batch_trains_only_head_and_flows_through_validation_ran
         loader,  # type: ignore[arg-type]
     )
     expected_rank_keys = {
-        "val/temporal/boundary_top1_rate",
+        "val/temporal/natural/auprc",
         "val/temporal/hard_local/auprc",
         "val/temporal/margin/hard_local_median",
-        "val/temporal/natural/auprc",
     }
     assert expected_rank_keys <= metrics.keys()
     assert selection.selected_on_split == "val"
     assert train.temporal_validation_rank(metrics) == tuple(
         float(metrics[key])
         for key in (
-            "val/temporal/boundary_top1_rate",
+            "val/temporal/natural/auprc",
             "val/temporal/hard_local/auprc",
             "val/temporal/margin/hard_local_median",
-            "val/temporal/natural/auprc",
         )
     )

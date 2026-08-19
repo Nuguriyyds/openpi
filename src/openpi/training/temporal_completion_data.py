@@ -21,7 +21,7 @@ TICK_STRIDE_FRAMES = 15
 TASKS_PER_TRAJECTORY = 4
 TEMPORAL_HISTORY_STEPS = 3
 SPLIT_SEED = 42
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 SPLIT_RATIOS: Mapping[str, float] = {"train": 0.72, "val": 0.08, "test": 0.20}
 
 SplitName = Literal["train", "val", "test"]
@@ -75,6 +75,18 @@ class SubtaskEpisodeRecord:
         if self.length <= 0:
             raise ValueError(f"subtask {self.episode_id} is empty or has invalid length {self.length}")
 
+    @property
+    def end_frame(self) -> int:
+        """Inclusive artificial-human completion frame for this subtask.
+
+        The audited LeRobot parquet uses contiguous frame indices ``0..L-1``;
+        therefore the last row is the inclusive endpoint ``E=L-1``.  Keeping
+        this conversion in the record prevents the temporal sampler from
+        accidentally treating the exclusive length as the completion frame.
+        """
+
+        return self.length - 1
+
 
 @dataclasses.dataclass(frozen=True)
 class FullEpisodeRecord:
@@ -119,7 +131,10 @@ class SubtaskGroupRecord:
                 f"group {self.group_id} has inconsistent exclusive boundaries: "
                 f"expected={tuple(expected_boundaries)}, got={self.boundaries}"
             )
-        expected_ticks = tuple(ceil_to_tick(boundary) for boundary in self.boundaries)
+        # ``positive_ticks`` is retained as a manifest field for compatibility,
+        # but in the subtask protocol it stores each episode's inclusive E,
+        # not a cumulative/global tick.
+        expected_ticks = tuple(length - 1 for length in self.lengths)
         if self.positive_ticks != expected_ticks:
             raise ValueError(
                 f"group {self.group_id} has inconsistent positive ticks: expected={expected_ticks}, "
@@ -144,7 +159,7 @@ class SubtaskGroupRecord:
             task_indices=task_indices,  # type: ignore[arg-type]
             lengths=lengths,  # type: ignore[arg-type]
             boundaries=tuple(boundaries),  # type: ignore[arg-type]
-            positive_ticks=tuple(ceil_to_tick(boundary) for boundary in boundaries),  # type: ignore[arg-type]
+            positive_ticks=tuple(episode.end_frame for episode in episodes),  # type: ignore[arg-type]
         )
 
 
@@ -193,12 +208,14 @@ def require_reachable(group: SubtaskGroupRecord) -> None:
 
 
 def global_feature_ticks(group: SubtaskGroupRecord, task_index: int) -> tuple[int, ...]:
-    """Returns same-prompt feature ticks for one oracle activation interval."""
+    """Legacy logical-trajectory helper; not used by subtask temporal training."""
 
     if task_index not in range(TASKS_PER_TRAJECTORY):
         raise ValueError(f"task_index must be in [0, 3], got {task_index}")
-    start = 0 if task_index == 0 else group.positive_ticks[task_index - 1] + TICK_STRIDE_FRAMES
-    stop = group.positive_ticks[task_index]
+    # Preserve the old virtual-concatenation helper for callers that still
+    # inspect it, while the new sample builder uses local inclusive endpoints.
+    start = 0 if task_index == 0 else ceil_to_tick(group.boundaries[task_index - 1]) + TICK_STRIDE_FRAMES
+    stop = ceil_to_tick(group.boundaries[task_index])
     if start > stop:
         return ()
     return tuple(range(start, stop + 1, TICK_STRIDE_FRAMES))
@@ -219,12 +236,12 @@ class SourceFrameReference:
 
 
 def map_logical_frame(group: SubtaskGroupRecord, logical_frame: int) -> SourceFrameReference:
-    """Maps a virtual-concatenation frame to immutable source coordinates."""
+    """Legacy virtual-concatenation helper; not used by subtask temporal training."""
 
     if logical_frame < 0:
         raise ValueError(f"logical_frame must be non-negative, got {logical_frame}")
     total_length = group.boundaries[-1]
-    terminal_limit = group.positive_ticks[-1]
+    terminal_limit = ceil_to_tick(group.boundaries[-1])
     if logical_frame >= total_length:
         if logical_frame > terminal_limit:
             raise ValueError(f"logical frame {logical_frame} exceeds task-3 terminal hold limit {terminal_limit}")
@@ -665,7 +682,13 @@ def create_temporal_manifest(
     trajectory_source: TrajectorySource = "full_identity",
     split_seed: int = SPLIT_SEED,
 ) -> TemporalCompletionManifest:
-    """Quarantines invalid trajectories, then seals test before val/train."""
+    """Seal the trajectory-level split without imposing temporal reachability.
+
+    A complete breakfast group is only a split unit.  Completion candidates
+    are built later per raw subtask episode, so a short episode may contribute
+    no rows without quarantining its three siblings or changing the group
+    split.
+    """
 
     if split_seed != SPLIT_SEED:
         raise ValueError(f"temporal split_seed is locked to {SPLIT_SEED}, got {split_seed}")
@@ -689,11 +712,7 @@ def create_temporal_manifest(
             exclusion_by_id[identity.trajectory_id] = identity.exclusion_reason or "unmatched_identity"
             continue
         assert identity.group is not None
-        reasons = reachability_exclusion_reasons(identity.group)
-        if reasons:
-            exclusion_by_id[identity.trajectory_id] = ";".join(reasons)
-        else:
-            eligible.append(identity)
+        eligible.append(identity)
 
     counts = compute_split_counts(len(eligible))
     shuffled_ids = [identity.trajectory_id for identity in sorted(eligible, key=lambda item: item.trajectory_id)]
@@ -833,25 +852,13 @@ def validate_temporal_manifest(manifest: TemporalCompletionManifest) -> None:
         if manifest.trajectory_source == "subtask_logical" and record.mapping_status == "subtask_only":
             if group is None or record.full_episode_id is not None:
                 raise ValueError(f"logical trajectory {record.trajectory_id} has invalid identity fields")
-            reasons = reachability_exclusion_reasons(group)
-            if record.split is None:
-                if not reasons or record.exclusion_reason != ";".join(reasons):
-                    raise ValueError(
-                        f"logical trajectory {record.trajectory_id} is unsplit without exact reachability quarantine"
-                    )
-            elif reasons or record.exclusion_reason is not None:
-                raise ValueError(f"split logical trajectory {record.trajectory_id} is invalid or quarantined")
+            if record.split is None or record.exclusion_reason is not None:
+                raise ValueError("subtask logical training groups cannot be quarantined by temporal reachability")
         elif record.mapping_status == "matched":
             if group is None or record.full_episode_id is None:
                 raise ValueError(f"matched trajectory {record.trajectory_id} lacks group/full identity")
-            reasons = reachability_exclusion_reasons(group)
-            if record.split is None:
-                if not reasons or record.exclusion_reason != ";".join(reasons):
-                    raise ValueError(
-                        f"matched trajectory {record.trajectory_id} is unsplit without exact reachability quarantine"
-                    )
-            elif reasons or record.exclusion_reason is not None:
-                raise ValueError(f"split trajectory {record.trajectory_id} is invalid or quarantined")
+            if record.split is None or record.exclusion_reason is not None:
+                raise ValueError("matched training groups cannot be quarantined by temporal reachability")
         else:
             if record.split is not None:
                 raise ValueError(f"unmatched trajectory {record.trajectory_id} cannot enter split {record.split}")
@@ -947,6 +954,12 @@ class TemporalSampleRow:
     source_frame_indices: tuple[int, int, int]
     terminal_hold_flags: tuple[bool, bool, bool]
 
+    @property
+    def subtask_episode_id(self) -> int:
+        """The single raw subtask episode owning all three source frames."""
+
+        return self.source_episode_ids[0]
+
     def __post_init__(self) -> None:
         if not self.trajectory_id or self.full_episode_id < 0:
             raise ValueError("sample requires a valid trajectory and full episode identity")
@@ -972,8 +985,6 @@ class TemporalSampleRow:
             raise ValueError("sample history/source indices must be non-negative")
         if self.boundary_tick < 0 or self.logical_tick > self.boundary_tick:
             raise ValueError("sample logical_tick must not occur after its non-negative boundary_tick")
-        if any(tick % TICK_STRIDE_FRAMES for tick in (*self.history_logical_ticks, self.boundary_tick)):
-            raise ValueError("sample history and boundary must use the global 15-frame tick phase")
         if self.label not in (0, 1):
             raise ValueError("sample label must be binary")
         if (self.sample_kind == "positive") != (self.label == 1):
@@ -986,18 +997,30 @@ class TemporalSampleRow:
         )
         if gaps != (TICK_STRIDE_FRAMES, TICK_STRIDE_FRAMES):
             raise ValueError(f"sample history gaps must be (15, 15), got {gaps}")
-        if self.sample_kind == "positive" and self.logical_tick != self.boundary_tick:
-            raise ValueError("positive sample logical_tick must equal boundary_tick")
+        if len(set(self.source_episode_ids)) != 1:
+            raise ValueError("all three temporal references must belong to one subtask episode")
+        if any(frame > self.boundary_tick for frame in self.source_frame_indices):
+            raise ValueError("temporal source frame exceeds the subtask completion frame")
         distance = self.boundary_tick - self.logical_tick
-        expected_kind: SampleKind
-        if distance == 0:
-            expected_kind = "positive"
-        elif distance in (15, 30, 45, 60):
-            expected_kind = "hard_negative"
-        else:
-            expected_kind = "ordinary_negative"
-        if self.sample_kind != expected_kind:
-            raise ValueError(f"sample_kind {self.sample_kind!r} is inconsistent with boundary distance {distance}")
+        if self.sample_kind == "positive":
+            if self.logical_tick != self.boundary_tick or self.label != 1:
+                raise ValueError("positive sample must be the inclusive endpoint and have label 1")
+        elif self.sample_kind == "hard_negative":
+            if distance != TICK_STRIDE_FRAMES or self.label != 0:
+                raise ValueError("hard negative must be exactly 15 frames before E and have label 0")
+        elif self.label != 0 or distance < 2 * TICK_STRIDE_FRAMES or distance % TICK_STRIDE_FRAMES:
+            raise ValueError("ordinary negative must be E-30, E-45, ... and have label 0")
+        expected_history = (
+            self.logical_tick - 2 * TICK_STRIDE_FRAMES,
+            self.logical_tick - TICK_STRIDE_FRAMES,
+            self.logical_tick,
+        )
+        if self.history_logical_ticks != expected_history:
+            raise ValueError(f"history must be [t-30, t-15, t], got {self.history_logical_ticks}")
+        if self.source_frame_indices != expected_history:
+            raise ValueError("source frame indices must equal the local subtask history frames")
+        if any(self.terminal_hold_flags):
+            raise ValueError("subtask temporal samples do not use terminal holds")
 
 
 def build_temporal_sample_rows(
@@ -1007,52 +1030,65 @@ def build_temporal_sample_rows(
     full_episode_id: int,
     split: SplitName,
 ) -> tuple[TemporalSampleRow, ...]:
-    """Builds the natural oracle-prompt candidate set for one trajectory."""
+    """Builds reverse-sampled candidates independently for each subtask.
+
+    ``group`` is used only to carry the split/trajectory identity.  Images and
+    history are always addressed in one raw episode; no logical concatenation
+    or prompt crossing is possible in this indexer.
+    """
 
     if split not in SPLIT_NAMES:
         raise ValueError(f"invalid split {split!r}")
-    require_reachable(group)
     rows: list[TemporalSampleRow] = []
     for task_index in range(TASKS_PER_TRAJECTORY):
-        boundary_tick = group.positive_ticks[task_index]
-        for logical_tick in eligible_decision_ticks(group, task_index):
-            if logical_tick == boundary_tick:
-                label = 1
-                sample_kind: SampleKind = "positive"
-            elif boundary_tick - logical_tick in (15, 30, 45, 60):
-                label = 0
-                sample_kind = "hard_negative"
-            else:
-                label = 0
-                sample_kind = "ordinary_negative"
-            history_ticks = (
-                logical_tick - 2 * TICK_STRIDE_FRAMES,
-                logical_tick - TICK_STRIDE_FRAMES,
-                logical_tick,
+        episode_id = group.source_episode_ids[task_index]
+        end_frame = group.lengths[task_index] - 1
+        if end_frame < 3 * TICK_STRIDE_FRAMES:
+            continue
+
+        def add_row(
+            current_frame: int,
+            sample_kind: SampleKind,
+            label: int,
+            *,
+            _task_index: int = task_index,
+            _end_frame: int = end_frame,
+            _episode_id: int = episode_id,
+        ) -> None:
+            history_frames = (
+                current_frame - 2 * TICK_STRIDE_FRAMES,
+                current_frame - TICK_STRIDE_FRAMES,
+                current_frame,
             )
-            references = tuple(map_logical_frame(group, tick) for tick in history_ticks)
             rows.append(
                 TemporalSampleRow(
                     trajectory_id=trajectory_id,
                     full_episode_id=full_episode_id,
-                    task_index=task_index,
+                    task_index=_task_index,
                     split=split,
-                    logical_tick=logical_tick,
+                    logical_tick=current_frame,
                     label=label,
                     sample_kind=sample_kind,
-                    boundary_tick=boundary_tick,
-                    prompt_index=task_index,
-                    history_logical_ticks=history_ticks,
-                    source_episode_ids=tuple(reference.episode_id for reference in references),  # type: ignore[arg-type]
-                    source_frame_indices=tuple(reference.frame_index for reference in references),  # type: ignore[arg-type]
-                    terminal_hold_flags=tuple(reference.terminal_hold for reference in references),  # type: ignore[arg-type]
+                    boundary_tick=_end_frame,
+                    prompt_index=_task_index,
+                    history_logical_ticks=history_frames,
+                    source_episode_ids=(_episode_id, _episode_id, _episode_id),
+                    source_frame_indices=history_frames,
+                    terminal_hold_flags=(False, False, False),
                 )
             )
 
-    positive_keys = [(row.trajectory_id, row.task_index) for row in rows if row.label == 1]
-    expected_keys = [(trajectory_id, task_index) for task_index in range(TASKS_PER_TRAJECTORY)]
-    if positive_keys != expected_keys:
-        raise ValueError(f"trajectory {trajectory_id} must have exactly one positive per task; got={positive_keys}")
+        # Exactly one endpoint positive and one fixed E-15 hard negative.
+        add_row(end_frame, "positive", 1)
+        add_row(end_frame - TICK_STRIDE_FRAMES, "hard_negative", 0)
+
+        # Ordinary negatives walk backwards from E-30.  Each candidate has its
+        # own complete local three-frame history and is sampled afresh by the
+        # training sampler.
+        current_frame = end_frame - 2 * TICK_STRIDE_FRAMES
+        while current_frame >= 2 * TICK_STRIDE_FRAMES:
+            add_row(current_frame, "ordinary_negative", 0)
+            current_frame -= TICK_STRIDE_FRAMES
     return tuple(rows)
 
 

@@ -16,12 +16,12 @@ from scripts import evaluate_temporal_completion as evaluator
 
 def _selection() -> temporal_metrics.ThresholdSelection:
     return temporal_metrics.ThresholdSelection(
-        threshold=0.8,
+        threshold=0.5,
         validation_event_count=1,
         validation_early_trigger_events=0,
         validation_event_recall=1.0,
         validation_event_f1=1.0,
-        candidate_count=3,
+        candidate_count=1,
     )
 
 
@@ -40,9 +40,9 @@ def _write_selection(
             {
                 "checkpoint_step": step,
                 "last_validated_checkpoint_step": step if last_validated_step is None else last_validated_step,
-                "validation_rank": [1.0, 0.9, 0.8, 0.7],
+                "validation_rank": [1.0, 0.9, 0.8],
                 "threshold_selection": selection,
-                "feature_cache_schema_version": 3,
+                "feature_cache_schema_version": 4,
                 "feature_cache_model_config_name": "clean",
                 "feature_cache_checkpoint_path": "/checkpoint/49999",
                 "feature_cache_row_count": 100,
@@ -56,7 +56,7 @@ def _write_selection(
 
 def _artifact_kwargs(*, temporal_input_mode: str = "history") -> dict[str, object]:
     return {
-        "feature_cache_schema_version": 3,
+        "feature_cache_schema_version": 4,
         "feature_cache_model_config_name": "clean",
         "feature_cache_checkpoint_path": "/checkpoint/49999",
         "feature_cache_row_count": 100,
@@ -76,7 +76,9 @@ def _event(
     for logical_tick in (30, 45, 60):
         distance = 60 - logical_tick
         label = int(distance == 0)
-        sample_kind: temporal_data.SampleKind = "positive" if label else "hard_negative"
+        sample_kind: temporal_data.SampleKind = "positive" if label else (
+            "hard_negative" if distance == 15 else "ordinary_negative"
+        )
         rows.append(
             temporal_data.TemporalSampleRow(
                 trajectory_id=trajectory_id,

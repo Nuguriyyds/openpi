@@ -97,10 +97,10 @@ class CompletionTrainingConfig:
     temporal_input_mode: TemporalInputMode = "history"
     temporal_history_steps: int = 3
     temporal_stride_frames: int = 15
-    temporal_positive_per_batch: int = 21
-    temporal_hard_negative_per_batch: int = 21
-    temporal_ordinary_negative_per_batch: int = 22
-    temporal_hard_negative_ticks: int = 4
+    temporal_positive_per_batch: int = 32
+    temporal_hard_negative_per_batch: int = 16
+    temporal_ordinary_negative_per_batch: int = 16
+    temporal_hard_negative_ticks: int = 1
     temporal_train_fraction: float = 0.72
     temporal_val_fraction: float = 0.08
     temporal_test_fraction: float = 0.20
@@ -215,10 +215,10 @@ class CompletionTrainingConfig:
                 self.temporal_hard_negative_per_batch,
                 self.temporal_ordinary_negative_per_batch,
             )
-            if counts != (21, 21, 22):
-                raise ValueError("temporal completion v1 requires batch counts (21, 21, 22)")
-            if self.temporal_hard_negative_ticks != 4:
-                raise ValueError("temporal completion hard negatives must cover the preceding four 2 Hz ticks")
+            if counts != (32, 16, 16):
+                raise ValueError("temporal completion requires batch counts (32, 16, 16)")
+            if self.temporal_hard_negative_ticks != 1:
+                raise ValueError("temporal completion uses the fixed E-15 hard negative")
             fractions = (
                 self.temporal_train_fraction,
                 self.temporal_val_fraction,
@@ -229,9 +229,9 @@ class CompletionTrainingConfig:
             if abs(sum(fractions) - 1.0) > 1.0e-9:
                 raise ValueError("temporal completion split fractions must sum to 1")
             if self.focal_gamma != 0.0:
-                raise ValueError("temporal completion v1 uses unweighted BCE, not focal loss")
+                raise ValueError("subtask temporal completion uses unweighted BCE, not focal loss")
             if self.bce_pos_weight_override not in (None, 1.0):
-                raise ValueError("temporal completion v1 requires bce_pos_weight_override=1.0")
+                raise ValueError("subtask temporal completion requires bce_pos_weight_override=1.0")
 
     @property
     def uses_completion_data(self) -> bool:

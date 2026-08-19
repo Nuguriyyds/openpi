@@ -679,14 +679,13 @@ def evaluate_temporal_completion_loader(
     return metrics, selection
 
 
-def temporal_validation_rank(metrics: dict[str, float]) -> tuple[float, float, float, float]:
-    """Locked threshold-free checkpoint ordering (larger is better)."""
+def temporal_validation_rank(metrics: dict[str, float]) -> tuple[float, float, float]:
+    """Locked validation-only ordering (natural AUPRC, hard AUPRC, margin)."""
 
     keys = (
-        "val/temporal/boundary_top1_rate",
+        "val/temporal/natural/auprc",
         "val/temporal/hard_local/auprc",
         "val/temporal/margin/hard_local_median",
-        "val/temporal/natural/auprc",
     )
     values = tuple(float(metrics[key]) for key in keys)
     # Keep the persisted selection JSON standards-compliant even if a tiny
@@ -1118,7 +1117,7 @@ def main(config: _config.TrainConfig):
         )
 
     temporal_selection_path = epath.Path(config.checkpoint_dir) / "best_temporal_validation.json"
-    best_temporal_rank: tuple[float, float, float, float] | None = None
+    best_temporal_rank: tuple[float, float, float] | None = None
     best_temporal_step: int | None = None
     best_temporal_threshold_selection: dict[str, Any] | None = None
     pending_temporal_selection: dict[str, Any] | None = None
@@ -1150,7 +1149,7 @@ def main(config: _config.TrainConfig):
             previous_selection,
             resumed_step=start_step,
         )
-        if len(best_temporal_rank) != 4 or not all(np.isfinite(best_temporal_rank)):
+        if len(best_temporal_rank) != 3 or not all(np.isfinite(best_temporal_rank)):
             raise ValueError("temporal validation selection has an invalid validation_rank")
         if best_temporal_step <= 0 or best_temporal_step > start_step:
             raise ValueError(

@@ -18,12 +18,12 @@ import numpy as np
 TemporalSampleKind: TypeAlias = Literal["positive", "hard_negative", "ordinary_negative"]
 
 TEMPORAL_BATCH_SIZE = 64
-POSITIVE_PER_BATCH = 21
-HARD_NEGATIVE_PER_BATCH = 21
-ORDINARY_NEGATIVE_PER_BATCH = 22
+POSITIVE_PER_BATCH = 32
+HARD_NEGATIVE_PER_BATCH = 16
+ORDINARY_NEGATIVE_PER_BATCH = 16
 TEMPORAL_TASK_INDICES = (0, 1, 2, 3)
 DEFAULT_TICK_STRIDE_FRAMES = 15
-HARD_NEGATIVE_OFFSETS = (1, 2, 3, 4)
+HARD_NEGATIVE_OFFSETS = (1,)
 _STATE_SCHEMA_VERSION = 1
 
 
@@ -139,21 +139,7 @@ def _normalise_sample(sample: TemporalSampleLike, *, index: int) -> _SampleView:
 
 
 class TemporalCompletionBatchSampler:
-    """Yields strict ``21 positive + 21 paired hard + 22 ordinary`` batches.
-
-    Positive events are sampled without replacement *within* a batch and with
-    replacement across batches.  For every selected positive, exactly one hard
-    negative is drawn from the same ``(trajectory, task, boundary)`` event when
-    one exists.  A reachable event with no earlier eligible decision tick uses
-    a real hard negative from the same task in another trajectory.  The task
-    receiving the sixth positive rotates over consecutive batches; the other
-    tasks each receive five.
-
-    Randomness is derived independently from ``(seed, epoch, batch_index)``.
-    Consequently resume can jump directly to a batch without replaying earlier
-    RNG draws.  This first implementation is intentionally single-process:
-    callers must shard batches explicitly before enabling distributed loading.
-    """
+    """Sample 32 positives with 16 fixed-hard and 16 ordinary pairs."""
 
     def __init__(
         self,
@@ -168,74 +154,63 @@ class TemporalCompletionBatchSampler:
     ) -> None:
         if batch_size != TEMPORAL_BATCH_SIZE:
             raise ValueError(f"temporal completion batch_size must be exactly {TEMPORAL_BATCH_SIZE}")
-        if seed < 0:
-            raise ValueError("temporal completion sampler seed must be non-negative")
-        if tick_stride_frames <= 0:
-            raise ValueError("tick_stride_frames must be positive")
+        if seed < 0 or tick_stride_frames <= 0:
+            raise ValueError("temporal completion sampler seed/stride must be positive")
         if num_replicas != 1 or rank != 0:
-            raise ValueError(
-                "TemporalCompletionBatchSampler is single-process in this version; "
-                "explicitly shard batches before using num_replicas != 1"
-            )
-        if len(samples) == 0:
-            raise ValueError("temporal completion sampling requires at least one candidate row")
+            raise ValueError("TemporalCompletionBatchSampler is single-process in this version")
+        if not samples:
+            raise ValueError("temporal completion sampling requires candidate rows")
 
         views = tuple(_normalise_sample(sample, index=index) for index, sample in enumerate(samples))
         self._validate_candidate_rows(views, tick_stride_frames=tick_stride_frames)
-
-        positive_by_task: dict[int, list[int]] = {task_index: [] for task_index in TEMPORAL_TASK_INDICES}
-        positive_event_by_index: dict[int, CompletionEventKey] = {}
-        hard_by_event: dict[CompletionEventKey, list[int]] = {}
-        hard_by_task: dict[int, list[int]] = {task_index: [] for task_index in TEMPORAL_TASK_INDICES}
-        ordinary_by_trajectory: dict[Hashable, list[int]] = {}
+        positive_by_task: dict[int, list[int]] = {task: [] for task in TEMPORAL_TASK_INDICES}
+        positive_by_episode: dict[tuple[Hashable, int], int] = {}
+        hard_by_episode: dict[tuple[Hashable, int], int] = {}
+        ordinary_by_episode: dict[tuple[Hashable, int], list[int]] = {}
         for view in views:
+            key = (view.trajectory_id, view.task_index)
             if view.sample_kind == "positive":
                 positive_by_task[view.task_index].append(view.index)
-                positive_event_by_index[view.index] = view.event_key
+                if key in positive_by_episode:
+                    raise ValueError(f"duplicate positive subtask episode {key!r}")
+                positive_by_episode[key] = view.index
             elif view.sample_kind == "hard_negative":
-                hard_by_event.setdefault(view.event_key, []).append(view.index)
-                hard_by_task[view.task_index].append(view.index)
+                if key in hard_by_episode:
+                    raise ValueError(f"duplicate hard negative subtask episode {key!r}")
+                hard_by_episode[key] = view.index
             else:
-                ordinary_by_trajectory.setdefault(view.trajectory_id, []).append(view.index)
+                ordinary_by_episode.setdefault(key, []).append(view.index)
 
-        for task_index, pool in positive_by_task.items():
-            required = 6
-            if len(pool) < required:
-                raise ValueError(
-                    f"task {task_index} has only {len(pool)} unique positive events; "
-                    f"at least {required} are required for a 5/5/5/6 batch"
-                )
-        missing_hard = [event for event in positive_event_by_index.values() if event not in hard_by_event]
-        positive_events = set(positive_event_by_index.values())
-        orphan_hard = [event for event in hard_by_event if event not in positive_events]
+        for task, pool in positive_by_task.items():
+            if len(pool) < 8:
+                raise ValueError(f"task {task} needs at least 8 positive subtask episodes, got {len(pool)}")
+            ordinary_count = sum(key[1] == task for key in ordinary_by_episode)
+            if ordinary_count < 4:
+                raise ValueError(f"task {task} ordinary pool has only {ordinary_count} episodes; need 4")
+            hard_count = sum(key[1] == task for key in hard_by_episode)
+            if hard_count < 8:
+                raise ValueError(f"task {task} hard pool has only {hard_count} episodes; need 8")
+        missing_hard = set(positive_by_episode) - set(hard_by_episode)
+        if missing_hard:
+            raise ValueError(f"every positive subtask episode needs its fixed hard negative: {sorted(missing_hard)!r}")
+        orphan_hard = set(hard_by_episode) - set(positive_by_episode)
         if orphan_hard:
-            raise ValueError(f"hard negative(s) have no matching positive event: {orphan_hard[:3]}")
-        tasks_without_hard = [task_index for task_index, pool in hard_by_task.items() if not pool]
-        if tasks_without_hard:
-            raise ValueError(
-                "temporal completion task(s) have no hard negatives for event-local pairing or same-task "
-                f"fallback: {tasks_without_hard}"
-            )
-        if not ordinary_by_trajectory:
-            raise ValueError("temporal completion sampling found no ordinary negatives")
+            raise ValueError("every hard negative must have a positive from the same subtask episode")
+        orphan_ordinary = set(ordinary_by_episode) - set(positive_by_episode)
+        if orphan_ordinary:
+            raise ValueError("every ordinary negative must have a positive from the same subtask episode")
 
-        positive_count = len(positive_event_by_index)
-        if batches_per_epoch is None:
-            batches_per_epoch = math.ceil(positive_count / POSITIVE_PER_BATCH)
+        positive_count = len(positive_by_episode)
+        batches_per_epoch = math.ceil(positive_count / POSITIVE_PER_BATCH) if batches_per_epoch is None else batches_per_epoch
         if batches_per_epoch <= 0:
             raise ValueError("batches_per_epoch must be positive")
-
         self._views = views
-        self._positive_by_task = {
-            task_index: np.asarray(pool, dtype=np.int64) for task_index, pool in positive_by_task.items()
-        }
-        self._positive_event_by_index = positive_event_by_index
-        self._hard_by_event = {event: np.asarray(pool, dtype=np.int64) for event, pool in hard_by_event.items()}
-        self._hard_by_task = {task_index: np.asarray(pool, dtype=np.int64) for task_index, pool in hard_by_task.items()}
-        self._events_without_local_hard = frozenset(missing_hard)
-        self._ordinary_trajectory_ids = tuple(ordinary_by_trajectory)
-        self._ordinary_by_trajectory = {
-            trajectory_id: np.asarray(pool, dtype=np.int64) for trajectory_id, pool in ordinary_by_trajectory.items()
+        self._positive_by_task = {task: np.asarray(pool, dtype=np.int64) for task, pool in positive_by_task.items()}
+        self._positive_by_episode = positive_by_episode
+        self._hard_by_episode = hard_by_episode
+        self._ordinary_by_episode = {key: np.asarray(pool, dtype=np.int64) for key, pool in ordinary_by_episode.items()}
+        self._episodes_by_task = {
+            task: tuple(key for key in positive_by_episode if key[1] == task) for task in TEMPORAL_TASK_INDICES
         }
         self._seed = int(seed)
         self._batches_per_epoch = int(batches_per_epoch)
@@ -245,44 +220,27 @@ class TemporalCompletionBatchSampler:
     @staticmethod
     def _validate_candidate_rows(views: Sequence[_SampleView], *, tick_stride_frames: int) -> None:
         row_keys: set[tuple[Hashable, int, int]] = set()
-        positive_events: set[CompletionEventKey] = set()
-        positive_trajectory_tasks: set[tuple[Hashable, int]] = set()
+        positive_events: set[tuple[Hashable, int]] = set()
         hard_offsets = {offset * tick_stride_frames for offset in HARD_NEGATIVE_OFFSETS}
         for view in views:
             if view.task_index not in TEMPORAL_TASK_INDICES:
-                raise ValueError(
-                    f"temporal sample {view.index} task_index must be one of {TEMPORAL_TASK_INDICES}, "
-                    f"got {view.task_index}"
-                )
+                raise ValueError(f"invalid temporal task_index {view.task_index}")
             row_key = (view.trajectory_id, view.task_index, view.logical_tick)
             if row_key in row_keys:
                 raise ValueError(f"duplicate temporal candidate row for {row_key!r}")
             row_keys.add(row_key)
-
+            episode_key = (view.trajectory_id, view.task_index)
             if view.sample_kind == "positive":
-                if view.logical_tick != view.boundary_tick:
-                    raise ValueError(
-                        f"positive sample {view.index} logical_tick must equal boundary_tick "
-                        f"({view.logical_tick} != {view.boundary_tick})"
-                    )
-                if view.event_key in positive_events:
-                    raise ValueError(f"duplicate positive completion event {view.event_key!r}")
-                trajectory_task = (view.trajectory_id, view.task_index)
-                if trajectory_task in positive_trajectory_tasks:
-                    raise ValueError(f"multiple positive events for trajectory/task {trajectory_task!r}")
-                positive_events.add(view.event_key)
-                positive_trajectory_tasks.add(trajectory_task)
+                if view.logical_tick != view.boundary_tick or episode_key in positive_events:
+                    raise ValueError("each subtask episode must have exactly one positive endpoint")
+                positive_events.add(episode_key)
             elif view.sample_kind == "hard_negative":
-                frame_offset = view.boundary_tick - view.logical_tick
-                if frame_offset not in hard_offsets:
-                    raise ValueError(
-                        f"hard-negative sample {view.index} must be 1-4 ticks before its boundary; "
-                        f"got frame offset {frame_offset}"
-                    )
+                if view.boundary_tick - view.logical_tick not in hard_offsets:
+                    raise ValueError("hard negative must be exactly E-15")
             else:
-                frame_offset = view.boundary_tick - view.logical_tick
-                if frame_offset == 0 or frame_offset in hard_offsets:
-                    raise ValueError(f"ordinary-negative sample {view.index} overlaps the positive/hard-negative pool")
+                distance = view.boundary_tick - view.logical_tick
+                if distance < 2 * tick_stride_frames or distance % tick_stride_frames:
+                    raise ValueError("ordinary negative must be E-30, E-45, ...")
 
     @property
     def steps_per_epoch(self) -> int:
@@ -290,61 +248,34 @@ class TemporalCompletionBatchSampler:
 
     @property
     def batch_composition(self) -> dict[str, int]:
-        return {
-            "positive": POSITIVE_PER_BATCH,
-            "hard_negative": HARD_NEGATIVE_PER_BATCH,
-            "ordinary_negative": ORDINARY_NEGATIVE_PER_BATCH,
-        }
+        return {"positive": 32, "hard_negative": 16, "ordinary_negative": 16}
 
     @property
     def pool_sizes(self) -> dict[str, int]:
         return {
-            "positive": int(sum(pool.size for pool in self._positive_by_task.values())),
-            "hard_negative": int(sum(pool.size for pool in self._hard_by_event.values())),
-            "ordinary_negative": int(sum(pool.size for pool in self._ordinary_by_trajectory.values())),
+            "positive": len(self._positive_by_episode),
+            "hard_negative": len(self._hard_by_episode),
+            "ordinary_negative": sum(len(pool) for pool in self._ordinary_by_episode.values()),
         }
 
     @property
     def events_without_local_hard(self) -> frozenset[CompletionEventKey]:
-        """Events that use a same-task hard negative from another trajectory."""
-
-        return self._events_without_local_hard
+        return frozenset()
 
     def audit_batch(self, batch: Sequence[int]) -> TemporalBatchAudit:
-        """Summarizes kind/task balance and event-local versus fallback pairing."""
-
-        try:
-            indices = [operator.index(index) for index in batch]
-        except TypeError as exc:
-            raise ValueError("batch contains an invalid temporal candidate index") from exc
-        if any(index < 0 or index >= len(self._views) for index in indices):
-            raise ValueError("batch contains an invalid temporal candidate index")
+        indices = [operator.index(index) for index in batch]
+        if len(indices) != TEMPORAL_BATCH_SIZE or any(index < 0 or index >= len(self._views) for index in indices):
+            raise ValueError("batch must contain exactly 64 valid temporal candidate indices")
         selected = [self._views[index] for index in indices]
         positives = [view for view in selected if view.sample_kind == "positive"]
-        fallback_count = sum(view.event_key in self._events_without_local_hard for view in positives)
         return TemporalBatchAudit(
             positive_count=len(positives),
             hard_negative_count=sum(view.sample_kind == "hard_negative" for view in selected),
             ordinary_negative_count=sum(view.sample_kind == "ordinary_negative" for view in selected),
-            event_local_hard_count=len(positives) - fallback_count,
-            same_task_fallback_hard_count=fallback_count,
-            positive_task_counts=tuple(
-                sum(view.task_index == task_index for view in positives) for task_index in TEMPORAL_TASK_INDICES
-            ),
+            event_local_hard_count=sum(view.sample_kind == "hard_negative" for view in selected),
+            same_task_fallback_hard_count=0,
+            positive_task_counts=tuple(sum(view.task_index == task for view in positives) for task in TEMPORAL_TASK_INDICES),
         )
-
-    def task_composition(self, batch_index: int, *, epoch: int | None = None) -> dict[int, int]:
-        """Returns the positive task counts for one batch."""
-
-        if batch_index < 0 or batch_index >= self._batches_per_epoch:
-            raise ValueError(f"batch_index must be in [0, {self._batches_per_epoch})")
-        selected_epoch = self._epoch if epoch is None else int(epoch)
-        if selected_epoch < 0:
-            raise ValueError("epoch must be non-negative")
-        composition = dict.fromkeys(TEMPORAL_TASK_INDICES, 5)
-        extra_task = (selected_epoch * self._batches_per_epoch + batch_index) % len(TEMPORAL_TASK_INDICES)
-        composition[extra_task] += 1
-        return composition
 
     def set_epoch(self, epoch: int) -> None:
         if epoch < 0:
@@ -353,20 +284,11 @@ class TemporalCompletionBatchSampler:
         self._skip_batches = 0
 
     def set_skip_batches(self, skip_batches: int) -> None:
-        """Skips already completed batches on the next iteration."""
-
         if skip_batches < 0 or skip_batches > self._batches_per_epoch:
             raise ValueError(f"skip_batches must be in [0, {self._batches_per_epoch}]")
         self._skip_batches = int(skip_batches)
 
     def state_dict(self) -> dict[str, int]:
-        """Serializes the configuration of the next ``__iter__`` call.
-
-        Trainers checkpointing in the middle of an epoch should first call
-        ``set_epoch(current_epoch)`` and ``set_skip_batches(completed_batches)``
-        so this cursor describes the desired resume point exactly.
-        """
-
         return {
             "schema_version": _STATE_SCHEMA_VERSION,
             "seed": self._seed,
@@ -378,65 +300,45 @@ class TemporalCompletionBatchSampler:
     def load_state_dict(self, state: Mapping[str, int]) -> None:
         if int(state.get("schema_version", -1)) != _STATE_SCHEMA_VERSION:
             raise ValueError("unsupported temporal sampler state schema_version")
-        if int(state.get("seed", -1)) != self._seed:
-            raise ValueError("temporal sampler state seed does not match this sampler")
-        if int(state.get("batches_per_epoch", -1)) != self._batches_per_epoch:
-            raise ValueError("temporal sampler state batches_per_epoch does not match this sampler")
+        if int(state.get("seed", -1)) != self._seed or int(state.get("batches_per_epoch", -1)) != self._batches_per_epoch:
+            raise ValueError("temporal sampler state does not match this sampler")
         self.set_epoch(int(state["epoch"]))
         self.set_skip_batches(int(state["skip_batches"]))
 
     def _rng(self, *, epoch: int, batch_index: int) -> np.random.Generator:
         return np.random.default_rng(np.random.SeedSequence([self._seed, epoch, batch_index]))
 
-    def _sample_ordinary(self, rng: np.random.Generator) -> list[int]:
-        trajectory_count = len(self._ordinary_trajectory_ids)
-        selected_trajectory_offsets: list[int] = []
-        while len(selected_trajectory_offsets) < ORDINARY_NEGATIVE_PER_BATCH:
-            permutation = rng.permutation(trajectory_count).tolist()
-            remaining = ORDINARY_NEGATIVE_PER_BATCH - len(selected_trajectory_offsets)
-            selected_trajectory_offsets.extend(permutation[:remaining])
-
-        return [
-            int(rng.choice(self._ordinary_by_trajectory[self._ordinary_trajectory_ids[offset]]))
-            for offset in selected_trajectory_offsets
-        ]
-
     def _make_batch(self, *, epoch: int, batch_index: int) -> list[int]:
         rng = self._rng(epoch=epoch, batch_index=batch_index)
-        task_composition = self.task_composition(batch_index, epoch=epoch)
-        positive_indices: list[int] = []
-        for task_index in TEMPORAL_TASK_INDICES:
-            sampled = rng.choice(
-                self._positive_by_task[task_index],
-                size=task_composition[task_index],
-                replace=False,
-            )
-            positive_indices.extend(int(index) for index in sampled)
+        selected_pairs: list[tuple[int, str]] = []
+        for task in TEMPORAL_TASK_INDICES:
+            task_keys = list(self._episodes_by_task[task])
+            ordinary_keys = [key for key in task_keys if key in self._ordinary_by_episode]
+            ordinary_keys = [ordinary_keys[int(index)] for index in rng.choice(len(ordinary_keys), size=4, replace=False)]
+            remaining_hard = [key for key in task_keys if key not in ordinary_keys]
+            hard_keys = [remaining_hard[int(index)] for index in rng.choice(len(remaining_hard), size=4, replace=False)]
+            selected_pairs.extend((self._positive_by_episode[key], "hard") for key in hard_keys)
+            selected_pairs.extend((self._positive_by_episode[key], "ordinary") for key in ordinary_keys)
 
-        hard_indices: list[int] = []
-        for index in positive_indices:
-            event = self._positive_event_by_index[index]
-            pool = self._hard_by_event.get(event)
-            if pool is None:
-                # An interval of exactly three 2 Hz ticks has a reachable
-                # positive triplet but no earlier eligible decision tick.
-                # Keep that positive and draw a real hard negative from the
-                # same task in another training trajectory.
-                pool = self._hard_by_task[event.task_index]
-            hard_indices.append(int(rng.choice(pool)))
-        ordinary_indices = self._sample_ordinary(rng)
-        batch = np.asarray([*positive_indices, *hard_indices, *ordinary_indices], dtype=np.int64)
-        if batch.size != TEMPORAL_BATCH_SIZE:
-            raise AssertionError(f"internal temporal batch size error: {batch.size}")
-        rng.shuffle(batch)
-        return [int(index) for index in batch]
+        indices: list[int] = []
+        for positive_index, negative_kind in selected_pairs:
+            view = self._views[positive_index]
+            key = (view.trajectory_id, view.task_index)
+            indices.append(positive_index)
+            if negative_kind == "hard":
+                indices.append(self._hard_by_episode[key])
+            else:
+                indices.append(int(rng.choice(self._ordinary_by_episode[key])))
+        if len(indices) != TEMPORAL_BATCH_SIZE:
+            raise AssertionError(f"internal temporal batch size error: {len(indices)}")
+        rng.shuffle(indices)
+        return [int(index) for index in indices]
 
     def __iter__(self) -> Iterator[list[int]]:
-        epoch = self._epoch
-        skip_batches = self._skip_batches
+        epoch, skip = self._epoch, self._skip_batches
         self._epoch += 1
         self._skip_batches = 0
-        for batch_index in range(skip_batches, self._batches_per_epoch):
+        for batch_index in range(skip, self._batches_per_epoch):
             yield self._make_batch(epoch=epoch, batch_index=batch_index)
 
     def __len__(self) -> int:

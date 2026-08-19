@@ -44,7 +44,7 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
         temporal.completion.temporal_positive_per_batch,
         temporal.completion.temporal_hard_negative_per_batch,
         temporal.completion.temporal_ordinary_negative_per_batch,
-    ) == (21, 21, 22)
+    ) == (32, 16, 16)
     assert temporal.batch_size == 64
     assert temporal.completion.focal_gamma == 0.0
     assert temporal.completion.bce_pos_weight_override == 1.0
@@ -96,7 +96,7 @@ def test_temporal_completion_rejects_backbone_different_from_feature_source():
 
 
 def test_temporal_completion_rejects_sampler_counts_different_from_locked_batch():
-    with pytest.raises(ValueError, match=r"requires batch counts \(21, 21, 22\)"):
+    with pytest.raises(ValueError, match=r"requires batch counts \(32, 16, 16\)"):
         completion_training.CompletionTrainingConfig(
             stage="head",
             temporal_sampling=True,

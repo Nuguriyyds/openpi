@@ -6,18 +6,10 @@ pair and must contain exactly one positive row at its boundary tick.
 
 Threshold selection is intentionally exposed only through
 :func:`select_validation_threshold`, which rejects anything other than a pure
-validation split.  The deterministic selection rule is lexicographic over the
-validation events:
-
-1. minimise events with any pre-boundary threshold crossing;
-2. maximise on-time event recall (a crossing at the boundary tick);
-3. maximise event F1, where an early event is a false positive and is also not
-   counted as a recalled boundary;
-4. choose the larger (more conservative) threshold.
-
-The candidates are the validation positive scores, per-event maximum
-pre-boundary scores, and one abstention threshold immediately above their
-maximum.  No test label or score is accepted by the selection API.
+validation split.  The temporal training path does not use threshold metrics
+for checkpoint selection; it uses natural AUPRC, hard-only AUPRC, and paired
+hard margin.  A fixed 0.5 threshold is retained only for compatibility with
+the report/evaluator API.
 """
 
 from __future__ import annotations
@@ -34,8 +26,7 @@ import numpy as np
 from openpi.training import temporal_completion_data as _temporal_data
 
 THRESHOLD_SELECTION_RULE = (
-    "validation-only lexicographic: minimise early-trigger events, maximise on-time event recall, "
-    "maximise event F1, then maximise threshold"
+    "validation-only fixed threshold=0.5 for reporting; checkpoint selection is threshold-free"
 )
 
 
@@ -44,7 +35,7 @@ class EventMargin:
     """Boundary separation for one trajectory/task event.
 
     ``margin`` uses every eligible pre-boundary row. ``hard_local_margin`` uses
-    only the preceding four 2 Hz ticks (0.5--2.0 seconds).  A margin is ``None``
+    only the fixed preceding 0.5-second hard tick.  A margin is ``None``
     when that event has no eligible negative in the relevant window.
     """
 
@@ -165,7 +156,7 @@ def binary_ranking_metrics(
 def event_margins(
     rows: Sequence[_temporal_data.TemporalSampleRow], scores: np.ndarray | Sequence[float]
 ) -> tuple[EventMargin, ...]:
-    """Computes all-history and four-tick-local margins for every event."""
+    """Computes all-history and fixed E-15 hard margins for every event."""
 
     row_tuple, score_values, events = _prepare_rows_and_scores(rows, scores)
     del row_tuple
@@ -228,47 +219,22 @@ def select_validation_threshold(
     rows: Sequence[_temporal_data.TemporalSampleRow],
     scores: np.ndarray | Sequence[float],
 ) -> ThresholdSelection:
-    """Selects a threshold from a pure validation split and nothing else."""
+    """Returns the fixed reporting threshold after validating a pure val split."""
 
     row_tuple, score_values, events = _prepare_rows_and_scores(rows, scores)
     splits = {row.split for row in row_tuple}
     if splits != {"val"}:
         raise ValueError(f"threshold selection requires only validation rows; got splits={sorted(splits)}")
 
-    positive_scores = np.asarray([score_values[event.positive_index] for event in events], dtype=np.float64)
-    maximum_negative_scores = np.asarray(
-        [np.max(score_values[event.negative_indices]) if event.negative_indices.size else -np.inf for event in events],
-        dtype=np.float64,
-    )
-    finite_breakpoints = np.concatenate((positive_scores, maximum_negative_scores))
-    finite_breakpoints = finite_breakpoints[np.isfinite(finite_breakpoints)]
-    unique_breakpoints = np.unique(finite_breakpoints)
-    abstention_threshold = float(np.nextafter(np.max(unique_breakpoints), np.inf))
-    candidates = np.concatenate((np.asarray([abstention_threshold]), unique_breakpoints[::-1]))
-
-    best_key: tuple[float, float, float, float] | None = None
-    best_metrics: dict[str, float] | None = None
-    best_threshold = abstention_threshold
-    for candidate in candidates:
-        metrics = _threshold_metrics_from_prepared(row_tuple, score_values, events, float(candidate))
-        key = (
-            metrics["early_trigger_event_count"],
-            -metrics["event_recall"],
-            -metrics["event_f1"],
-            -float(candidate),
-        )
-        if best_key is None or key < best_key:
-            best_key = key
-            best_metrics = metrics
-            best_threshold = float(candidate)
-    assert best_metrics is not None
+    fixed_threshold = 0.5
+    report_metrics = _threshold_metrics_from_prepared(row_tuple, score_values, events, fixed_threshold)
     return ThresholdSelection(
-        threshold=best_threshold,
+        threshold=fixed_threshold,
         validation_event_count=len(events),
-        validation_early_trigger_events=int(best_metrics["early_trigger_event_count"]),
-        validation_event_recall=best_metrics["event_recall"],
-        validation_event_f1=best_metrics["event_f1"],
-        candidate_count=int(candidates.size),
+        validation_early_trigger_events=int(report_metrics["early_trigger_event_count"]),
+        validation_event_recall=report_metrics["event_recall"],
+        validation_event_f1=report_metrics["event_f1"],
+        candidate_count=1,
     )
 
 
@@ -422,11 +388,7 @@ def _prepare_rows_and_scores(
         if any(row_tuple[index].logical_tick >= boundary_tick for index in negative_indices):
             raise ValueError(f"event {(trajectory_id, task_index)} contains a non-pre-boundary negative")
         hard_local_indices = np.asarray(
-            [
-                index
-                for index in negative_indices
-                if 0 < boundary_tick - row_tuple[index].logical_tick <= 4 * _temporal_data.TICK_STRIDE_FRAMES
-            ],
+            [index for index in negative_indices if row_tuple[index].sample_kind == "hard_negative"],
             dtype=np.int64,
         )
         events.append(
@@ -543,7 +505,7 @@ def _add_stratified_metrics(
     hard_local_mask = np.asarray(
         [
             (row.trajectory_id, row.task_index) in hard_local_events
-            and (row.label == 1 or 0 < row.boundary_tick - row.logical_tick <= 4 * _temporal_data.TICK_STRIDE_FRAMES)
+            and row.sample_kind in ("positive", "hard_negative")
             for row in rows
         ]
     )
@@ -569,6 +531,27 @@ def _add_stratified_metrics(
     output[f"{prefix}boundary_top1_rate"] = float(np.mean([margin.boundary_top1 for margin in margins]))
     _add_margin_summary(output, margins, attribute="margin", prefix=f"{prefix}margin/all_")
     _add_margin_summary(output, margins, attribute="hard_local_margin", prefix=f"{prefix}margin/hard_local_")
+    hard_margins = np.asarray(
+        [margin.hard_local_margin for margin in margins if margin.hard_local_margin is not None], dtype=np.float64
+    )
+    output[f"{prefix}paired_hard/ordering_accuracy"] = (
+        float(np.mean(hard_margins > 0.0)) if hard_margins.size else math.nan
+    )
+    output[f"{prefix}paired_hard/margin_mean"] = float(np.mean(hard_margins)) if hard_margins.size else math.nan
+    output[f"{prefix}paired_hard/margin_median"] = (
+        float(np.median(hard_margins)) if hard_margins.size else math.nan
+    )
+    output[f"{prefix}paired_hard/margin_p25"] = (
+        float(np.percentile(hard_margins, 25)) if hard_margins.size else math.nan
+    )
+    output[f"{prefix}paired_hard/margin_p75"] = (
+        float(np.percentile(hard_margins, 75)) if hard_margins.size else math.nan
+    )
+    ordinary_scores = scores[np.asarray([row.sample_kind == "ordinary_negative" for row in rows])]
+    output[f"{prefix}ordinary/score_mean"] = float(np.mean(ordinary_scores)) if ordinary_scores.size else math.nan
+    output[f"{prefix}ordinary/score_p95"] = (
+        float(np.percentile(ordinary_scores, 95)) if ordinary_scores.size else math.nan
+    )
     _add_negative_smoothness(output, rows, scores, prefix=f"{prefix}negative_smoothness/")
 
 
@@ -592,10 +575,16 @@ def _add_empty_stratum(output: dict[str, float], *, prefix: str) -> None:
         output[f"{prefix}{margin_prefix}count"] = 0.0
         output[f"{prefix}{margin_prefix}mean"] = math.nan
         output[f"{prefix}{margin_prefix}median"] = math.nan
+        output[f"{prefix}{margin_prefix}p25"] = math.nan
+        output[f"{prefix}{margin_prefix}p75"] = math.nan
         output[f"{prefix}{margin_prefix}gt_zero_rate"] = math.nan
+    for name in ("ordering_accuracy", "margin_mean", "margin_median", "margin_p25", "margin_p75"):
+        output[f"{prefix}paired_hard/{name}"] = math.nan
     output[f"{prefix}negative_smoothness/pair_count"] = 0.0
     output[f"{prefix}negative_smoothness/adjacent_abs_delta_mean"] = math.nan
     output[f"{prefix}negative_smoothness/adjacent_abs_delta_p95"] = math.nan
+    output[f"{prefix}ordinary/score_mean"] = math.nan
+    output[f"{prefix}ordinary/score_p95"] = math.nan
 
 
 def _add_negative_smoothness(
@@ -637,6 +626,8 @@ def _add_margin_summary(
     output[f"{prefix}count"] = float(values.size)
     output[f"{prefix}mean"] = float(np.mean(values)) if values.size else math.nan
     output[f"{prefix}median"] = float(np.median(values)) if values.size else math.nan
+    output[f"{prefix}p25"] = float(np.percentile(values, 25)) if values.size else math.nan
+    output[f"{prefix}p75"] = float(np.percentile(values, 75)) if values.size else math.nan
     output[f"{prefix}gt_zero_rate"] = float(np.mean(values > 0.0)) if values.size else math.nan
 
 

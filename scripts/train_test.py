@@ -251,13 +251,12 @@ def test_should_save_epoch_checkpoint_no_off_by_one():
 
 def test_temporal_validation_rank_uses_metric_report_keys():
     metrics = {
-        "val/temporal/boundary_top1_rate": 0.8,
+        "val/temporal/natural/auprc": 0.9,
         "val/temporal/hard_local/auprc": 0.7,
         "val/temporal/margin/hard_local_median": 0.2,
-        "val/temporal/natural/auprc": 0.9,
     }
 
-    assert train.temporal_validation_rank(metrics) == (0.8, 0.7, 0.2, 0.9)
+    assert train.temporal_validation_rank(metrics) == (0.9, 0.7, 0.2)
 
 
 def test_temporal_input_mode_keeps_shape_and_removes_only_history_slots():

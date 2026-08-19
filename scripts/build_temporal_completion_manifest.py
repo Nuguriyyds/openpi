@@ -620,6 +620,23 @@ def build_manifest(
             "group_count": len(groups),
             "metadata_files": [str(path) for path in subtask_audit.metadata_files],
             "ordered_prompts": [subtask_audit.prompts_by_task[index] for index in range(4)],
+            "endpoint_definition": "inclusive_last_frame_index",
+            "excluded_end_frame_lt_45_by_task": {
+                str(task_index): sum(
+                    episode.task_index == task_index and episode.end_frame < 45
+                    for episode in subtask_audit.subtask_episodes
+                )
+                for task_index in range(4)
+            },
+            "no_ordinary_candidate_end_frame_lt_60_by_task": {
+                # This is restricted to retained E>=45 episodes; E<45 is
+                # reported separately and is excluded before candidate build.
+                str(task_index): sum(
+                    episode.task_index == task_index and 45 <= episode.end_frame < 60
+                    for episode in subtask_audit.subtask_episodes
+                )
+                for task_index in range(4)
+            },
         },
         "trajectory_source": manifest.trajectory_source,
         "full": None

@@ -697,18 +697,18 @@ def create_temporal_feature_data_loader(
     sharding: jax.sharding.Sharding | None = None,
     num_batches: int | None = None,
 ) -> DataLoader[tuple[jax.Array, jax.Array]]:
-    """Creates the strict 21/21/22 train loader or natural eval loader."""
+    """Creates the strict 32/16/16 subtask-pair loader or natural eval loader."""
 
     if not config.completion.uses_temporal_completion:
         raise ValueError("temporal feature loader requires completion.temporal_sampling=True")
     if jax.process_count() != 1:
-        raise ValueError("temporal completion v1 supports one JAX process; multi-GPU within that process is supported")
+        raise ValueError("subtask temporal completion supports one JAX process; multi-GPU within that process is supported")
     data_config = config.data.create(config.assets_dirs, config.model)
     dataset = _temporal_features.TemporalFeatureDataset(temporal_data_info.cache, split)
     local_batch_size = config.batch_size // jax.process_count()
     if split == "train":
         if config.batch_size != 64:
-            raise ValueError("temporal completion v1 requires global batch_size=64")
+            raise ValueError("temporal completion requires global batch_size=64")
         batch_sampler = _temporal_sampler.TemporalCompletionBatchSampler(
             dataset.samples,
             seed=config.seed,

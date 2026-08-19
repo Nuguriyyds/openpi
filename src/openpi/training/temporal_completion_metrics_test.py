@@ -25,7 +25,7 @@ def _event(
         if distance == 0:
             label = 1
             sample_kind: temporal_data.SampleKind = "positive"
-        elif distance in (15, 30, 45, 60):
+        elif distance == 15:
             label = 0
             sample_kind = "hard_negative"
         else:
@@ -45,8 +45,8 @@ def _event(
                 prompt_index=task_index,
                 history_logical_ticks=(tick - 30, tick - 15, tick),
                 source_episode_ids=(source_episode_id,) * 3,
-                source_frame_indices=(max(tick - 30, 0), tick - 15, tick),
-                terminal_hold_flags=(False, False, task_index == 3 and label == 1),
+                source_frame_indices=(tick - 30, tick - 15, tick),
+                terminal_hold_flags=(False, False, False),
             )
         )
         scores.append(score)
@@ -123,7 +123,7 @@ def test_report_quantifies_all_history_hard_local_margins_and_tasks():
     assert report.metrics["task_1/event_count"] == 1.0
     assert report.metrics["task_2/event_count"] == 0.0
     assert report.metrics["natural/sample_count"] == 10.0
-    assert report.metrics["hard_local/sample_count"] == 8.0
+    assert report.metrics["hard_local/sample_count"] == 4.0
     assert report.metrics["negative_smoothness/pair_count"] == 6.0
     assert report.metrics["negative_smoothness/adjacent_abs_delta_mean"] == pytest.approx(1.6 / 6.0)
     assert report.metrics["negative_smoothness/adjacent_abs_delta_p95"] == pytest.approx(0.7)
@@ -152,12 +152,12 @@ def test_validation_threshold_prioritises_zero_early_events_before_recall():
 
     selection = metrics.select_validation_threshold(validation_rows, validation_scores)
 
-    assert selection.threshold == 0.8
-    assert selection.validation_early_trigger_events == 0
+    assert selection.threshold == 0.5
+    assert selection.validation_early_trigger_events == 1
     assert selection.validation_event_recall == 0.5
-    assert selection.validation_event_f1 == pytest.approx(2.0 / 3.0)
+    assert selection.validation_event_f1 == pytest.approx(0.5)
     assert selection.selected_on_split == "val"
-    assert "minimise early-trigger events" in selection.rule
+    assert "fixed threshold=0.5" in selection.rule
 
 
 def test_frozen_validation_threshold_reports_operational_test_metrics():
@@ -242,7 +242,7 @@ def test_no_negative_event_and_tied_boundary_are_explicit_edge_cases():
     assert positive_report.metrics["hard_local/event_count"] == 0.0
     assert math.isnan(positive_report.metrics["hard_local/auprc"])
     selection = metrics.select_validation_threshold(positive_only_rows, positive_only_scores)
-    assert selection.threshold == 0.9
+    assert selection.threshold == 0.5
     applied = metrics.threshold_application_metrics(positive_only_rows, positive_only_scores, threshold=0.9)
     assert math.isnan(applied["false_positives_per_minute"])
 
@@ -258,7 +258,7 @@ def test_no_negative_event_and_tied_boundary_are_explicit_edge_cases():
     assert tied_report.event_margins[0].margin == 0.0
     assert tied_report.event_margins[0].boundary_top1 is False
     tied_selection = metrics.select_validation_threshold(tied_rows, tied_scores)
-    assert tied_selection.threshold > 0.5
+    assert tied_selection.threshold == 0.5
     assert tied_selection.validation_event_recall == 0.0
 
 
@@ -286,7 +286,7 @@ def test_hard_local_auprc_excludes_free_positive_without_local_negative():
     assert report.metrics["natural/positive_count"] == 2.0
     assert report.metrics["hard_local/event_count"] == 1.0
     assert report.metrics["hard_local/positive_count"] == 1.0
-    assert report.metrics["hard_local/negative_count"] == 2.0
+    assert report.metrics["hard_local/negative_count"] == 1.0
 
 
 def test_evaluator_rejects_incomplete_events_duplicates_and_ambiguous_inputs():

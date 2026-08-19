@@ -63,7 +63,7 @@ def test_group_audit_builds_exact_four_stage_identity_and_integer_boundaries():
     assert group.source_episode_ids == (0, 1, 2, 3)
     assert group.task_indices == (0, 1, 2, 3)
     assert group.boundaries == (15, 16, 30, 46)
-    assert group.positive_ticks == (15, 30, 30, 60)
+    assert group.positive_ticks == (14, 0, 13, 15)
 
 
 @pytest.mark.parametrize(
@@ -147,14 +147,9 @@ def test_exact_45_frame_activation_produces_one_triplet_without_padding():
         group, trajectory_id="full-000000", full_episode_id=0, split="train"
     )
 
-    assert len(rows) == 4
-    assert all(row.sample_kind == "positive" for row in rows)
-    assert [row.history_logical_ticks for row in rows] == [
-        (0, 15, 30),
-        (45, 60, 75),
-        (90, 105, 120),
-        (135, 150, 165),
-    ]
+    # ``length=45`` means inclusive E=44, so every subtask is excluded by
+    # the locked E>=45 gate; there is no padding or cross-subtask fallback.
+    assert rows == ()
 
 
 def test_unreachable_positive_quarantines_whole_trajectory(tmp_path):
@@ -181,8 +176,8 @@ def test_unreachable_positive_quarantines_whole_trajectory(tmp_path):
     )
 
     record = next(record for record in manifest.trajectories if record.trajectory_id == "full-000001")
-    assert record.split is None
-    assert record.exclusion_reason == "unreachable_positive_after_history_reset:task=0"
+    assert record.split is not None
+    assert record.exclusion_reason is None
 
 
 def test_natural_index_has_one_positive_per_task_and_exact_negative_pools():
@@ -190,36 +185,37 @@ def test_natural_index_has_one_positive_per_task_and_exact_negative_pools():
     rows = temporal_data.build_temporal_sample_rows(group, trajectory_id="full-000000", full_episode_id=0, split="val")
 
     positives = [row for row in rows if row.sample_kind == "positive"]
-    assert [(row.task_index, row.logical_tick) for row in positives] == list(enumerate(group.positive_ticks))
+    assert [(row.task_index, row.logical_tick) for row in positives] == [(task, 99) for task in range(4)]
     assert len({(row.trajectory_id, row.task_index) for row in positives}) == 4
 
     for row in rows:
         distance = row.boundary_tick - row.logical_tick
         if row.sample_kind == "hard_negative":
-            assert distance in (15, 30, 45, 60)
+            assert distance == 15
             assert row.label == 0
         elif row.sample_kind == "ordinary_negative":
-            assert distance not in (0, 15, 30, 45, 60)
+            assert distance >= 30
+            assert distance % 15 == 0
             assert row.label == 0
         assert tuple(
             b - a for a, b in zip(row.history_logical_ticks[:-1], row.history_logical_ticks[1:], strict=True)
         ) == (15, 15)
 
 
-def test_positive_cross_boundary_observation_keeps_old_prompt_and_task4_uses_hold():
+def test_positive_history_stays_inside_one_subtask_without_terminal_hold():
     group = _group(lengths=(100, 100, 100, 100))
     rows = temporal_data.build_temporal_sample_rows(group, trajectory_id="full-000000", full_episode_id=0, split="test")
     task0_positive = next(row for row in rows if row.task_index == 0 and row.label == 1)
     task3_positive = next(row for row in rows if row.task_index == 3 and row.label == 1)
 
     assert task0_positive.prompt_index == 0
-    assert task0_positive.history_logical_ticks == (75, 90, 105)
-    assert task0_positive.source_episode_ids == (0, 0, 1)
-    assert task0_positive.source_frame_indices == (75, 90, 5)
+    assert task0_positive.history_logical_ticks == (69, 84, 99)
+    assert task0_positive.source_episode_ids == (0, 0, 0)
+    assert task0_positive.source_frame_indices == (69, 84, 99)
     assert task3_positive.prompt_index == 3
-    assert task3_positive.source_episode_ids[-1] == 3
-    assert task3_positive.source_frame_indices[-1] == 99
-    assert task3_positive.terminal_hold_flags == (False, False, True)
+    assert task3_positive.source_episode_ids == (3, 3, 3)
+    assert task3_positive.source_frame_indices == (69, 84, 99)
+    assert task3_positive.terminal_hold_flags == (False, False, False)
 
 
 def test_identity_mapping_is_bijective_and_records_737_versus_736_style_unmatched_full():
@@ -348,7 +344,7 @@ def test_split_counts_for_736_are_exact_and_split_is_deterministic(tmp_path):
 
 
 def test_subtask_logical_manifest_needs_no_full_identity_and_materializes_rows(tmp_path):
-    groups = temporal_data.build_subtask_groups(_episodes_for_groups(6, lengths=(45, 45, 45, 45)))
+    groups = temporal_data.build_subtask_groups(_episodes_for_groups(6, lengths=(60, 60, 60, 60)))
 
     manifest = temporal_data.create_subtask_temporal_manifest(
         groups,
@@ -357,7 +353,7 @@ def test_subtask_logical_manifest_needs_no_full_identity_and_materializes_rows(t
         task_prompts=("task 0", "task 1", "task 2", "task 3"),
     )
 
-    assert manifest.schema_version == 3
+    assert manifest.schema_version == 4
     assert manifest.trajectory_source == "subtask_logical"
     assert manifest.source_full_repo_id is None
     assert manifest.source_full_root is None
