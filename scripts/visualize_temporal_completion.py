@@ -89,15 +89,20 @@ def _selected_episodes(keys: Sequence[str], max_episodes: int) -> set[str]:
     return {keys[int(position)] for position in positions}
 
 
-def _prediction_metadata(report_path: Path, report: Mapping[str, Any]) -> dict[str, str | int]:
+def _prediction_metadata(
+    report_path: Path, report: Mapping[str, Any], *, checkpoint_path: Path | None = None
+) -> dict[str, str | int]:
     bindings = report["bindings"]
     if not isinstance(bindings, Mapping):
         raise ValueError("report bindings must be an object")
+    selected_checkpoint = (
+        checkpoint_path.resolve() if checkpoint_path is not None else Path(str(bindings["checkpoint_path"])).resolve()
+    )
     return {
         "schema_version": PREDICTION_SCHEMA_VERSION,
         "report_path": str(report_path.resolve()),
         "config_name": str(bindings["config_name"]),
-        "checkpoint_path": str(bindings["checkpoint_path"]),
+        "checkpoint_path": str(selected_checkpoint),
         "feature_cache_path": str(bindings["feature_cache_path"]),
     }
 
@@ -198,7 +203,12 @@ def _save_prediction_sidecar(path: Path, metadata: Mapping[str, str | int], payl
 
 
 def _save_prediction_json(
-    path: Path, report_path: Path, report: Mapping[str, Any], payload: Mapping[str, np.ndarray]
+    path: Path,
+    report_path: Path,
+    report: Mapping[str, Any],
+    payload: Mapping[str, np.ndarray],
+    *,
+    score_checkpoint_path: Path,
 ) -> None:
     """Save the row-level values used by the HTML in a portable JSON file."""
 
@@ -222,7 +232,8 @@ def _save_prediction_json(
         "schema_version": 1,
         "source_report": str(report_path.resolve()),
         "config_name": str(report["bindings"]["config_name"]),
-        "checkpoint_path": str(report["bindings"]["checkpoint_path"]),
+        "score_checkpoint_path": str(score_checkpoint_path),
+        "threshold_checkpoint_path": str(report["bindings"]["checkpoint_path"]),
         "feature_cache_path": str(report["bindings"]["feature_cache_path"]),
         "threshold_selection": report["threshold_selection"],
         "metrics": {split: _report_split(report, split) for split in SPLIT_CHOICES},
@@ -246,6 +257,7 @@ def _compute_predictions(
     *,
     splits: Sequence[str],
     batch_size: int,
+    checkpoint_path: Path,
 ) -> dict[str, np.ndarray]:
     bindings = report["bindings"]
     config_name = str(bindings["config_name"])
@@ -257,7 +269,6 @@ def _compute_predictions(
     config = training_config.get_config(config_name)
     manifest_path = Path(str(bindings["manifest_path"])).resolve()
     cache_path = Path(str(bindings["feature_cache_path"])).resolve()
-    checkpoint_path = Path(str(bindings["checkpoint_path"])).resolve()
     manifest = evaluator._load_sealed_manifest(manifest_path)  # noqa: SLF001
     cache = temporal_features.load_temporal_feature_cache(
         cache_path,
@@ -335,10 +346,13 @@ def _html_document(
     *,
     max_episodes: int,
     task_index: int | None,
+    score_checkpoint_path: Path,
 ) -> str:
     threshold = float(report["threshold_selection"]["threshold"])
     if not 0.0 <= threshold <= float(np.nextafter(1.0, np.inf)):
         raise ValueError(f"invalid report threshold: {threshold}")
+    report_checkpoint_path = Path(str(report["bindings"].get("checkpoint_path", ""))).resolve()
+    same_checkpoint = score_checkpoint_path == report_checkpoint_path
     splits: dict[str, list[dict[str, Any]]] = {}
     for split in SPLIT_CHOICES:
         mask = payload["split"].astype(str) == split
@@ -348,8 +362,10 @@ def _html_document(
         "title": str(report["bindings"]["config_name"]),
         "threshold": threshold,
         "splits": splits,
-        "cards": _metric_cards(report),
-        "report_path": str(report["bindings"].get("checkpoint_path", "")),
+        "cards": _metric_cards(report) if same_checkpoint else {},
+        "cards_note": ("Aggregate cards are from the source report checkpoint." if not same_checkpoint else ""),
+        "score_checkpoint_path": str(score_checkpoint_path),
+        "threshold_checkpoint_path": str(report["bindings"].get("checkpoint_path", "")),
     }
     encoded = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).replace("<", "\\u003c")
     title = html.escape(str(report["bindings"]["config_name"]))
@@ -380,13 +396,14 @@ svg { width:100%; height:auto; min-height:360px; display:block; }
 </head>
 <body>
 <h1>__TITLE__</h1>
-<div class="sub">Temporal completion scores by subtask episode · checkpoint __CHECKPOINT__</div>
+<div class="sub">Temporal completion scores by subtask episode · score checkpoint __CHECKPOINT__ · threshold from __THRESHOLD_CHECKPOINT__</div>
 <div class="controls">
   <label>Split <select id="split"></select></label>
   <label>Task <select id="task"><option value="all">all</option><option value="0">task 0</option><option value="1">task 1</option><option value="2">task 2</option><option value="3">task 3</option></select></label>
   <label>Episode <select id="episode"></select></label>
 </div>
 <div id="cards" class="cards"></div>
+<div id="cardNote" class="sub"></div>
 <div class="panel">
   <div id="episodeInfo"></div>
   <div id="chart"></div>
@@ -399,6 +416,7 @@ const splitEl = document.getElementById('split');
 const taskEl = document.getElementById('task');
 const episodeEl = document.getElementById('episode');
 const cardsEl = document.getElementById('cards');
+const cardNoteEl = document.getElementById('cardNote');
 const infoEl = document.getElementById('episodeInfo');
 const chartEl = document.getElementById('chart');
 for (const split of ['val','test']) {
@@ -412,6 +430,8 @@ function selectedEpisodes() {
 function fmt(value) { return value == null ? '—' : Number(value).toFixed(4); }
 function updateCards() {
   const cards = DATA.cards[splitEl.value] || {};
+  cardNoteEl.textContent = DATA.cards_note || '';
+  if (Object.keys(cards).length === 0) { cardsEl.innerHTML = ''; return; }
   const labels = {'natural/auprc':'Natural AUPRC','natural/roc_auc':'ROC-AUC','hard_local/auprc':'Hard AUPRC','paired/ordering_accuracy':'Pair order','paired/hard_margin_median':'Hard margin median'};
   cardsEl.innerHTML = Object.entries(labels).map(([key,label]) => `<div class="card"><span>${label}</span><b>${fmt(cards[key])}</b></div>`).join('');
 }
@@ -444,7 +464,8 @@ updateEpisodes();
 """
     return (
         template.replace("__TITLE__", title)
-        .replace("__CHECKPOINT__", html.escape(str(report["bindings"].get("checkpoint_step", "?"))))
+        .replace("__CHECKPOINT__", html.escape(str(score_checkpoint_path)))
+        .replace("__THRESHOLD_CHECKPOINT__", html.escape(str(report["bindings"].get("checkpoint_path", "?"))))
         .replace("__DATA__", encoded)
     )
 
@@ -454,33 +475,62 @@ def visualize(args: argparse.Namespace) -> Path:
     report = _read_report(report_path)
     splits = tuple(SPLIT_CHOICES if args.split == "both" else (args.split,))
     output = args.output.resolve()
+    score_checkpoint_path = (
+        args.checkpoint.resolve()
+        if args.checkpoint is not None
+        else Path(str(report["bindings"]["checkpoint_path"])).resolve()
+    )
+    if not score_checkpoint_path.is_dir() or not (score_checkpoint_path / "params").is_dir():
+        raise FileNotFoundError(f"checkpoint params not found: {score_checkpoint_path / 'params'}")
     prediction_path = (
         args.predictions_cache.resolve()
         if args.predictions_cache is not None
         else output.with_suffix(".predictions.npz")
     )
-    metadata = _prediction_metadata(report_path, report)
+    metadata = _prediction_metadata(report_path, report, checkpoint_path=score_checkpoint_path)
     payload = _load_prediction_sidecar(prediction_path, metadata=metadata)
     if payload is None:
         batch_size = int(args.batch_size)
         if batch_size <= 0:
             raise ValueError("--batch-size must be positive")
-        payload = _compute_predictions(report, splits=splits, batch_size=batch_size)
+        payload = _compute_predictions(
+            report,
+            splits=splits,
+            batch_size=batch_size,
+            checkpoint_path=score_checkpoint_path,
+        )
         _save_prediction_sidecar(prediction_path, metadata, payload)
         print(f"Saved prediction sidecar: {prediction_path}")
     else:
         available = set(payload["split"].astype(str).tolist())
         if not set(splits).issubset(available):
-            payload = _compute_predictions(report, splits=splits, batch_size=int(args.batch_size))
+            payload = _compute_predictions(
+                report,
+                splits=splits,
+                batch_size=int(args.batch_size),
+                checkpoint_path=score_checkpoint_path,
+            )
             _save_prediction_sidecar(prediction_path, metadata, payload)
         print(f"Reused prediction sidecar: {prediction_path}")
 
     if args.predictions_json is not None:
         predictions_json = args.predictions_json.resolve()
-        _save_prediction_json(predictions_json, report_path, report, payload)
+        _save_prediction_json(
+            predictions_json,
+            report_path,
+            report,
+            payload,
+            score_checkpoint_path=score_checkpoint_path,
+        )
         print(f"Wrote row-level prediction JSON: {predictions_json}")
 
-    document = _html_document(report, payload, max_episodes=args.max_episodes, task_index=args.task_index)
+    document = _html_document(
+        report,
+        payload,
+        max_episodes=args.max_episodes,
+        task_index=args.task_index,
+        score_checkpoint_path=score_checkpoint_path,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
     temporary.write_text(document, encoding="utf-8")
@@ -492,6 +542,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True, help="JSON written by evaluate_temporal_completion.py")
     parser.add_argument("--output", type=Path, required=True, help="HTML output path")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Optional exact checkpoint directory used for plotted scores; defaults to the report-selected checkpoint.",
+    )
     parser.add_argument("--split", choices=("val", "test", "both"), default="both")
     parser.add_argument("--task-index", type=int, choices=range(4), help="Only include one subtask index")
     parser.add_argument(
