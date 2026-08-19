@@ -26,7 +26,8 @@ SPLIT_RATIOS: Mapping[str, float] = {"train": 0.72, "val": 0.08, "test": 0.20}
 
 SplitName = Literal["train", "val", "test"]
 SPLIT_NAMES: tuple[SplitName, ...] = ("train", "val", "test")
-SampleKind = Literal["positive", "hard_negative", "ordinary_negative"]
+SampleKind = Literal["positive", "hard_negative", "ordinary_negative", "transition_negative"]
+SamplingProtocol = Literal["subtask_local", "history_carry"]
 MappingStatus = Literal["matched", "subtask_only", "full_only", "ambiguous"]
 TrajectorySource = Literal["subtask_logical", "full_identity"]
 
@@ -956,16 +957,26 @@ class TemporalSampleRow:
 
     @property
     def subtask_episode_id(self) -> int:
-        """The single raw subtask episode owning all three source frames."""
+        """The raw subtask episode owning the current (last) source frame."""
 
-        return self.source_episode_ids[0]
+        return self.source_episode_ids[-1]
+
+    @property
+    def history_prompt_indices(self) -> tuple[int, int, int]:
+        """Prompt identity used to compute each of the three prefix features."""
+
+        if self.sample_kind != "transition_negative":
+            return (self.task_index, self.task_index, self.task_index)
+        if self.logical_tick == 0:
+            return (self.task_index - 1, self.task_index - 1, self.task_index)
+        return (self.task_index - 1, self.task_index, self.task_index)
 
     def __post_init__(self) -> None:
         if not self.trajectory_id or self.full_episode_id < 0:
             raise ValueError("sample requires a valid trajectory and full episode identity")
         if self.split not in SPLIT_NAMES:
             raise ValueError(f"sample has invalid split {self.split!r}")
-        if self.sample_kind not in ("positive", "hard_negative", "ordinary_negative"):
+        if self.sample_kind not in ("positive", "hard_negative", "ordinary_negative", "transition_negative"):
             raise ValueError(f"sample has invalid sample_kind {self.sample_kind!r}")
         if self.task_index not in range(TASKS_PER_TRAJECTORY) or self.prompt_index != self.task_index:
             raise ValueError("sample prompt_index must equal its logical task_index")
@@ -979,9 +990,9 @@ class TemporalSampleRow:
             )
         ):
             raise ValueError("sample history and all source-reference fields must contain exactly three values")
-        if any(
-            value < 0 for value in (*self.history_logical_ticks, *self.source_episode_ids, *self.source_frame_indices)
-        ):
+        if any(value < 0 for value in (*self.source_episode_ids, *self.source_frame_indices)):
+            raise ValueError("sample history/source indices must be non-negative")
+        if self.sample_kind != "transition_negative" and any(value < 0 for value in self.history_logical_ticks):
             raise ValueError("sample history/source indices must be non-negative")
         if self.boundary_tick < 0 or self.logical_tick > self.boundary_tick:
             raise ValueError("sample logical_tick must not occur after its non-negative boundary_tick")
@@ -997,10 +1008,12 @@ class TemporalSampleRow:
         )
         if gaps != (TICK_STRIDE_FRAMES, TICK_STRIDE_FRAMES):
             raise ValueError(f"sample history gaps must be (15, 15), got {gaps}")
-        if len(set(self.source_episode_ids)) != 1:
-            raise ValueError("all three temporal references must belong to one subtask episode")
-        if any(frame > self.boundary_tick for frame in self.source_frame_indices):
-            raise ValueError("temporal source frame exceeds the subtask completion frame")
+        is_transition = self.sample_kind == "transition_negative"
+        if not is_transition:
+            if len(set(self.source_episode_ids)) != 1:
+                raise ValueError("all three temporal references must belong to one subtask episode")
+            if any(frame > self.boundary_tick for frame in self.source_frame_indices):
+                raise ValueError("temporal source frame exceeds the subtask completion frame")
         distance = self.boundary_tick - self.logical_tick
         if self.sample_kind == "positive":
             if self.logical_tick != self.boundary_tick or self.label != 1:
@@ -1008,17 +1021,44 @@ class TemporalSampleRow:
         elif self.sample_kind == "hard_negative":
             if distance != TICK_STRIDE_FRAMES or self.label != 0:
                 raise ValueError("hard negative must be exactly 15 frames before E and have label 0")
-        elif self.label != 0 or distance < 2 * TICK_STRIDE_FRAMES or distance % TICK_STRIDE_FRAMES:
+        elif self.sample_kind == "ordinary_negative" and (
+            self.label != 0 or distance < 2 * TICK_STRIDE_FRAMES or distance % TICK_STRIDE_FRAMES
+        ):
             raise ValueError("ordinary negative must be E-30, E-45, ... and have label 0")
-        expected_history = (
-            self.logical_tick - 2 * TICK_STRIDE_FRAMES,
-            self.logical_tick - TICK_STRIDE_FRAMES,
-            self.logical_tick,
-        )
-        if self.history_logical_ticks != expected_history:
-            raise ValueError(f"history must be [t-30, t-15, t], got {self.history_logical_ticks}")
-        if self.source_frame_indices != expected_history:
-            raise ValueError("source frame indices must equal the local subtask history frames")
+        if is_transition:
+            if self.task_index not in (1, 2, 3) or len(set(self.source_episode_ids)) == 1:
+                raise ValueError("transition negative must cross two adjacent subtask episodes")
+            if self.label != 0:
+                raise ValueError("transition negative must have label 0")
+            previous_episode, current_episode = self.source_episode_ids[0], self.source_episode_ids[-1]
+            if self.logical_tick == 0:
+                expected_history = (-2 * TICK_STRIDE_FRAMES, -TICK_STRIDE_FRAMES, 0)
+                expected_frames = (
+                    self.source_frame_indices[1] - TICK_STRIDE_FRAMES,
+                    self.source_frame_indices[1],
+                    0,
+                )
+                expected_ids = (previous_episode, previous_episode, current_episode)
+            elif self.logical_tick == TICK_STRIDE_FRAMES:
+                expected_history = (-TICK_STRIDE_FRAMES, 0, TICK_STRIDE_FRAMES)
+                expected_frames = (self.source_frame_indices[0], 0, TICK_STRIDE_FRAMES)
+                expected_ids = (previous_episode, current_episode, current_episode)
+            else:
+                raise ValueError("transition negative logical_tick must be 0 or 15")
+            if self.history_logical_ticks != expected_history:
+                raise ValueError(f"transition history must use fixed carry slots, got {self.history_logical_ticks}")
+            if self.source_episode_ids != expected_ids or self.source_frame_indices != expected_frames:
+                raise ValueError("transition source episodes/frames do not match its step")
+        else:
+            expected_history = (
+                self.logical_tick - 2 * TICK_STRIDE_FRAMES,
+                self.logical_tick - TICK_STRIDE_FRAMES,
+                self.logical_tick,
+            )
+            if self.history_logical_ticks != expected_history:
+                raise ValueError(f"history must be [t-30, t-15, t], got {self.history_logical_ticks}")
+            if self.source_frame_indices != expected_history:
+                raise ValueError("source frame indices must equal the local subtask history frames")
         if any(self.terminal_hold_flags):
             raise ValueError("subtask temporal samples do not use terminal holds")
 
@@ -1092,24 +1132,99 @@ def build_temporal_sample_rows(
     return tuple(rows)
 
 
-def build_manifest_sample_rows(manifest: TemporalCompletionManifest, split: SplitName) -> tuple[TemporalSampleRow, ...]:
+def build_history_carry_transition_rows(
+    group: SubtaskGroupRecord,
+    *,
+    trajectory_id: str,
+    full_episode_id: int,
+    split: SplitName,
+) -> tuple[TemporalSampleRow, ...]:
+    """Build the two negative carry windows immediately after task switches."""
+
+    if split not in SPLIT_NAMES:
+        raise ValueError(f"invalid split {split!r}")
+    rows: list[TemporalSampleRow] = []
+    for task_index in (1, 2, 3):
+        current_episode = group.source_episode_ids[task_index]
+        previous_episode = group.source_episode_ids[task_index - 1]
+        previous_end = group.lengths[task_index - 1] - 1
+        current_end = group.lengths[task_index] - 1
+        if current_end < 3 * TICK_STRIDE_FRAMES:
+            continue
+        if previous_end >= TICK_STRIDE_FRAMES:
+            rows.append(
+                TemporalSampleRow(
+                    trajectory_id=trajectory_id,
+                    full_episode_id=full_episode_id,
+                    task_index=task_index,
+                    split=split,
+                    logical_tick=0,
+                    label=0,
+                    sample_kind="transition_negative",
+                    boundary_tick=current_end,
+                    prompt_index=task_index,
+                    history_logical_ticks=(-2 * TICK_STRIDE_FRAMES, -TICK_STRIDE_FRAMES, 0),
+                    source_episode_ids=(previous_episode, previous_episode, current_episode),
+                    source_frame_indices=(previous_end - TICK_STRIDE_FRAMES, previous_end, 0),
+                    terminal_hold_flags=(False, False, False),
+                )
+            )
+        if previous_end >= 0:
+            rows.append(
+                TemporalSampleRow(
+                    trajectory_id=trajectory_id,
+                    full_episode_id=full_episode_id,
+                    task_index=task_index,
+                    split=split,
+                    logical_tick=TICK_STRIDE_FRAMES,
+                    label=0,
+                    sample_kind="transition_negative",
+                    boundary_tick=current_end,
+                    prompt_index=task_index,
+                    history_logical_ticks=(-TICK_STRIDE_FRAMES, 0, TICK_STRIDE_FRAMES),
+                    source_episode_ids=(previous_episode, current_episode, current_episode),
+                    source_frame_indices=(previous_end, 0, TICK_STRIDE_FRAMES),
+                    terminal_hold_flags=(False, False, False),
+                )
+            )
+    return tuple(rows)
+
+
+def build_manifest_sample_rows(
+    manifest: TemporalCompletionManifest,
+    split: SplitName,
+    *,
+    sampling_protocol: SamplingProtocol = "subtask_local",
+) -> tuple[TemporalSampleRow, ...]:
     """Builds natural candidates without resampling or crossing trajectory splits."""
 
     validate_temporal_manifest(manifest)
     if split not in SPLIT_NAMES:
         raise ValueError(f"invalid split {split!r}")
+    if sampling_protocol not in ("subtask_local", "history_carry"):
+        raise ValueError(f"unsupported temporal sampling protocol {sampling_protocol!r}")
     rows: list[TemporalSampleRow] = []
     for record in manifest.trajectories:
         if record.split != split:
             continue
         trajectory_numeric_id = record.full_episode_id if record.full_episode_id is not None else record.group_id
         assert trajectory_numeric_id is not None
+        group = record.as_group()
         rows.extend(
             build_temporal_sample_rows(
-                record.as_group(),
+                group,
                 trajectory_id=record.trajectory_id,
                 full_episode_id=trajectory_numeric_id,
                 split=split,
             )
         )
+        if sampling_protocol == "history_carry":
+            rows.extend(
+                build_history_carry_transition_rows(
+                    group,
+                    trajectory_id=record.trajectory_id,
+                    full_episode_id=trajectory_numeric_id,
+                    split=split,
+                )
+            )
     return tuple(rows)

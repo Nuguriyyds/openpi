@@ -202,6 +202,28 @@ def test_natural_index_has_one_positive_per_task_and_exact_negative_pools():
         ) == (15, 15)
 
 
+def test_history_carry_rows_keep_previous_episode_and_prompt_identity():
+    group = _group(lengths=(100, 100, 100, 100))
+    rows = temporal_data.build_history_carry_transition_rows(
+        group,
+        trajectory_id="full-000000",
+        full_episode_id=0,
+        split="train",
+    )
+
+    assert len(rows) == 6
+    step0 = next(row for row in rows if row.task_index == 1 and row.logical_tick == 0)
+    step1 = next(row for row in rows if row.task_index == 1 and row.logical_tick == 15)
+    assert step0.label == step1.label == 0
+    assert step0.source_episode_ids == (0, 0, 1)
+    assert step0.source_frame_indices == (84, 99, 0)
+    assert step0.history_prompt_indices == (0, 0, 1)
+    assert step1.source_episode_ids == (0, 1, 1)
+    assert step1.source_frame_indices == (99, 0, 15)
+    assert step1.history_prompt_indices == (0, 1, 1)
+    assert all(row.task_index in (1, 2, 3) for row in rows)
+
+
 def test_positive_history_stays_inside_one_subtask_without_terminal_hold():
     group = _group(lengths=(100, 100, 100, 100))
     rows = temporal_data.build_temporal_sample_rows(group, trajectory_id="full-000000", full_episode_id=0, split="test")

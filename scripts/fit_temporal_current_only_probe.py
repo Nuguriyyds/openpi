@@ -276,6 +276,7 @@ def load_fitting_cache(
         manifest=manifest,
         expected_checkpoint_path=checkpoint_path,
         expected_model_config_name=temporal_config.completion.temporal_source_model_config_name,
+        sampling_protocol=temporal_config.completion.temporal_sampling_protocol,
     )
 
 

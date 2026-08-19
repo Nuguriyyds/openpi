@@ -595,6 +595,7 @@ def run_evaluation(args: argparse.Namespace) -> Path:
         manifest=manifest,
         expected_checkpoint_path=config.completion.temporal_source_checkpoint_path,
         expected_model_config_name=config.completion.temporal_source_model_config_name,
+        sampling_protocol=config.completion.temporal_sampling_protocol,
     )
     artifact = load_validation_artifact(
         checkpoint_root,
@@ -652,6 +653,7 @@ def run_evaluation(args: argparse.Namespace) -> Path:
             manifest=manifest,
             expected_checkpoint_path=cache.metadata.checkpoint_path,
             expected_model_config_name=cache.metadata.model_config_name,
+            sampling_protocol=config.completion.temporal_sampling_protocol,
         )
         probe = _load_current_only_probe(args.current_only_probe_weights.resolve(), cache=current_cache)
         current_only = _evaluate_current_only(

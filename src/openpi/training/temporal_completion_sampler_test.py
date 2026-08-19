@@ -58,6 +58,43 @@ def _event(row: _Row) -> tuple[str, int, int]:
     return (row.trajectory_id, row.task_index, row.boundary_tick)
 
 
+def _make_history_carry_rows(trajectory_count: int = 12) -> list[_Row]:
+    rows: list[_Row] = []
+    for trajectory in range(trajectory_count):
+        for task_index in _sampler.TEMPORAL_TASK_INDICES:
+            boundary = 1000 + 300 * task_index
+            common = {"trajectory_id": f"trajectory-{trajectory}", "task_index": task_index}
+            rows.extend(
+                (
+                    _Row(**common, logical_tick=boundary, label=1, sample_kind="positive", boundary_tick=boundary),
+                    _Row(
+                        **common,
+                        logical_tick=boundary - 15,
+                        label=0,
+                        sample_kind="hard_negative",
+                        boundary_tick=boundary,
+                    ),
+                    _Row(
+                        **common,
+                        logical_tick=boundary - 30,
+                        label=0,
+                        sample_kind="ordinary_negative",
+                        boundary_tick=boundary,
+                    ),
+                )
+            )
+        for task_index in (1, 2, 3):
+            boundary = 1000 + 300 * task_index
+            common = {"trajectory_id": f"trajectory-{trajectory}", "task_index": task_index}
+            rows.extend(
+                (
+                    _Row(**common, logical_tick=0, label=0, sample_kind="transition_negative", boundary_tick=boundary),
+                    _Row(**common, logical_tick=15, label=0, sample_kind="transition_negative", boundary_tick=boundary),
+                )
+            )
+    return rows
+
+
 def test_train_batch_has_exact_composition_unique_positives_and_paired_hard_negatives():
     rows = _make_rows()
     sampler = _sampler.TemporalCompletionBatchSampler(rows, seed=42, batches_per_epoch=4)
@@ -76,11 +113,60 @@ def test_train_batch_has_exact_composition_unique_positives_and_paired_hard_nega
             for task_index in _sampler.TEMPORAL_TASK_INDICES
         } == dict.fromkeys(_sampler.TEMPORAL_TASK_INDICES, 8)
         assert all(
-            (row.trajectory_id, row.task_index, row.boundary_tick)
-            in {_event(positive) for positive in positives}
+            (row.trajectory_id, row.task_index, row.boundary_tick) in {_event(positive) for positive in positives}
             for row in hard
         )
         del batch_index
+
+
+def test_history_carry_batch_is_task_balanced_and_rotates_transition_steps():
+    rows = _make_history_carry_rows()
+    sampler = _sampler.TemporalCompletionBatchSampler(
+        rows,
+        seed=42,
+        batches_per_epoch=3,
+        positive_per_batch=16,
+        hard_negative_per_batch=16,
+        ordinary_negative_per_batch=28,
+        transition_negative_per_batch=4,
+    )
+    batches = list(sampler)
+    for batch in batches:
+        selected = [rows[index] for index in batch]
+        audit = sampler.audit_batch(batch)
+        assert audit.positive_task_counts == (4, 4, 4, 4)
+        assert audit.hard_task_counts == (4, 4, 4, 4)
+        assert audit.ordinary_task_counts == (7, 7, 7, 7)
+        assert audit.transition_negative_count == 4
+        assert [
+            sum(row.sample_kind == kind for row in selected)
+            for kind in (
+                "positive",
+                "hard_negative",
+                "ordinary_negative",
+                "transition_negative",
+            )
+        ] == [16, 16, 28, 4]
+        assert [
+            sum(row.sample_kind == "positive" and row.task_index == task for row in selected)
+            for task in _sampler.TEMPORAL_TASK_INDICES
+        ] == [4] * 4
+        assert [
+            sum(row.sample_kind == "ordinary_negative" and row.task_index == task for row in selected)
+            for task in _sampler.TEMPORAL_TASK_INDICES
+        ] == [7] * 4
+        assert all(
+            _event(row) in {_event(positive) for positive in selected if positive.sample_kind == "positive"}
+            for row in selected
+            if row.sample_kind == "hard_negative"
+        )
+    transition_counts = {(task, step): 0 for task in (1, 2, 3) for step in (0, 15)}
+    for batch in batches:
+        for index in batch:
+            row = rows[index]
+            if row.sample_kind == "transition_negative":
+                transition_counts[(row.task_index, row.logical_tick)] += 1
+    assert transition_counts == dict.fromkeys(transition_counts, 2)
 
 
 def test_task_remainder_rotates_evenly_across_batches_and_epochs():

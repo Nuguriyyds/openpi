@@ -10,11 +10,13 @@ from scripts import extract_temporal_completion_features as extract
 def _row(
     *,
     prompt_index=0,
-    episodes=(0, 0, 1),
-    frames=(30, 45, 0),
+    episodes=(0, 0, 0),
+    frames=None,
     label=1,
     sample_kind="positive",
 ):
+    if frames is None:
+        frames = (30, 45, 60) if label else (15, 30, 45)
     return temporal_data.TemporalSampleRow(
         trajectory_id="full-000000",
         full_episode_id=0,
@@ -28,6 +30,40 @@ def _row(
         history_logical_ticks=(30, 45, 60) if label else (15, 30, 45),
         source_episode_ids=episodes,
         source_frame_indices=frames,
+        terminal_hold_flags=(False, False, False),
+    )
+
+
+def _transition_row(*, step: int = 0, task_index: int = 1):
+    if step == 0:
+        return temporal_data.TemporalSampleRow(
+            trajectory_id="full-000000",
+            full_episode_id=0,
+            task_index=task_index,
+            split="train",
+            logical_tick=0,
+            label=0,
+            sample_kind="transition_negative",
+            boundary_tick=60,
+            prompt_index=task_index,
+            history_logical_ticks=(-30, -15, 0),
+            source_episode_ids=(0, 0, 1),
+            source_frame_indices=(84, 99, 0),
+            terminal_hold_flags=(False, False, False),
+        )
+    return temporal_data.TemporalSampleRow(
+        trajectory_id="full-000000",
+        full_episode_id=0,
+        task_index=task_index,
+        split="train",
+        logical_tick=15,
+        label=0,
+        sample_kind="transition_negative",
+        boundary_tick=60,
+        prompt_index=task_index,
+        history_logical_ticks=(-15, 0, 15),
+        source_episode_ids=(0, 1, 1),
+        source_frame_indices=(99, 0, 15),
         terminal_hold_flags=(False, False, False),
     )
 
@@ -55,47 +91,43 @@ def test_plan_never_reads_supervision_fields():
 
 def test_plan_deduplicates_exact_source_frame_prompt_and_preserves_old_prompt():
     first = _row(label=0, sample_kind="hard_negative")
-    second = dataclasses.replace(
-        _row(),
-        source_episode_ids=(0, 1, 1),
-        source_frame_indices=(45, 0, 15),
-    )
+    second = dataclasses.replace(_transition_row(step=1), source_frame_indices=(45, 0, 15))
     plan = extract.build_prefix_feature_plan((first, second), PROMPTS)
 
-    assert len(plan.keys) == 4
+    assert len(plan.keys) == 5
     assert plan.row_key_indices.shape == (2, 3)
-    assert plan.row_key_indices[0, 1] == plan.row_key_indices[1, 0]
-    assert plan.row_key_indices[0, 2] == plan.row_key_indices[1, 1]
-    cross_boundary = next(key for key in plan.keys if key.source_episode_id == 1 and key.source_frame_index == 0)
-    assert cross_boundary.prompt_index == 0
-    assert cross_boundary.prompt == PROMPTS[0]
+    shared_old = next(
+        key
+        for key in plan.keys
+        if key.source_episode_id == 0 and key.source_frame_index == 45 and key.prompt == PROMPTS[0]
+    )
+    assert plan.row_key_indices[0, 2] == plan.row_key_indices[1, 0] == plan.keys.index(shared_old)
+    current = next(key for key in plan.keys if key.source_episode_id == 1 and key.source_frame_index == 0)
+    assert current.prompt_index == 1
+    assert current.prompt == PROMPTS[1]
 
 
-def test_same_pixels_with_different_prompt_are_distinct_feature_keys():
-    task0 = _row(prompt_index=0, episodes=(0, 1, 1), frames=(45, 0, 15))
-    task1 = dataclasses.replace(
-        _row(prompt_index=1, episodes=(1, 1, 1), frames=(0, 15, 30)),
-        trajectory_id="full-000001",
-        full_episode_id=1,
+def test_current_boundary_pixels_keep_new_prompt_and_deduplicate():
+    task0 = _transition_row(step=0, task_index=1)
+    task1 = temporal_data.TemporalSampleRow(
+        trajectory_id="full-000000",
+        full_episode_id=0,
+        task_index=1,
+        split="train",
+        logical_tick=30,
+        label=1,
+        sample_kind="positive",
+        boundary_tick=30,
+        prompt_index=1,
+        history_logical_ticks=(0, 15, 30),
+        source_episode_ids=(1, 1, 1),
+        source_frame_indices=(0, 15, 30),
+        terminal_hold_flags=(False, False, False),
     )
     plan = extract.build_prefix_feature_plan((task0, task1), PROMPTS)
 
     same_pixel = [key for key in plan.keys if (key.source_episode_id, key.source_frame_index) == (1, 0)]
-    assert {(key.prompt_index, key.prompt) for key in same_pixel} == {
-        (0, PROMPTS[0]),
-        (1, PROMPTS[1]),
-    }
-
-    duplicate_prompt_plan = extract.build_prefix_feature_plan(
-        (task0, task1),
-        {**PROMPTS, 1: PROMPTS[0]},
-    )
-    duplicate_pixel = [
-        key
-        for key in duplicate_prompt_plan.keys
-        if (key.source_episode_id, key.source_frame_index, key.prompt) == (1, 0, PROMPTS[0])
-    ]
-    assert len(duplicate_pixel) == 1
+    assert {(key.prompt_index, key.prompt) for key in same_pixel} == {(1, PROMPTS[1])}
 
 
 def test_assembly_uses_oldest_to_current_indices_and_requires_fp32_model_output():

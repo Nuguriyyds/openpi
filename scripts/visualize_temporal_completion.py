@@ -275,6 +275,7 @@ def _compute_predictions(
         manifest=manifest,
         expected_checkpoint_path=config.completion.temporal_source_checkpoint_path,
         expected_model_config_name=config.completion.temporal_source_model_config_name,
+        sampling_protocol=config.completion.temporal_sampling_protocol,
     )
     model = evaluator._load_temporal_model(  # noqa: SLF001
         config, checkpoint_path, feature_dim=cache.metadata.feature_dim

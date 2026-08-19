@@ -678,6 +678,7 @@ def prepare_temporal_completion_data(config: _config.TrainConfig) -> TemporalCom
         manifest=manifest,
         expected_checkpoint_path=config.completion.temporal_source_checkpoint_path,
         expected_model_config_name=config.completion.temporal_source_model_config_name,
+        sampling_protocol=config.completion.temporal_sampling_protocol,
     )
     logging.info(
         "Temporal completion cache: manifest=%s rows=%d feature_dim=%d checkpoint=%s",
@@ -697,12 +698,14 @@ def create_temporal_feature_data_loader(
     sharding: jax.sharding.Sharding | None = None,
     num_batches: int | None = None,
 ) -> DataLoader[tuple[jax.Array, jax.Array]]:
-    """Creates the strict 32/16/16 subtask-pair loader or natural eval loader."""
+    """Creates the configured temporal training sampler or natural eval loader."""
 
     if not config.completion.uses_temporal_completion:
         raise ValueError("temporal feature loader requires completion.temporal_sampling=True")
     if jax.process_count() != 1:
-        raise ValueError("subtask temporal completion supports one JAX process; multi-GPU within that process is supported")
+        raise ValueError(
+            "subtask temporal completion supports one JAX process; multi-GPU within that process is supported"
+        )
     data_config = config.data.create(config.assets_dirs, config.model)
     dataset = _temporal_features.TemporalFeatureDataset(temporal_data_info.cache, split)
     local_batch_size = config.batch_size // jax.process_count()
@@ -712,6 +715,10 @@ def create_temporal_feature_data_loader(
         batch_sampler = _temporal_sampler.TemporalCompletionBatchSampler(
             dataset.samples,
             seed=config.seed,
+            positive_per_batch=config.completion.temporal_positive_per_batch,
+            hard_negative_per_batch=config.completion.temporal_hard_negative_per_batch,
+            ordinary_negative_per_batch=config.completion.temporal_ordinary_negative_per_batch,
+            transition_negative_per_batch=config.completion.temporal_transition_negative_per_batch,
         )
         repeat = True
         drop_last = True

@@ -44,7 +44,8 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
         temporal.completion.temporal_positive_per_batch,
         temporal.completion.temporal_hard_negative_per_batch,
         temporal.completion.temporal_ordinary_negative_per_batch,
-    ) == (32, 16, 16)
+        temporal.completion.temporal_transition_negative_per_batch,
+    ) == (32, 16, 16, 0)
     assert temporal.batch_size == 64
     assert temporal.completion.focal_gamma == 0.0
     assert temporal.completion.bce_pos_weight_override == 1.0
@@ -52,6 +53,23 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
     assert temporal.weight_loader.missing_regex == r"completion_head/.*"
     assert temporal.weight_loader.reject_unexpected
     assert isinstance(temporal.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
+
+
+def test_temporal_history_carry_config_uses_balanced_transition_batch():
+    carry = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_head")
+
+    assert carry.completion.temporal_sampling_protocol == "history_carry"
+    assert (
+        carry.completion.temporal_positive_per_batch,
+        carry.completion.temporal_hard_negative_per_batch,
+        carry.completion.temporal_ordinary_negative_per_batch,
+        carry.completion.temporal_transition_negative_per_batch,
+    ) == (16, 16, 28, 4)
+    assert carry.batch_size == 64
+    assert carry.num_train_steps == 2_000
+    assert carry.completion.temporal_feature_cache_path.endswith(
+        "temporal_completion_prefix_features_history_carry_v1/features.npz"
+    )
 
 
 def test_temporal_current_only_config_changes_only_name_and_input_mode():
@@ -96,7 +114,7 @@ def test_temporal_completion_rejects_backbone_different_from_feature_source():
 
 
 def test_temporal_completion_rejects_sampler_counts_different_from_locked_batch():
-    with pytest.raises(ValueError, match=r"requires batch counts \(32, 16, 16\)"):
+    with pytest.raises(ValueError, match=r"requires batch counts \(32, 16, 16, 0\)"):
         completion_training.CompletionTrainingConfig(
             stage="head",
             temporal_sampling=True,

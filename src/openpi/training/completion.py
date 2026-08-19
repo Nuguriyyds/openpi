@@ -95,11 +95,13 @@ class CompletionTrainingConfig:
     # [B, 3, D] temporal head and zeros the first two slots immediately before
     # the head.  It therefore changes neither eligible rows nor parameter count.
     temporal_input_mode: TemporalInputMode = "history"
+    temporal_sampling_protocol: Literal["subtask_local", "history_carry"] = "subtask_local"
     temporal_history_steps: int = 3
     temporal_stride_frames: int = 15
     temporal_positive_per_batch: int = 32
     temporal_hard_negative_per_batch: int = 16
     temporal_ordinary_negative_per_batch: int = 16
+    temporal_transition_negative_per_batch: int = 0
     temporal_hard_negative_ticks: int = 1
     temporal_train_fraction: float = 0.72
     temporal_val_fraction: float = 0.08
@@ -112,6 +114,8 @@ class CompletionTrainingConfig:
             raise ValueError(f"unsupported completion objective: {self.objective!r}")
         if self.temporal_input_mode not in ("history", "current_only"):
             raise ValueError(f"unsupported temporal_input_mode: {self.temporal_input_mode!r}")
+        if self.temporal_sampling_protocol not in ("subtask_local", "history_carry"):
+            raise ValueError(f"unsupported temporal_sampling_protocol: {self.temporal_sampling_protocol!r}")
         if not self.temporal_sampling and self.temporal_input_mode != "history":
             raise ValueError("temporal_input_mode='current_only' requires temporal_sampling=True")
         if not self.label_key:
@@ -214,9 +218,13 @@ class CompletionTrainingConfig:
                 self.temporal_positive_per_batch,
                 self.temporal_hard_negative_per_batch,
                 self.temporal_ordinary_negative_per_batch,
+                self.temporal_transition_negative_per_batch,
             )
-            if counts != (32, 16, 16):
-                raise ValueError("temporal completion requires batch counts (32, 16, 16)")
+            expected_counts = (32, 16, 16, 0) if self.temporal_sampling_protocol == "subtask_local" else (16, 16, 28, 4)
+            if counts != expected_counts:
+                raise ValueError(
+                    f"temporal {self.temporal_sampling_protocol} completion requires batch counts {expected_counts}"
+                )
             if self.temporal_hard_negative_ticks != 1:
                 raise ValueError("temporal completion uses the fixed E-15 hard negative")
             fractions = (

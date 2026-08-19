@@ -636,8 +636,9 @@ class TrainConfig:
                 self.completion.temporal_positive_per_batch
                 + self.completion.temporal_hard_negative_per_batch
                 + self.completion.temporal_ordinary_negative_per_batch
+                + self.completion.temporal_transition_negative_per_batch
             ):
-                raise ValueError("temporal completion batch_size must equal the configured 32/16/16 composition")
+                raise ValueError("temporal completion batch_size must equal the configured temporal composition")
             if self.save_interval != self.completion.val_interval or self.keep_period != self.completion.val_interval:
                 raise ValueError(
                     "temporal completion requires save_interval=keep_period=val_interval so every val-selected "
@@ -1040,6 +1041,91 @@ _CONFIGS = [
         fsdp_devices=1,
         # Cached prefix histories are indexed in-process; no worker copies are
         # needed for the subtask reverse-sampling loader.
+        num_workers=0,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+    ),
+    # History-carry ablation: the first two prefix slots at a subtask switch
+    # retain the previous task's prompt-conditioned features.
+    TrainConfig(
+        name="pi05_agilex_breakfast_temporal_completion_history_carry_head",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(
+                enabled=True,
+                variant="temporal_mlp",
+                pooling="masked_mean",
+                temporal_steps=3,
+                hidden_dim=128,
+                dropout_rate=0.1,
+            ),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir=(
+                    "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
+                    "breakfast_subtasks_bs64_50k/49999/assets"
+                ),
+                asset_id="agilex_make_breakfast_subtasks",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/dataset/ei/huggingface",
+            ),
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            objective="binary",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json"
+            ),
+            split_seed=42,
+            val_interval=200,
+            warmup_steps=50,
+            peak_lr=1e-4,
+            decay_lr=1e-5,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+            focal_gamma=0.0,
+            bce_pos_weight_override=1.0,
+            temporal_sampling=True,
+            temporal_sampling_protocol="history_carry",
+            temporal_feature_cache_path=(
+                "/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_history_carry_v1/features.npz"
+            ),
+            temporal_source_model_config_name="pi05_730_breakfast_subtasks",
+            temporal_input_mode="history",
+            temporal_history_steps=3,
+            temporal_stride_frames=15,
+            temporal_positive_per_batch=16,
+            temporal_hard_negative_per_batch=16,
+            temporal_ordinary_negative_per_batch=28,
+            temporal_transition_negative_per_batch=4,
+            temporal_hard_negative_ticks=1,
+            temporal_train_fraction=0.72,
+            temporal_val_fraction=0.08,
+            temporal_test_fraction=0.20,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(
+                enabled=True,
+                variant="temporal_mlp",
+                pooling="masked_mean",
+            ),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999/params",
+            missing_regex=r"completion_head/.*",
+            reject_unexpected=True,
+        ),
+        num_train_steps=2_000,
+        ema_decay=None,
+        batch_size=64,
+        log_interval=100,
+        save_interval=200,
+        keep_period=200,
+        fsdp_devices=1,
         num_workers=0,
         checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
     ),

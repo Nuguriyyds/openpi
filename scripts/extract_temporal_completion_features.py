@@ -5,8 +5,9 @@ and the clean checkpoint.  It expands the canonical rows from a sealed
 temporal manifest, de-duplicates exact ``(episode, frame, logical prompt)``
 requests, evaluates the clean pi0.5 prefix in deterministic inference mode,
 then reassembles the features in canonical ``[row, oldest..current, dim]``
-order.  Every request belongs to one raw subtask episode and uses that
-episode's own prompt; no cross-subtask source or prompt is ever constructed.
+order.  The default subtask-local protocol uses one raw episode/prompt for
+all three slots; the optional ``history_carry`` protocol intentionally keeps
+the previous task's prompt on carried prefix slots at a subtask boundary.
 
 The supervision fields on a row are never consulted while selecting or
 extracting features.  The row's explicit source episode/frame references and
@@ -105,19 +106,23 @@ def build_prefix_feature_plan(
     row_keys: list[tuple[PrefixFeatureKey, PrefixFeatureKey, PrefixFeatureKey]] = []
     unique_keys: set[PrefixFeatureKey] = set()
     for row in rows:
-        # Deliberately use only immutable source references and prompt identity.
-        # No label/sample_kind/boundary field participates in feature selection.
-        prompt = logical_prompts[row.prompt_index]
+        # Deliberately use immutable source references and the row's explicit
+        # prompt identity for each slot; numeric labels and boundaries do not
+        # participate in feature selection.
+        history_prompts = getattr(row, "history_prompt_indices", None)
+        if history_prompts is None:
+            history_prompts = (row.prompt_index,) * 3
         keys = tuple(
             PrefixFeatureKey(
                 source_episode_id=int(episode_id),
                 source_frame_index=int(frame_index),
-                prompt_index=int(row.prompt_index),
-                prompt=prompt,
+                prompt_index=int(prompt_index),
+                prompt=logical_prompts[int(prompt_index)],
             )
-            for episode_id, frame_index in zip(
+            for episode_id, frame_index, prompt_index in zip(
                 row.source_episode_ids,
                 row.source_frame_indices,
+                history_prompts,
                 strict=True,
             )
         )
@@ -213,9 +218,7 @@ class _PartialFeatureCache:
     def write_batch(self, start: int, features: np.ndarray) -> int:
         values = np.asarray(features, dtype=np.float32)
         if values.ndim != 2 or values.shape[1] != self.feature_dim:
-            raise ValueError(
-                f"partial feature batch has shape {values.shape}, expected [batch, {self.feature_dim}]"
-            )
+            raise ValueError(f"partial feature batch has shape {values.shape}, expected [batch, {self.feature_dim}]")
         if not np.isfinite(values).all():
             raise ValueError("partial feature batch contains non-finite values")
         if start != self.completed_keys:
@@ -481,7 +484,7 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
             "runtime task prompts differ from the sealed temporal manifest: "
             f"runtime={ordered_prompts!r}, manifest={manifest.task_prompts!r}"
         )
-    rows = temporal_features.manifest_rows(manifest)
+    rows = temporal_features.manifest_rows(manifest, sampling_protocol=args.sampling_protocol)
     plan = build_prefix_feature_plan(rows, prompts)
     if not plan.keys:
         raise ValueError("sealed temporal manifest produced no prefix feature requests")
@@ -576,6 +579,7 @@ def extract_temporal_features(args: argparse.Namespace) -> Path:
         prefix_history=prefix_history,
         model_config_name=args.config_name,
         checkpoint_path=str(checkpoint),
+        sampling_protocol=args.sampling_protocol,
     )
     print(
         "Saved immutable temporal feature cache "
@@ -593,6 +597,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--hf-lerobot-home", type=Path, default=DEFAULT_HF_LEROBOT_HOME)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--sampling-protocol",
+        choices=("subtask_local", "history_carry"),
+        default="subtask_local",
+        help="which canonical temporal rows to extract; the default preserves the existing cache protocol",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--storage-dtype", choices=("float16", "float32"), default="float16")
     return parser

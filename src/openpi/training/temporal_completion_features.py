@@ -24,13 +24,15 @@ SUPPORTED_FEATURE_DTYPES = (np.dtype(np.float16), np.dtype(np.float32))
 
 def manifest_rows(
     manifest: _temporal_data.TemporalCompletionManifest,
+    *,
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
 ) -> tuple[_temporal_data.TemporalSampleRow, ...]:
     """Returns the canonical natural row order sealed into every cache."""
 
     return tuple(
         row
         for split in _temporal_data.SPLIT_NAMES
-        for row in _temporal_data.build_manifest_sample_rows(manifest, split)
+        for row in _temporal_data.build_manifest_sample_rows(manifest, split, sampling_protocol=sampling_protocol)
     )
 
 
@@ -102,9 +104,14 @@ class TemporalFeatureCache:
     rows: tuple[_temporal_data.TemporalSampleRow, ...]
     prefix_history: np.ndarray
 
-    def validate(self, manifest: _temporal_data.TemporalCompletionManifest) -> None:
+    def validate(
+        self,
+        manifest: _temporal_data.TemporalCompletionManifest,
+        *,
+        sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
+    ) -> None:
         _temporal_data.validate_temporal_manifest(manifest)
-        expected_rows = manifest_rows(manifest)
+        expected_rows = manifest_rows(manifest, sampling_protocol=sampling_protocol)
         if self.metadata.task_prompts != manifest.task_prompts:
             raise ValueError("feature cache task prompts differ from the sealed temporal manifest")
         if self.rows != expected_rows:
@@ -198,10 +205,11 @@ def save_temporal_feature_cache(
     prefix_history: np.ndarray,
     model_config_name: str,
     checkpoint_path: str,
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
 ) -> TemporalFeatureCacheMetadata:
     """Atomically writes one immutable cache in canonical manifest row order."""
 
-    rows = manifest_rows(manifest)
+    rows = manifest_rows(manifest, sampling_protocol=sampling_protocol)
     history = np.asarray(prefix_history)
     if history.ndim != 3 or history.shape[:2] != (len(rows), 3):
         raise ValueError(f"prefix_history must have shape [{len(rows)}, 3, D], got {history.shape}")
@@ -213,7 +221,7 @@ def save_temporal_feature_cache(
         row_count=len(rows),
     )
     cache = TemporalFeatureCache(metadata=metadata, rows=rows, prefix_history=history)
-    cache.validate(manifest)
+    cache.validate(manifest, sampling_protocol=sampling_protocol)
 
     output_path = pathlib.Path(path)
     if output_path.exists():
@@ -269,6 +277,7 @@ def load_temporal_feature_cache(
     manifest: _temporal_data.TemporalCompletionManifest,
     expected_checkpoint_path: str | None = None,
     expected_model_config_name: str | None = None,
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
 ) -> TemporalFeatureCache:
     """Loads and fully audits a cache before exposing any training samples."""
 
@@ -292,7 +301,7 @@ def load_temporal_feature_cache(
             rows = _rows_from_arrays(arrays)
             prefix_history = arrays["prefix_history"]
     cache = TemporalFeatureCache(metadata=metadata, rows=rows, prefix_history=prefix_history)
-    cache.validate(manifest)
+    cache.validate(manifest, sampling_protocol=sampling_protocol)
     if expected_checkpoint_path is not None and metadata.checkpoint_path != expected_checkpoint_path:
         raise ValueError("temporal feature cache checkpoint path does not match the requested clean checkpoint")
     if expected_model_config_name is not None and metadata.model_config_name != expected_model_config_name:

@@ -87,3 +87,47 @@ git diff --check
 ```
 
 val/test 只评估自然 candidate set；本阶段不做 closed-loop 控制和真实 full-video 评估。
+
+## 7. History-carry transition 消融
+
+该消融保留子任务切换时上一任务已经生成的两个 prefix。普通
+positive/hard/ordinary 样本仍使用单个子任务自己的 prompt；只有 transition
+negative 的历史槽位使用混合 prompt：
+
+- step0: `[previous(E-15), previous(E), current(0)]`
+- step1: `[previous(E), current(0), current(15)]`
+
+旧的 v5 cache 和 `pi05_agilex_breakfast_temporal_completion_head` 配置不变。
+消融使用独立 cache：
+
+```text
+/mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_history_carry_v1/features.npz
+```
+
+```bash
+uv run scripts/extract_temporal_completion_features.py \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json \
+  --config-name pi05_730_breakfast_subtasks \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999 \
+  --dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
+  --sampling-protocol history_carry \
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_prefix_features_history_carry_v1/features.npz \
+  --storage-dtype float16 \
+  --batch-size 32
+```
+
+训练配置固定为 `16 positive / 16 hard / 28 ordinary / 4 transition`、
+batch size 64、2000 optimizer steps，并使用未加权 BCE：
+
+```bash
+uv run scripts/train.py \
+  pi05_agilex_breakfast_temporal_completion_history_carry_head \
+  --exp-name history_carry_seed42
+```
+
+```bash
+uv run scripts/evaluate_temporal_completion.py \
+  --config-name pi05_agilex_breakfast_temporal_completion_history_carry_head \
+  --checkpoint-root /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_completion_history_carry_head/history_carry_seed42 \
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42.json
+```
