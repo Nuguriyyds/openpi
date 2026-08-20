@@ -177,10 +177,10 @@ class TemporalCompletionBatchSampler:
         )
         if any(count < 0 for count in counts) or sum(counts) != TEMPORAL_BATCH_SIZE:
             raise ValueError(f"temporal completion batch counts must be non-negative and sum to 64, got {counts}")
-        if counts not in ((32, 16, 16, 0), (16, 16, 28, 4)):
+        if counts not in ((32, 16, 16, 0), (16, 16, 28, 4), (32, 16, 12, 4)):
             raise ValueError(f"unsupported temporal completion batch composition {counts}")
         self._counts = counts
-        self._history_carry = counts == (16, 16, 28, 4)
+        self._history_carry = counts[3] > 0
         self._tick_stride_frames = int(tick_stride_frames)
 
         views = tuple(_normalise_sample(sample, index=index) for index, sample in enumerate(samples))
@@ -209,7 +209,7 @@ class TemporalCompletionBatchSampler:
                 transition_by_stratum.setdefault((view.task_index, view.logical_tick), []).append(view.index)
 
         for task, pool in positive_by_task.items():
-            required_positive = 4 if self._history_carry else 8
+            required_positive = positive_per_batch // len(TEMPORAL_TASK_INDICES)
             if len(pool) < required_positive:
                 raise ValueError(
                     f"task {task} needs at least {required_positive} positive subtask episodes, got {len(pool)}"
@@ -221,7 +221,7 @@ class TemporalCompletionBatchSampler:
                     f"task {task} ordinary pool has only {ordinary_count} episodes; need {required_ordinary}"
                 )
             hard_count = sum(key[1] == task for key in hard_by_episode)
-            required_hard = 4 if self._history_carry else 8
+            required_hard = hard_negative_per_batch // len(TEMPORAL_TASK_INDICES) if self._history_carry else 8
             if hard_count < required_hard:
                 raise ValueError(f"task {task} hard pool has only {hard_count} episodes; need {required_hard}")
         missing_hard = set(positive_by_episode) - set(hard_by_episode)
@@ -423,24 +423,40 @@ class TemporalCompletionBatchSampler:
         return [int(index) for index in indices]
 
     def _make_history_carry_batch(self, *, epoch: int, batch_index: int) -> list[int]:
-        """Build a task-balanced 16/16/28/4 history-carry batch."""
+        """Build one of the fixed task-balanced history-carry batches."""
 
         rng = self._rng(epoch=epoch, batch_index=batch_index)
         indices: list[int] = []
         selected_positive_keys: set[tuple[Hashable, int]] = set()
 
-        # Four positive events per task, with their fixed local hard negative.
+        positive_per_task = self._counts[0] // len(TEMPORAL_TASK_INDICES)
+        hard_per_task = self._counts[1] // len(TEMPORAL_TASK_INDICES)
+        ordinary_per_task = self._counts[2] // len(TEMPORAL_TASK_INDICES)
+
+        # Select the positive events first.  The hard pool is a deliberately
+        # smaller paired subset for the 32/16/12/4 ablation, so not every
+        # positive in that composition receives a hard row in this batch.
+        selected_positive_by_task: dict[int, list[tuple[Hashable, int]]] = {}
         for task in TEMPORAL_TASK_INDICES:
             pool = self._positive_by_task[task]
-            positive_indices = pool[rng.permutation(len(pool))[: self._counts[0] // len(TEMPORAL_TASK_INDICES)]]
+            positive_indices = pool[rng.permutation(len(pool))[:positive_per_task]]
+            selected_positive_by_task[task] = []
             for raw_positive_index in positive_indices:
                 positive_index = int(raw_positive_index)
                 positive_view = self._views[positive_index]
                 key = (positive_view.trajectory_id, positive_view.task_index)
                 selected_positive_keys.add(key)
-                indices.extend((positive_index, int(self._hard_by_episode[key])))
+                selected_positive_by_task[task].append((key, positive_index))
+                indices.append(positive_index)
 
-        # Seven ordinary events per task.  Choose distinct episodes in the
+        # Pair a fixed number of hard negatives with positive events from the
+        # same batch.  For the original 16/16/28/4 composition this includes
+        # every selected positive; for 32/16/12/4 it includes four per task.
+        for task in TEMPORAL_TASK_INDICES:
+            for key, _ in selected_positive_by_task[task][:hard_per_task]:
+                indices.append(int(self._hard_by_episode[key]))
+
+        # Task-balanced ordinary events.  Choose distinct episodes in the
         # batch, then advance the selected episode's row deterministically so
         # repeated batches do not always select the same tick.
         for task in TEMPORAL_TASK_INDICES:
@@ -451,7 +467,6 @@ class TemporalCompletionBatchSampler:
             ]
             if len(candidates) < self._counts[2] // len(TEMPORAL_TASK_INDICES):
                 candidates = [key for key in self._episodes_by_task[task] if key in self._ordinary_by_episode]
-            ordinary_per_task = self._counts[2] // len(TEMPORAL_TASK_INDICES)
             chosen = [candidates[int(index)] for index in rng.permutation(len(candidates))[:ordinary_per_task]]
             for candidate in chosen:
                 pool = self._ordinary_by_episode[candidate]

@@ -206,3 +206,31 @@ uv run scripts/evaluate_temporal_completion.py \
   --checkpoint-root /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head/history_carry_seed42_single_gpu_posweight2 \
   --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42_single_gpu_posweight2.json
 ```
+
+## 10. History-carry 的 32/16/12/4 匹配消融
+
+该消融复用已有 history-carry cache，不需要重新提取 prefix。它保留原方案的
+32 条 positive 和16条 hard negative，只把4条 ordinary negative替换成4条
+transition negative：
+
+```text
+positive=32, hard=16, ordinary=12, transition=4
+batch_size=64, num_train_steps=2000, pos_weight=1.0
+```
+
+训练：
+
+```bash
+uv run scripts/train.py \
+  pi05_agilex_breakfast_temporal_completion_history_carry_32_16_12_4_head \
+  --exp-name history_carry_32_16_12_4_seed42_single_gpu
+```
+
+评估：
+
+```bash
+uv run scripts/evaluate_temporal_completion.py \
+  --config-name pi05_agilex_breakfast_temporal_completion_history_carry_32_16_12_4_head \
+  --checkpoint-root /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_completion_history_carry_32_16_12_4_head/history_carry_32_16_12_4_seed42_single_gpu \
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_32_16_12_4_seed42_single_gpu.json
+```

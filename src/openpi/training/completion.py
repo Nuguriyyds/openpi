@@ -220,10 +220,16 @@ class CompletionTrainingConfig:
                 self.temporal_ordinary_negative_per_batch,
                 self.temporal_transition_negative_per_batch,
             )
-            expected_counts = (32, 16, 16, 0) if self.temporal_sampling_protocol == "subtask_local" else (16, 16, 28, 4)
-            if counts != expected_counts:
+            if self.temporal_sampling_protocol == "subtask_local":
+                allowed_counts = ((32, 16, 16, 0),)
+            else:
+                allowed_counts = ((16, 16, 28, 4), (32, 16, 12, 4))
+            if counts not in allowed_counts:
+                if self.temporal_sampling_protocol == "subtask_local":
+                    raise ValueError("temporal subtask_local completion requires batch counts (32, 16, 16, 0)")
                 raise ValueError(
-                    f"temporal {self.temporal_sampling_protocol} completion requires batch counts {expected_counts}"
+                    "temporal history_carry completion requires batch counts "
+                    "(16, 16, 28, 4) or (32, 16, 12, 4)"
                 )
             if self.temporal_hard_negative_ticks != 1:
                 raise ValueError("temporal completion uses the fixed E-15 hard negative")

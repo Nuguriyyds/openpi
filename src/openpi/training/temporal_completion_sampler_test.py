@@ -169,6 +169,32 @@ def test_history_carry_batch_is_task_balanced_and_rotates_transition_steps():
     assert transition_counts == dict.fromkeys(transition_counts, 2)
 
 
+def test_history_carry_32_16_12_4_keeps_positive_count_and_pairs_hard_subset():
+    rows = _make_history_carry_rows()
+    sampler = _sampler.TemporalCompletionBatchSampler(
+        rows,
+        seed=42,
+        positive_per_batch=32,
+        hard_negative_per_batch=16,
+        ordinary_negative_per_batch=12,
+        transition_negative_per_batch=4,
+    )
+    batch = next(iter(sampler))
+    selected = [rows[index] for index in batch]
+    audit = sampler.audit_batch(batch)
+
+    assert audit.positive_count == 32
+    assert audit.hard_negative_count == 16
+    assert audit.ordinary_negative_count == 12
+    assert audit.transition_negative_count == 4
+    assert audit.positive_task_counts == (8, 8, 8, 8)
+    assert audit.hard_task_counts == (4, 4, 4, 4)
+    assert audit.ordinary_task_counts == (3, 3, 3, 3)
+    positive_events = {_event(row) for row in selected if row.sample_kind == "positive"}
+    assert all(_event(row) in positive_events for row in selected if row.sample_kind == "hard_negative")
+    assert sampler.steps_per_epoch == 2
+
+
 def test_task_remainder_rotates_evenly_across_batches_and_epochs():
     rows = _make_rows()
     sampler = _sampler.TemporalCompletionBatchSampler(rows, seed=3, batches_per_epoch=5)

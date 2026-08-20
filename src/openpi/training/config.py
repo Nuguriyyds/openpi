@@ -1922,6 +1922,23 @@ _CONFIGS.append(
     )
 )
 
+# Matched history-carry batch ablation: retain the original 32 positive
+# examples and replace only four ordinary negatives with transition negatives.
+_CONFIGS.append(
+    dataclasses.replace(
+        _TEMPORAL_HISTORY_CARRY_CONFIG,
+        name="pi05_agilex_breakfast_temporal_completion_history_carry_32_16_12_4_head",
+        completion=dataclasses.replace(
+            _TEMPORAL_HISTORY_CARRY_CONFIG.completion,
+            temporal_positive_per_batch=32,
+            temporal_hard_negative_per_batch=16,
+            temporal_ordinary_negative_per_batch=12,
+            temporal_transition_negative_per_batch=4,
+            bce_pos_weight_override=1.0,
+        ),
+    )
+)
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

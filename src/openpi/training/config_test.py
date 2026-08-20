@@ -79,6 +79,25 @@ def test_temporal_history_carry_config_uses_balanced_transition_batch():
     assert carry_posweight2.batch_size == carry.batch_size == 64
 
 
+def test_temporal_history_carry_32_16_12_4_config_reuses_history_cache():
+    ablation = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_32_16_12_4_head")
+
+    assert ablation.completion.temporal_sampling_protocol == "history_carry"
+    assert (
+        ablation.completion.temporal_positive_per_batch,
+        ablation.completion.temporal_hard_negative_per_batch,
+        ablation.completion.temporal_ordinary_negative_per_batch,
+        ablation.completion.temporal_transition_negative_per_batch,
+    ) == (32, 16, 12, 4)
+    assert ablation.completion.temporal_feature_cache_path.endswith(
+        "temporal_completion_prefix_features_history_carry_v1/features.npz"
+    )
+    assert ablation.completion.bce_pos_weight_override == 1.0
+    assert ablation.completion.focal_gamma == 0.0
+    assert ablation.batch_size == 64
+    assert ablation.num_train_steps == 2_000
+
+
 def test_temporal_current_only_config_changes_only_name_and_input_mode():
     history = config.get_config("pi05_agilex_breakfast_temporal_completion_head")
     current_only = config.get_config("pi05_agilex_breakfast_temporal_completion_current_only_head")
