@@ -247,10 +247,20 @@ def train_step(
         focal_alpha = config.completion.focal_alpha
         uses_focal = config.completion.uses_focal_loss
         uses_progress = config.completion.uses_progress_objective
+        if uses_temporal:
+            # The temporal config is the source of truth; do not let a stale
+            # caller argument silently change the configured loss ablation.
+            pos_weight = (
+                config.completion.bce_pos_weight_override
+                if config.completion.bce_pos_weight_override is not None
+                else 1.0
+            )
         if not uses_temporal and not uses_progress and not uses_focal and pos_weight is None:
             raise ValueError("pos_weight is required for completion head training")
 
         if uses_temporal:
+            if pos_weight is None:
+                raise ValueError("temporal completion requires a configured pos_weight")
 
             def temporal_completion_loss_fn(model, rng, history, targets):
                 logits = model.compute_temporal_completion_logits(rng, history, train=True)
@@ -258,7 +268,7 @@ def train_step(
                     raise ValueError(
                         f"temporal completion target shape {targets.shape} does not match logits shape {logits.shape}"
                     )
-                return jnp.mean(_completion.bce_with_logits(logits, targets))
+                return jnp.mean(_completion.weighted_bce_with_logits(logits, targets, pos_weight))
 
             loss, grads = nnx.value_and_grad(
                 temporal_completion_loss_fn,
@@ -378,7 +388,7 @@ def train_step(
                 "completion_positive_fraction": jnp.mean(completion_targets),
             }
             if uses_temporal:
-                head_info["pos_weight"] = jnp.asarray(1.0, dtype=jnp.float32)
+                head_info["pos_weight"] = jnp.asarray(pos_weight, dtype=jnp.float32)
                 head_info["temporal_history_steps"] = jnp.asarray(3.0, dtype=jnp.float32)
             elif uses_focal:
                 head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
@@ -841,7 +851,11 @@ def main(config: _config.TrainConfig):
     if trains_completion_head:
         if uses_temporal_completion:
             assert temporal_data_info is not None
-            pos_weight = 1.0
+            pos_weight = (
+                config.completion.bce_pos_weight_override
+                if config.completion.bce_pos_weight_override is not None
+                else 1.0
+            )
         else:
             assert completion_data_info is not None
         if not uses_temporal_completion and not config.completion.uses_progress_objective:
@@ -1016,7 +1030,7 @@ def main(config: _config.TrainConfig):
                 "dataset/test_candidate_count": temporal_data_info.sample_count("test"),
                 "dataset/feature_dim": temporal_data_info.cache.metadata.feature_dim,
                 "dataset/history_steps": temporal_data_info.cache.metadata.history_steps,
-                "dataset/effective_pos_weight": 1.0,
+                "dataset/effective_pos_weight": float(pos_weight),
             }
             temporal_sampler = data_loader.temporal_sampler
             if temporal_sampler is not None:

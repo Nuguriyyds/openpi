@@ -131,3 +131,78 @@ uv run scripts/evaluate_temporal_completion.py \
   --checkpoint-root /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_completion_history_carry_head/history_carry_seed42 \
   --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42.json
 ```
+
+## 8. 生成逐样本曲线 HTML
+
+评估命令只生成汇总 JSON。需要查看类似“target / predicted score / threshold”
+的曲线时，先完成第 7 节的评估，再运行独立可视化脚本。它复用同一个
+validation-selected checkpoint、feature cache 和 threshold，不重新搜索 test
+threshold。默认绘制 test split 中的所有 trajectory/task，可在 HTML 下拉框中切换。
+
+```bash
+uv run scripts/visualize_temporal_completion.py \
+  --report /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42.json \
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42_curves.html \
+  --split both \
+  --predictions-json /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42_curves_predictions.json
+```
+
+该命令会复用评估报告中记录的 checkpoint、cache 和 validation threshold，
+并在 HTML 旁边生成可复用的 `.predictions.npz` sidecar。以后再次运行相同
+报告时，如果 sidecar 仍匹配，会直接复用预测，不重复做 prefix-head 推理。
+
+只查看某一个 task 时，可以追加：
+
+```bash
+  --task-index 2
+```
+
+`--task-index` 取值为 `0/1/2/3`。如果不传该参数，HTML 会为所有 trajectory/task
+建立下拉选项；打开页面后可在 Episode 下拉框中选择具体曲线。若只想生成
+少量均匀分布的 episode 预览，可追加 `--max-episodes 20`。
+
+输出文件：
+
+- `*_curves_predictions.json`：每个候选行的 current frame、label、score、
+  `sample_kind` 和 episode/task 信息。
+- `*_curves.html`：单文件离线页面，浏览器直接打开即可，不依赖 Plotly 或网络。
+- `*.predictions.npz`：脚本内部复用的预测 sidecar；不需要手工打开。
+
+横轴是当前 task 内的 source frame（30 fps，候选点按 15 帧即 2 Hz 采样），
+不是完整视频的每一个 30 fps 图像。曲线含义如下：
+
+- 绿色阶梯线：人工 label；
+- 橙色线：completion head 的 sigmoid score；
+- 紫色虚线：只由 val 选择的 threshold；
+- 彩色圆点：`positive`、`hard_negative`、`ordinary_negative` 和
+  `transition_negative`，history-carry 的 transition 会保留在图中。
+
+该页面仍然是 oracle-prompt candidate-set 可视化，不代表 closed-loop 部署
+曲线；history-carry 的 transition 行会显示旧 prompt 与新 prompt 混合历史的
+样本语义。
+
+current-only 或 subtask-local baseline 的可视化只需替换
+`--report` 和输出文件名，
+命令结构完全相同。
+
+## 9. History-carry 的 `pos_weight=2.0` 消融
+
+原始 `pi05_agilex_breakfast_temporal_completion_history_carry_head` 保持
+`pos_weight=1.0`。`pos_weight=2.0` 使用独立配置和独立实验目录，避免覆盖
+原实验的 checkpoint 或 validation artifact：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run scripts/train.py \
+  pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head \
+  --exp-name history_carry_seed42_single_gpu_posweight2
+```
+
+该配置仍使用相同的 history-carry cache、16/16/28/4 batch、2000 steps，
+只有 BCE 正类权重改为 `2.0`。评估时也必须使用新的 config 和 checkpoint root：
+
+```bash
+uv run scripts/evaluate_temporal_completion.py \
+  --config-name pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head \
+  --checkpoint-root /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head/history_carry_seed42_single_gpu_posweight2 \
+  --output /mnt/data/models/wyt/evaluations/temporal_completion_reports/history_carry_seed42_single_gpu_posweight2.json
+```

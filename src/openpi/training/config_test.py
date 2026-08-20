@@ -57,6 +57,9 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
 
 def test_temporal_history_carry_config_uses_balanced_transition_batch():
     carry = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_head")
+    carry_posweight2 = config.get_config(
+        "pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head"
+    )
 
     assert carry.completion.temporal_sampling_protocol == "history_carry"
     assert (
@@ -67,9 +70,13 @@ def test_temporal_history_carry_config_uses_balanced_transition_batch():
     ) == (16, 16, 28, 4)
     assert carry.batch_size == 64
     assert carry.num_train_steps == 2_000
+    assert carry.completion.bce_pos_weight_override == 1.0
     assert carry.completion.temporal_feature_cache_path.endswith(
         "temporal_completion_prefix_features_history_carry_v1/features.npz"
     )
+    assert carry_posweight2.completion.temporal_sampling_protocol == "history_carry"
+    assert carry_posweight2.completion.bce_pos_weight_override == 2.0
+    assert carry_posweight2.batch_size == carry.batch_size == 64
 
 
 def test_temporal_current_only_config_changes_only_name_and_input_mode():

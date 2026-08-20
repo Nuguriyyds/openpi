@@ -238,8 +238,8 @@ class CompletionTrainingConfig:
                 raise ValueError("temporal completion split fractions must sum to 1")
             if self.focal_gamma != 0.0:
                 raise ValueError("subtask temporal completion uses unweighted BCE, not focal loss")
-            if self.bce_pos_weight_override not in (None, 1.0):
-                raise ValueError("subtask temporal completion requires bce_pos_weight_override=1.0")
+            if self.temporal_sampling_protocol == "subtask_local" and self.bce_pos_weight_override not in (None, 1.0):
+                raise ValueError("subtask-local temporal completion requires bce_pos_weight_override=1.0")
 
     @property
     def uses_completion_data(self) -> bool:

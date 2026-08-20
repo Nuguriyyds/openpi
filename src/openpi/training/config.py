@@ -1906,6 +1906,22 @@ _CONFIGS.append(
     )
 )
 
+# Independent loss ablation for history-carry.  Keep the original config at
+# pos_weight=1.0 so its checkpoints and reports remain reproducible.
+_TEMPORAL_HISTORY_CARRY_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_agilex_breakfast_temporal_completion_history_carry_head"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _TEMPORAL_HISTORY_CARRY_CONFIG,
+        name="pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head",
+        completion=dataclasses.replace(
+            _TEMPORAL_HISTORY_CARRY_CONFIG.completion,
+            bce_pos_weight_override=2.0,
+        ),
+    )
+)
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
