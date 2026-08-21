@@ -19,17 +19,23 @@ from typing import Any
 import numpy as np
 
 from openpi.training import temporal_completion_data as temporal_data
-from openpi.training.temporal_completion_semiclosed import BoundaryResult
-from openpi.training.temporal_completion_semiclosed import SemiClosedCompletionController
+from openpi.training.temporal_completion_semiclosed import GatedCompletionController
 from openpi.training.temporal_completion_semiclosed import classify_boundary
-from openpi.training.temporal_completion_semiclosed import oracle_task_index
 from openpi.training.temporal_completion_semiclosed import reference_ticks
-from openpi.training.temporal_completion_semiclosed import summarize_boundary_results
 
 DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json")
 DEFAULT_FULL_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730")
 DEFAULT_SUBTASK_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730")
 REPORT_SCHEMA_VERSION = 1
+EVALUATION_PROTOCOL = "gated_terminal_hold_timeout_v1"
+
+
+def validate_timeout_seconds(value: float) -> tuple[float, int]:
+    seconds = float(value)
+    units = seconds * 2.0
+    if not np.isfinite(seconds) or seconds <= 0.0 or not np.isclose(units, round(units), rtol=0.0, atol=1.0e-8):
+        raise ValueError("--timeout-seconds must be positive and an integer multiple of 0.5 seconds")
+    return seconds, round(units)
 
 
 def load_threshold(
@@ -408,73 +414,61 @@ def _evaluate_episode(
 ) -> dict[str, Any]:
     ends = spec.gt_end_frames
     refs = reference_ticks(ends)
-    controller = SemiClosedCompletionController(spec.prompts, threshold=threshold, mode=args.mode)
-    feature_cache: dict[tuple[int, int, int], np.ndarray] = {}
-    predicted: list[int | None] = [None] * 4
+    playback_starts = (0, *spec.subtask_start_frames[1:])
+    controller = GatedCompletionController(
+        spec.prompts,
+        playback_start_frames=playback_starts,
+        gt_end_frames=ends,
+        threshold=threshold,
+        mode=args.mode,
+        timeout_seconds=args.timeout_seconds,
+    )
     ticks: list[dict[str, Any]] = []
-    warmup_count = 0
-    mismatch_count = 0
-    done_frame: int | None = None
-    for frame in range(0, spec.full_length, 15):
-        task_before = controller.current_task_index
+    rollout_tick = 0
+    while not controller.done:
+        source_frame = controller.current_source_frame
         prompt = controller.current_prompt
-        if controller.done:
-            feature = np.zeros(int(policy._model.prefix_feature_dim), dtype=np.float32)  # noqa: SLF001
-        else:
-            cache_key = (spec.full_episode_id, frame, task_before)
-            feature = feature_cache.get(cache_key)
-            if feature is None:
-                feature = _prefix_feature(
-                    policy=policy,
-                    model_api=model_api,
-                    jax=jax,
-                    jnp=jnp,
-                    compute_fn=compute_fn,
-                    state=state,
-                    dataset=full_dataset,
-                    episode_id=spec.full_episode_id,
-                    frame_index=frame,
-                    prompt=prompt,
-                )
-                feature_cache[cache_key] = feature
-        decision = controller.step(frame, feature, policy.score_temporal_completion)
-        oracle_task = oracle_task_index(frame, ends)
-        mismatch = decision.active_task_index != oracle_task
-        mismatch_count += int(mismatch)
-        if not decision.history_ready and not decision.done:
-            warmup_count += 1
-        if decision.triggered and predicted[decision.task_before] is None:
-            predicted[decision.task_before] = frame
-        if decision.done and done_frame is None:
-            done_frame = frame
-        ticks.append(
-            {
-                "frame_index": frame,
-                "active_task_index": decision.active_task_index,
-                "active_prompt": decision.active_prompt,
-                "oracle_task_index": oracle_task,
-                "history_ready": decision.history_ready,
-                "target": int(frame >= refs[decision.task_before]),
-                "score": decision.score,
-                "threshold": threshold,
-                "triggered": decision.triggered,
-                "task_before": decision.task_before,
-                "task_after": decision.task_after,
-                "done": decision.done,
-                "prompt_mismatch": mismatch,
-            }
+        feature = _prefix_feature(
+            policy=policy,
+            model_api=model_api,
+            jax=jax,
+            jnp=jnp,
+            compute_fn=compute_fn,
+            state=state,
+            dataset=full_dataset,
+            episode_id=spec.full_episode_id,
+            frame_index=source_frame,
+            prompt=prompt,
         )
+        decision = controller.step(rollout_tick, feature, policy.score_temporal_completion)
+        if decision.active_task_index != decision.source_task_index:
+            raise RuntimeError(
+                "gated replay invariant violated: active_task_index and source_task_index differ "
+                f"at rollout tick {rollout_tick}"
+            )
+        tick = decision.to_dict()
+        tick["prompt_mismatch"] = False
+        tick["wrong_prompt"] = False
+        ticks.append(tick)
+        rollout_tick += 1
+
+    task_results = list(controller.task_results)
+    if len(task_results) != 4:
+        raise RuntimeError(f"gated replay ended with {len(task_results)} task results instead of four")
+    predicted = [result.trigger_source_frame for result in task_results]
     boundaries = [
         classify_boundary(task, refs[task], predicted[task], full_length=spec.full_length) for task in range(4)
     ]
     boundary_dicts = [result.to_dict() for result in boundaries]
-    # A terminal boundary whose reference tick lies beyond the video is
-    # reported separately as ``unavailable`` rather than counted as a failure.
-    # A missing trigger at that boundary is still a real miss.
-    first_failure = next(
-        (result.task_index for result in boundaries if result.classification not in ("correct", "unavailable")),
-        None,
-    )
+    task_dicts = [result.to_dict() for result in task_results]
+    classifications = [result.classification for result in task_results]
+    first_non_on_time = next((task for task, value in enumerate(classifications) if value != "on_time"), None)
+    early_count = classifications.count("early")
+    on_time_count = classifications.count("on_time")
+    late_count = classifications.count("late_trigger")
+    timeout_count = classifications.count("timeout_forced")
+    mismatch_count = sum(int(bool(tick["prompt_mismatch"])) for tick in ticks)
+    warmup_count = sum(int(not bool(tick["history_ready"])) for tick in ticks)
     return {
         "full_episode_id": spec.full_episode_id,
         "group_id": spec.group_id,
@@ -482,64 +476,172 @@ def _evaluate_episode(
         "subtask_episode_ids": list(spec.subtask_episode_ids),
         "lengths": list(spec.lengths),
         "subtask_start_frames": list(spec.subtask_start_frames),
+        "playback_start_frames": list(playback_starts),
         "gt_end_frames": list(ends),
         "reference_ticks": list(refs),
         "reference_tick_available": [ref < spec.full_length for ref in refs],
         "predicted_ticks": predicted,
         "boundary_results": boundary_dicts,
+        "task_results": task_dicts,
         "all_correct": all(result.classification in ("correct", "unavailable") for result in boundaries),
-        "first_failure_task": first_failure,
-        "early_count": sum(result.classification == "early" for result in boundaries),
-        "late_count": sum(result.classification == "late" for result in boundaries),
-        "missed_count": sum(result.classification == "missed" for result in boundaries),
+        "all_on_time": on_time_count == 4,
+        "fully_autonomous": timeout_count == 0,
+        "first_failure_task": first_non_on_time,
+        "first_non_on_time_task": first_non_on_time,
+        "early_count": early_count,
+        "on_time_count": on_time_count,
+        "late_trigger_count": late_count,
+        "timeout_forced_count": timeout_count,
+        "late_count": late_count,
+        "missed_count": timeout_count,
         "done": controller.done,
-        "done_frame": done_frame,
+        "done_frame": ticks[-1]["source_frame_index"] if ticks else None,
+        "done_rollout_tick": controller.done_rollout_tick,
+        "has_early_switch": early_count > 0,
+        "has_late_trigger": late_count > 0,
+        "has_timeout_forced": timeout_count > 0,
+        "timeout_seconds": args.timeout_seconds,
+        "timeout_ticks": controller.timeout_ticks,
         "prompt_mismatch_count": mismatch_count,
         "prompt_mismatch_rate": mismatch_count / len(ticks) if ticks else None,
+        "wrong_prompt_tick_count": mismatch_count,
         "history_not_ready_count": warmup_count,
         "history_not_ready_rate": warmup_count / len(ticks) if ticks else None,
         "ticks": ticks,
     }
 
 
-def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
-    boundary_objects = [BoundaryResult(**boundary) for episode in episodes for boundary in episode["boundary_results"]]
-    per_task: dict[str, Any] = {}
-    for task in range(4):
-        per_task[str(task)] = summarize_boundary_results([item for item in boundary_objects if item.task_index == task])
-    all_ticks = sum(len(item["ticks"]) for item in episodes)
-    mismatches = sum(int(item["prompt_mismatch_count"]) for item in episodes)
-    warmups = sum(int(item["history_not_ready_count"]) for item in episodes)
-    incorrect = [int(item["full_episode_id"]) for item in episodes if not item["all_correct"]]
-    early = [int(item["full_episode_id"]) for item in episodes if item["early_count"]]
-    late = [int(item["full_episode_id"]) for item in episodes if item["late_count"]]
-    missed = [int(item["full_episode_id"]) for item in episodes if item["missed_count"]]
-    unavailable = [
-        int(item["full_episode_id"])
-        for item in episodes
-        if any(not boundary["reference_tick_available"] for boundary in item["boundary_results"])
-    ]
+def _distribution(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {
+            "mean": None,
+            "median": None,
+            "p90": None,
+            "max": None,
+        }
+    array = np.asarray(values, dtype=np.float64)
     return {
-        "episode_count": len(episodes),
-        "all_correct_count": sum(bool(item["all_correct"]) for item in episodes),
-        "all_correct_rate": sum(bool(item["all_correct"]) for item in episodes) / len(episodes) if episodes else None,
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "p90": float(np.percentile(array, 90)),
+        "max": float(np.max(array)),
+    }
+
+
+def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = dict.fromkeys(("early", "on_time", "late_trigger", "timeout_forced"), 0)
+    for result in results:
+        counts[str(result["classification"])] += 1
+    task_count = len(results)
+    autonomous = counts["early"] + counts["on_time"] + counts["late_trigger"]
+    early_remaining = [
+        float(result["remaining_source_frames"])
+        for result in results
+        if result["classification"] == "early" and result["remaining_source_frames"] is not None
+    ]
+    late_delays = [
+        float(result["late_delay_seconds"])
+        for result in results
+        if result["classification"] == "late_trigger" and result["late_delay_seconds"] is not None
+    ]
+    remaining_stats = _distribution(early_remaining)
+    late_stats = _distribution(late_delays)
+    return {
+        "task_count": task_count,
+        "early_count": counts["early"],
+        "on_time_count": counts["on_time"],
+        "late_trigger_count": counts["late_trigger"],
+        "timeout_forced_count": counts["timeout_forced"],
+        "early_rate": counts["early"] / task_count if task_count else None,
+        "on_time_rate": counts["on_time"] / task_count if task_count else None,
+        "late_trigger_rate": counts["late_trigger"] / task_count if task_count else None,
+        "timeout_forced_rate": counts["timeout_forced"] / task_count if task_count else None,
+        "autonomous_switch_count": autonomous,
+        "autonomous_switch_rate": autonomous / task_count if task_count else None,
+        "remaining_source_frames": remaining_stats,
+        "remaining_source_frames_mean": remaining_stats["mean"],
+        "remaining_source_frames_median": remaining_stats["median"],
+        "remaining_source_frames_p90": remaining_stats["p90"],
+        "remaining_source_frames_max": remaining_stats["max"],
+        "late_delay_seconds": late_stats,
+        "late_delay_seconds_mean": late_stats["mean"],
+        "late_delay_seconds_median": late_stats["median"],
+        "late_delay_seconds_p90": late_stats["p90"],
+        "late_delay_seconds_max": late_stats["max"],
+    }
+
+
+def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
+    task_results = [result for episode in episodes for result in episode["task_results"]]
+    per_task = {
+        str(task): _gated_summary([result for result in task_results if int(result["task_index"]) == task])
+        for task in range(4)
+    }
+    all_ticks = sum(len(item["ticks"]) for item in episodes)
+    mismatches = sum(int(item["wrong_prompt_tick_count"]) for item in episodes)
+    warmups = sum(int(item["history_not_ready_count"]) for item in episodes)
+    all_on_time_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["all_on_time"])
+    early_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_early_switch"])
+    late_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_late_trigger"])
+    timeout_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_timeout_forced"])
+    not_autonomous_ids = sorted(int(item["full_episode_id"]) for item in episodes if not item["fully_autonomous"])
+    episode_count = len(episodes)
+    fully_autonomous_count = sum(bool(item["fully_autonomous"]) for item in episodes)
+    all_on_time_count = len(all_on_time_ids)
+    overall = _gated_summary(task_results)
+    return {
+        "episode_count": episode_count,
+        "fully_autonomous_episode_count": fully_autonomous_count,
+        "fully_autonomous_episode_rate": fully_autonomous_count / episode_count if episode_count else None,
+        "all_on_time_episode_count": all_on_time_count,
+        "all_on_time_episode_rate": all_on_time_count / episode_count if episode_count else None,
+        "episode_with_early_count": len(early_ids),
+        "episode_with_late_trigger_count": len(late_ids),
+        "episode_with_timeout_count": len(timeout_ids),
+        "total_timeout_forced_switches": sum(int(item["timeout_forced_count"]) for item in episodes),
         "done_count": sum(bool(item["done"]) for item in episodes),
-        "done_rate": sum(bool(item["done"]) for item in episodes) / len(episodes) if episodes else None,
+        "done_rate": sum(bool(item["done"]) for item in episodes) / episode_count if episode_count else None,
         "prompt_mismatch_count": mismatches,
         "prompt_mismatch_rate": mismatches / all_ticks if all_ticks else None,
+        "wrong_prompt_tick_count": mismatches,
         "history_not_ready_count": warmups,
         "history_not_ready_rate": warmups / all_ticks if all_ticks else None,
-        "boundaries": summarize_boundary_results(boundary_objects),
+        "task_count": overall["task_count"],
+        "early_count": overall["early_count"],
+        "on_time_count": overall["on_time_count"],
+        "late_trigger_count": overall["late_trigger_count"],
+        "timeout_forced_count": overall["timeout_forced_count"],
+        "early_rate": overall["early_rate"],
+        "on_time_rate": overall["on_time_rate"],
+        "late_trigger_rate": overall["late_trigger_rate"],
+        "timeout_forced_rate": overall["timeout_forced_rate"],
+        "autonomous_switch_count": overall["autonomous_switch_count"],
+        "autonomous_switch_rate": overall["autonomous_switch_rate"],
+        "remaining_source_frames_mean": overall["remaining_source_frames_mean"],
+        "remaining_source_frames_median": overall["remaining_source_frames_median"],
+        "remaining_source_frames_p90": overall["remaining_source_frames_p90"],
+        "remaining_source_frames_max": overall["remaining_source_frames_max"],
+        "late_delay_seconds_mean": overall["late_delay_seconds_mean"],
+        "late_delay_seconds_median": overall["late_delay_seconds_median"],
+        "late_delay_seconds_p90": overall["late_delay_seconds_p90"],
+        "late_delay_seconds_max": overall["late_delay_seconds_max"],
+        "overall": overall,
         "per_task": per_task,
-        "incorrect_episode_ids": sorted(set(incorrect)),
-        "early_episode_ids": sorted(set(early)),
-        "late_episode_ids": sorted(set(late)),
-        "missed_episode_ids": sorted(set(missed)),
-        "terminal_unavailable_episode_ids": sorted(set(unavailable)),
+        "all_on_time_episode_ids": all_on_time_ids,
+        "early_episode_ids": early_ids,
+        "late_trigger_episode_ids": late_ids,
+        "timeout_forced_episode_ids": timeout_ids,
+        "not_fully_autonomous_episode_ids": not_autonomous_ids,
+        # Compatibility aliases retained for old report consumers; the new
+        # classification fields above are the primary metrics.
+        "incorrect_episode_ids": not_autonomous_ids,
+        "late_episode_ids": late_ids,
+        "missed_episode_ids": timeout_ids,
     }
 
 
 def evaluate(args: argparse.Namespace) -> Path:
+    args.timeout_seconds, timeout_ticks = validate_timeout_seconds(args.timeout_seconds)
     threshold, threshold_source, validation_path = load_threshold(
         validation_report=args.validation_report,
         explicit_threshold=args.threshold,
@@ -590,6 +692,12 @@ def evaluate(args: argparse.Namespace) -> Path:
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "mode": args.mode,
+        "evaluation_protocol": EVALUATION_PROTOCOL,
+        "timeout_seconds": args.timeout_seconds,
+        "timeout_ticks": timeout_ticks,
+        "scheduler_hz": 2,
+        "fps": 30,
+        "prompt_mismatch_note": "prompt mismatch is prevented by the gated replay protocol",
         "full_dataset_root": str(args.full_dataset_root.resolve()),
         "subtask_dataset_root": str(args.subtask_dataset_root.resolve()),
         "manifest": str(args.manifest.resolve()),
@@ -619,6 +727,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--split", choices=("test",), default="test")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=2.0)
     threshold_group = parser.add_mutually_exclusive_group(required=True)
     threshold_group.add_argument("--validation-report", type=Path)
     threshold_group.add_argument("--threshold", type=float)

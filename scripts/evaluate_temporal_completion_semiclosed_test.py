@@ -5,11 +5,23 @@ import json
 import numpy as np
 import pytest
 
+from openpi.training.temporal_completion_semiclosed import GatedCompletionController
 from openpi.training.temporal_completion_semiclosed import SemiClosedCompletionController
 from openpi.training.temporal_completion_semiclosed import classify_boundary
 from openpi.training.temporal_completion_semiclosed import gt_end_frames
 from openpi.training.temporal_completion_semiclosed import reference_tick
 from scripts import evaluate_temporal_completion_semiclosed as evaluator
+
+
+def _gated_controller(*, mode: str, threshold: float = 0.5, timeout_seconds: float = 2.0):
+    return GatedCompletionController(
+        ("p0", "p1", "p2", "p3"),
+        playback_start_frames=(0, 100, 200, 300),
+        gt_end_frames=(30, 130, 230, 330),
+        threshold=threshold,
+        mode=mode,  # type: ignore[arg-type]
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def test_global_ends_and_reference_ticks_use_inclusive_endpoints() -> None:
@@ -115,6 +127,114 @@ def test_transition_slots_evolve_old_old_new_to_new_new_new() -> None:
     np.testing.assert_array_equal(inputs[1], np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32))
     np.testing.assert_array_equal(inputs[2], np.asarray([[2.0], [3.0], [4.0]], dtype=np.float32))
     np.testing.assert_array_equal(inputs[3], np.asarray([[3.0], [4.0], [5.0]], dtype=np.float32))
+
+
+def test_gated_replay_caps_source_frame_and_repeats_terminal_until_timeout() -> None:
+    controller = _gated_controller(mode="current_only")
+    decisions = []
+    while not controller.done:
+        decision = controller.step(len(decisions), np.asarray([0.0]), lambda _: 0.0)
+        decisions.append(decision)
+    assert max(decision.source_frame_index for decision in decisions if decision.active_task_index == 0) == 30
+    task0 = [decision for decision in decisions if decision.active_task_index == 0]
+    assert [decision.source_frame_index for decision in task0[-5:]] == [30, 30, 30, 30, 30]
+    assert [decision.terminal_hold_tick for decision in task0[-5:]] == [0, 1, 2, 3, 4]
+    assert task0[-1].score == 0.0
+    assert task0[-1].timeout_forced
+    assert task0[-1].switch_reason == "timeout"
+
+
+def test_gated_replay_on_time_scores_at_first_terminal_tick_and_switches_next_tick() -> None:
+    controller = _gated_controller(mode="current_only")
+    decisions = []
+    while not controller.done:
+        tick = len(decisions)
+        source_frame = controller.current_source_frame
+        decision = controller.step(
+            tick,
+            np.asarray([float(source_frame)]),
+            lambda history: float(history[-1, 0]) == float(controller.gt_end_frames[controller.current_task_index]),
+        )
+        decisions.append(decision)
+    task0 = [decision for decision in decisions if decision.active_task_index == 0]
+    assert task0[-1].source_frame_index == 30
+    assert task0[-1].terminal_hold_tick == 0
+    assert task0[-1].switch_reason == "head_on_time"
+    assert task0[-1].triggered
+    assert decisions[len(task0)].active_task_index == 1
+    assert decisions[len(task0)].source_frame_index == 100
+
+
+def test_gated_timeout_deadline_is_scored_before_forcing_and_task3_finishes() -> None:
+    calls: list[int] = []
+    controller = _gated_controller(mode="current_only", timeout_seconds=2.0)
+    decisions = []
+
+    def score(_: np.ndarray) -> float:
+        calls.append(1)
+        return 0.0
+
+    while not controller.done:
+        decision = controller.step(len(decisions), np.asarray([0.0]), score)
+        decisions.append(decision)
+    assert len(calls) == len(decisions)
+    task3 = [decision for decision in decisions if decision.active_task_index == 3]
+    assert task3[-1].terminal_hold_tick == 4
+    assert task3[-1].timeout_forced
+    assert task3[-1].done
+    assert controller.done_rollout_tick == task3[-1].rollout_tick
+
+
+def test_gated_history_clears_after_switch_and_current_only_scores_first_tick() -> None:
+    history = _gated_controller(mode="history")
+    history_decisions = []
+    while history.current_task_index == 0:
+        tick = len(history_decisions)
+        source_frame = history.current_source_frame
+        history_decisions.append(
+            history.step(tick, np.asarray([float(source_frame)]), lambda values: float(values[-1, 0]) == 30.0)
+        )
+    # The task-0 end is reached after three warmup prefixes; after the
+    # on-time switch, task 1 starts with an empty history.
+    first_task1 = history.step(len(history_decisions), np.asarray([0.0]), lambda _: 1.0)
+    second_task1 = history.step(len(history_decisions) + 1, np.asarray([0.0]), lambda _: 1.0)
+    assert not first_task1.history_ready
+    assert first_task1.score is None
+    assert not second_task1.history_ready
+    assert second_task1.score is None
+
+    current_only = _gated_controller(mode="current_only")
+    first = current_only.step(0, np.asarray([0.0]), lambda _: 0.0)
+    assert first.history_ready
+    assert first.score == 0.0
+
+
+def test_gated_transition_keeps_history_and_scores_first_new_task_tick() -> None:
+    controller = _gated_controller(mode="transition")
+    inputs: list[np.ndarray] = []
+
+    def score(history: np.ndarray) -> float:
+        inputs.append(np.array(history, copy=True))
+        return float(history[-1, 0]) in (2.0, 99.0)
+
+    decisions = []
+    while controller.current_task_index == 0:
+        decisions.append(controller.step(len(decisions), np.asarray([float(len(decisions))]), score))
+    first_new = controller.step(len(decisions), np.asarray([99.0]), score)
+    assert first_new.active_task_index == first_new.source_task_index == 1
+    assert first_new.history_ready
+    assert first_new.score == 1.0
+    np.testing.assert_array_equal(inputs[-1], np.asarray([[1.0], [2.0], [99.0]], dtype=np.float32))
+
+
+@pytest.mark.parametrize("timeout", [0.0, -0.5, 0.25, 1.1])
+def test_gated_timeout_requires_positive_half_second_multiple(timeout: float) -> None:
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        _gated_controller(mode="current_only", timeout_seconds=timeout)
+
+
+def test_gated_timeout_default_is_two_seconds_and_four_ticks() -> None:
+    assert evaluator.validate_timeout_seconds(2.0) == (2.0, 4)
 
 
 def test_cascade_does_not_ground_truth_correct_and_unavailable_is_explicit() -> None:
