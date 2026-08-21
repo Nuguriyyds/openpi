@@ -144,7 +144,9 @@ def _numeric_episode(
         raise FileNotFoundError(f"episode parquet not found for alignment: {parquet_path}")
     table = parquet.read_table(
         parquet_path,
-        columns=("observation.state.joint", "observation.gripper_position", "actions"),
+        # Pass a list rather than a tuple: newer PyArrow releases validate
+        # the ``columns`` argument strictly and reject tuples.
+        columns=["observation.state.joint", "observation.gripper_position", "actions"],
     )
     columns = [
         np.asarray(table[name].combine_chunks().to_pylist(), dtype=np.float32)
