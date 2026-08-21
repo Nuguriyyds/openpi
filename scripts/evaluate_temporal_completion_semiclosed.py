@@ -86,10 +86,12 @@ def _resolve_logical_prompts(tasks: Any) -> tuple[str, str, str, str]:
 
 def _load_manifest(path: Path) -> temporal_data.TemporalCompletionManifest:
     manifest = temporal_data.load_temporal_manifest(path)
-    if manifest.trajectory_source != "full_identity":
-        raise ValueError("semi-closed evaluation requires a full_identity manifest")
-    if manifest.source_full_root is None or manifest.source_full_repo_id is None:
-        raise ValueError("manifest does not bind a full dataset")
+    if manifest.trajectory_source not in ("full_identity", "subtask_logical"):
+        raise ValueError(f"unsupported manifest trajectory_source: {manifest.trajectory_source!r}")
+    if manifest.trajectory_source == "full_identity" and (
+        manifest.source_full_root is None or manifest.source_full_repo_id is None
+    ):
+        raise ValueError("full_identity manifest does not bind a full dataset")
     return manifest
 
 
@@ -127,29 +129,38 @@ def _episode_specs(
     for record in manifest.trajectories:
         if record.split != split:
             continue
-        if record.mapping_status != "matched" or record.group_id is None or record.full_episode_id is None:
+        if record.group_id is None or record.mapping_status not in ("matched", "subtask_only"):
             continue
-        if record.full_episode_id != record.group_id:
+        group_id = int(record.group_id)
+        if manifest.trajectory_source == "full_identity":
+            if record.full_episode_id is None:
+                raise ValueError(f"matched group {group_id} has no full_episode_id")
+            full_episode_id = int(record.full_episode_id)
+        else:
+            # The logical training manifest has no full-trajectory identity
+            # field.  This evaluation protocol deliberately uses the user's
+            # fixed dataset convention: full episode id equals group id.
+            full_episode_id = group_id
+        if full_episode_id != group_id:
             raise ValueError(
                 "semi-closed fixed mapping requires full_episode_id == group_id; "
-                f"got group={record.group_id}, full={record.full_episode_id}"
+                f"got group={group_id}, full={full_episode_id}"
             )
-        group_id = int(record.group_id)
         subtask_ids = tuple(4 * group_id + task for task in range(4))
         lengths: list[int] = []
         for episode_id in subtask_ids:
             start, stop = _episode_bounds(subtask_dataset, episode_id)
             lengths.append(stop - start)
-        full_start, full_stop = _episode_bounds(full_dataset, int(record.full_episode_id))
+        full_start, full_stop = _episode_bounds(full_dataset, full_episode_id)
         full_length = full_stop - full_start
         if full_length != sum(lengths):
             raise ValueError(
-                f"full episode {record.full_episode_id} length {full_length} does not equal subtask sum {sum(lengths)}"
+                f"full episode {full_episode_id} length {full_length} does not equal subtask sum {sum(lengths)}"
             )
         specs.append(
             _EpisodeSpec(
                 group_id=group_id,
-                full_episode_id=int(record.full_episode_id),
+                full_episode_id=full_episode_id,
                 subtask_episode_ids=subtask_ids,  # type: ignore[arg-type]
                 lengths=tuple(lengths),  # type: ignore[arg-type]
                 full_length=full_length,
@@ -386,7 +397,10 @@ def evaluate(args: argparse.Namespace) -> Path:
         explicit_threshold=args.threshold,
     )
     manifest = _load_manifest(args.manifest.resolve())
-    if Path(manifest.source_full_root).resolve() != args.full_dataset_root.resolve():
+    if (
+        manifest.source_full_root is not None
+        and Path(manifest.source_full_root).resolve() != args.full_dataset_root.resolve()
+    ):
         raise ValueError("--full-dataset-root does not match manifest source_full_root")
     if Path(manifest.source_subtask_root).resolve() != args.subtask_dataset_root.resolve():
         raise ValueError("--subtask-dataset-root does not match manifest source_subtask_root")
@@ -395,7 +409,8 @@ def evaluate(args: argparse.Namespace) -> Path:
     import lerobot.common.datasets.lerobot_dataset as lerobot_dataset  # noqa: PLC0415
 
     subtask_dataset = lerobot_dataset.LeRobotDataset(manifest.source_subtask_repo_id, root=args.subtask_dataset_root)
-    full_dataset = lerobot_dataset.LeRobotDataset(manifest.source_full_repo_id, root=args.full_dataset_root)
+    full_repo_id = manifest.source_full_repo_id or "modanqing/agilex_make_breakfast_730"
+    full_dataset = lerobot_dataset.LeRobotDataset(full_repo_id, root=args.full_dataset_root)
     metadata = lerobot_dataset.LeRobotDatasetMetadata(manifest.source_subtask_repo_id, root=args.subtask_dataset_root)
     ordered_prompts = _resolve_logical_prompts(metadata.tasks)
     if ordered_prompts != manifest.task_prompts:
