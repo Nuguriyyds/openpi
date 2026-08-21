@@ -64,6 +64,59 @@ def test_current_only_scores_immediately_with_zero_history() -> None:
     np.testing.assert_array_equal(inputs[0], np.asarray([[0.0, 0.0], [0.0, 0.0], [2.0, 3.0]], dtype=np.float32))
 
 
+def test_transition_warms_up_with_three_prefixes_at_episode_start() -> None:
+    inputs: list[np.ndarray] = []
+    controller = SemiClosedCompletionController(("p0", "p1", "p2", "p3"), threshold=0.5, mode="transition")
+
+    def score(history: np.ndarray) -> float:
+        inputs.append(np.array(history, copy=True))
+        return 0.0
+
+    first = controller.step(0, np.asarray([0.0]), score)
+    second = controller.step(15, np.asarray([1.0]), score)
+    third = controller.step(30, np.asarray([2.0]), score)
+    assert first.score is None
+    assert second.score is None
+    assert not first.history_ready
+    assert not second.history_ready
+    assert third.history_ready
+    np.testing.assert_array_equal(inputs, np.asarray([[[0.0], [1.0], [2.0]]], dtype=np.float32))
+
+
+def test_transition_switch_keeps_deque_and_scores_first_new_prompt_tick() -> None:
+    inputs: list[np.ndarray] = []
+    controller = SemiClosedCompletionController(("p0", "p1", "p2", "p3"), threshold=0.5, mode="transition")
+
+    def score(history: np.ndarray) -> float:
+        inputs.append(np.array(history, copy=True))
+        return 1.0
+
+    controller.step(0, np.asarray([0.0]), score)
+    controller.step(15, np.asarray([1.0]), score)
+    switched = controller.step(30, np.asarray([2.0]), score)
+    first_new_tick = controller.step(45, np.asarray([3.0]), score)
+    assert switched.triggered
+    assert switched.active_prompt == "p0"
+    assert first_new_tick.active_prompt == "p1"
+    assert first_new_tick.history_ready
+    assert first_new_tick.score == 1.0
+    assert controller.history_size == 3
+    np.testing.assert_array_equal(inputs[1], np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32))
+
+
+def test_transition_slots_evolve_old_old_new_to_new_new_new() -> None:
+    inputs: list[np.ndarray] = []
+    controller = SemiClosedCompletionController(("p0", "p1", "p2", "p3"), threshold=0.5, mode="transition")
+
+    for frame, value in ((0, 0.0), (15, 1.0), (30, 2.0), (45, 3.0), (60, 4.0), (75, 5.0)):
+        controller.step(frame, np.asarray([value]), lambda history: inputs.append(np.array(history, copy=True)) or 1.0)
+
+    assert len(inputs) == 4
+    np.testing.assert_array_equal(inputs[1], np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32))
+    np.testing.assert_array_equal(inputs[2], np.asarray([[2.0], [3.0], [4.0]], dtype=np.float32))
+    np.testing.assert_array_equal(inputs[3], np.asarray([[3.0], [4.0], [5.0]], dtype=np.float32))
+
+
 def test_cascade_does_not_ground_truth_correct_and_unavailable_is_explicit() -> None:
     controller = SemiClosedCompletionController(("p0", "p1", "p2", "p3"), threshold=0.5, mode="current_only")
     decision = controller.step(15, np.asarray([1.0]), lambda _: 1.0)

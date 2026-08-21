@@ -18,7 +18,7 @@ import numpy as np
 FPS = 30
 TICK_STRIDE_FRAMES = 15
 TASK_COUNT = 4
-HistoryMode = Literal["history", "current_only"]
+HistoryMode = Literal["history", "current_only", "transition"]
 
 
 def _integer(value: Any, *, name: str) -> int:
@@ -151,8 +151,10 @@ class SemiClosedCompletionController:
 
     The feature passed to :meth:`step` is always generated using the prompt
     returned by ``active_prompt`` before the call.  A trigger changes the task
-    only for the next tick and clears history in history mode.  No ground-truth
-    boundary is consulted by this class.
+    only for the next tick.  ``history`` mode clears the prefix history after
+    a switch, while ``transition`` mode keeps it so the next inputs naturally
+    evolve through ``[old, old, new]``, ``[old, new, new]``, and
+    ``[new, new, new]``.  No ground-truth boundary is consulted by this class.
     """
 
     def __init__(self, prompts: Sequence[str], *, threshold: float, mode: HistoryMode) -> None:
@@ -162,7 +164,7 @@ class SemiClosedCompletionController:
         maximum = float(np.nextafter(1.0, np.inf))
         if not np.isfinite(threshold) or not 0.0 <= float(threshold) <= maximum:
             raise ValueError("threshold must be in [0, nextafter(1,+inf)]")
-        if mode not in ("history", "current_only"):
+        if mode not in ("history", "current_only", "transition"):
             raise ValueError(f"unsupported mode {mode!r}")
         self.prompts = values
         self.threshold = float(threshold)
@@ -218,7 +220,7 @@ class SemiClosedCompletionController:
         if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
             raise ValueError(f"prefix feature must be a finite non-empty [D] vector, got {values.shape}")
         history_ready = self.mode == "current_only"
-        if self.mode == "history":
+        if self.mode in ("history", "transition"):
             self._history.append(np.array(values, copy=True))
             if len(self._history) > 3:
                 self._history.pop(0)

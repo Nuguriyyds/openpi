@@ -324,7 +324,17 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
     if not bool(getattr(config.completion, "uses_temporal_completion", False)):
         raise ValueError(f"config {args.config_name!r} is not a temporal completion-head config")
     configured_mode = str(getattr(config.completion, "temporal_input_mode", "history"))
-    if configured_mode != args.mode:
+    configured_protocol = str(getattr(config.completion, "temporal_sampling_protocol", "subtask_local"))
+    if args.mode == "transition":
+        # Transition evaluation uses the same [B, 3, D] history head as the
+        # history-carry training ablation.  ``transition`` is an evaluator
+        # state-machine mode, not a separate model input mode.
+        if configured_mode != "history" or configured_protocol != "history_carry":
+            raise ValueError(
+                "transition mode requires a history-carry config "
+                "(temporal_input_mode='history', temporal_sampling_protocol='history_carry')"
+            )
+    elif configured_mode != args.mode:
         raise ValueError(f"config temporal_input_mode={configured_mode!r} does not match --mode={args.mode!r}")
     checkpoint = args.checkpoint.resolve()
     if not (checkpoint / "params").is_dir():
@@ -601,7 +611,7 @@ def evaluate(args: argparse.Namespace) -> Path:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("history", "current_only"), required=True)
+    parser.add_argument("--mode", choices=("history", "current_only", "transition"), required=True)
     parser.add_argument("--config-name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--full-dataset-root", type=Path, default=DEFAULT_FULL_DATASET_ROOT)
