@@ -22,7 +22,6 @@ from openpi.training import temporal_completion_data as temporal_data
 from openpi.training.temporal_completion_semiclosed import BoundaryResult
 from openpi.training.temporal_completion_semiclosed import SemiClosedCompletionController
 from openpi.training.temporal_completion_semiclosed import classify_boundary
-from openpi.training.temporal_completion_semiclosed import gt_end_frames
 from openpi.training.temporal_completion_semiclosed import oracle_task_index
 from openpi.training.temporal_completion_semiclosed import reference_ticks
 from openpi.training.temporal_completion_semiclosed import summarize_boundary_results
@@ -112,8 +111,103 @@ class _EpisodeSpec:
     full_episode_id: int
     subtask_episode_ids: tuple[int, int, int, int]
     lengths: tuple[int, int, int, int]
+    subtask_start_frames: tuple[int, int, int, int]
+    gt_end_frames: tuple[int, int, int, int]
     full_length: int
     prompts: tuple[str, str, str, str]
+
+
+def _numeric_episode(
+    root: Path,
+    episode_id: int,
+    *,
+    layout_cache: dict[Path, tuple[str, int]],
+    episode_cache: dict[tuple[Path, int], np.ndarray],
+) -> np.ndarray:
+    """Loads only numeric state/action columns for sequence alignment."""
+
+    key = (root.resolve(), int(episode_id))
+    if key in episode_cache:
+        return episode_cache[key]
+    import pyarrow.parquet as parquet  # noqa: PLC0415
+
+    root_key = root.resolve()
+    if root_key not in layout_cache:
+        info = json.loads((root_key / "meta/info.json").read_text(encoding="utf-8"))
+        layout_cache[root_key] = (str(info["data_path"]), int(info.get("chunks_size", 1000)))
+    template, chunk_size = layout_cache[root_key]
+    parquet_path = root_key / template.format(
+        episode_chunk=int(episode_id) // chunk_size,
+        episode_index=int(episode_id),
+    )
+    if not parquet_path.is_file():
+        raise FileNotFoundError(f"episode parquet not found for alignment: {parquet_path}")
+    table = parquet.read_table(
+        parquet_path,
+        columns=("observation.state.joint", "observation.gripper_position", "actions"),
+    )
+    columns = [
+        np.asarray(table[name].combine_chunks().to_pylist(), dtype=np.float32)
+        for name in ("observation.state.joint", "observation.gripper_position", "actions")
+    ]
+    values = np.concatenate(columns, axis=1)
+    if values.ndim != 2 or values.shape[0] == 0 or not np.isfinite(values).all():
+        raise ValueError(f"numeric alignment data is invalid: {parquet_path}")
+    episode_cache[key] = values
+    return values
+
+
+def _align_subtasks_to_full(
+    *,
+    full_root: Path,
+    full_episode_id: int,
+    subtask_root: Path,
+    subtask_episode_ids: tuple[int, int, int, int],
+    layout_cache: dict[Path, tuple[str, int]],
+    episode_cache: dict[tuple[Path, int], np.ndarray],
+    tolerance: float = 1.0e-5,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Finds exact contiguous subtask segments inside one full trajectory."""
+
+    full = _numeric_episode(
+        full_root,
+        full_episode_id,
+        layout_cache=layout_cache,
+        episode_cache=episode_cache,
+    )
+    subtasks = tuple(
+        _numeric_episode(
+            subtask_root,
+            episode_id,
+            layout_cache=layout_cache,
+            episode_cache=episode_cache,
+        )
+        for episode_id in subtask_episode_ids
+    )
+    first = subtasks[0][0]
+    candidate_starts = np.flatnonzero(np.max(np.abs(full - first), axis=1) <= tolerance)
+    solutions: list[tuple[tuple[int, int, int, int], tuple[int, int, int, int]]] = []
+    for candidate in candidate_starts.tolist():
+        starts: list[int] = []
+        ends: list[int] = []
+        cursor = int(candidate)
+        valid = True
+        for subtask in subtasks:
+            stop = cursor + len(subtask)
+            if stop > len(full) or not np.allclose(full[cursor:stop], subtask, rtol=0.0, atol=tolerance):
+                valid = False
+                break
+            starts.append(cursor)
+            ends.append(stop - 1)
+            cursor = stop
+        if valid:
+            solutions.append((tuple(starts), tuple(ends)))  # type: ignore[arg-type]
+    if len(solutions) != 1:
+        raise ValueError(
+            f"could not find a unique contiguous alignment for full episode {full_episode_id} "
+            f"and subtask episodes {subtask_episode_ids}: solutions={len(solutions)}"
+        )
+    return solutions[0]
 
 
 def _episode_specs(
@@ -122,10 +216,15 @@ def _episode_specs(
     split: str,
     subtask_dataset: Any,
     full_dataset: Any,
+    subtask_root: Path,
+    full_root: Path,
 ) -> tuple[_EpisodeSpec, ...]:
     if split != "test":
         raise ValueError("semi-closed evaluation is locked to the manifest test split")
     specs: list[_EpisodeSpec] = []
+    layout_cache: dict[Path, tuple[str, int]] = {}
+    episode_cache: dict[tuple[Path, int], np.ndarray] = {}
+    used_full_ids: set[int] = set()
     for record in manifest.trajectories:
         if record.split != split:
             continue
@@ -138,31 +237,67 @@ def _episode_specs(
             full_episode_id = int(record.full_episode_id)
         else:
             # The logical training manifest has no full-trajectory identity
-            # field.  This evaluation protocol deliberately uses the user's
-            # fixed dataset convention: full episode id equals group id.
+            # field.  Start with the nominal group id and resolve the one-off
+            # full-dataset insertion by exact numeric sequence alignment.
             full_episode_id = group_id
-        if full_episode_id != group_id:
-            raise ValueError(
-                "semi-closed fixed mapping requires full_episode_id == group_id; "
-                f"got group={group_id}, full={full_episode_id}"
-            )
         subtask_ids = tuple(4 * group_id + task for task in range(4))
         lengths: list[int] = []
         for episode_id in subtask_ids:
             start, stop = _episode_bounds(subtask_dataset, episode_id)
             lengths.append(stop - start)
+        if manifest.trajectory_source == "subtask_logical":
+            candidate_ids = [group_id]
+            for delta in range(1, 9):
+                candidate_ids.extend((group_id + delta, group_id - delta))
+            candidate_ids = [
+                candidate
+                for candidate in candidate_ids
+                if candidate >= 0 and candidate < len(full_dataset.episode_data_index["from"])
+            ]
+            aligned: list[tuple[int, tuple[int, int, int, int], tuple[int, int, int, int]]] = []
+            for candidate in candidate_ids:
+                if candidate in used_full_ids:
+                    continue
+                try:
+                    starts, ends = _align_subtasks_to_full(
+                        full_root=full_root,
+                        full_episode_id=candidate,
+                        subtask_root=subtask_root,
+                        subtask_episode_ids=subtask_ids,  # type: ignore[arg-type]
+                        layout_cache=layout_cache,
+                        episode_cache=episode_cache,
+                    )
+                except (FileNotFoundError, ValueError):
+                    continue
+                aligned.append((candidate, starts, ends))
+            if len(aligned) != 1:
+                raise ValueError(
+                    f"could not resolve full episode for logical group {group_id}; "
+                    f"candidate alignments={[(item[0], item[2][-1]) for item in aligned]}"
+                )
+            full_episode_id, starts, ends = aligned[0]
+        else:
+            starts, ends = _align_subtasks_to_full(
+                full_root=full_root,
+                full_episode_id=full_episode_id,
+                subtask_root=subtask_root,
+                subtask_episode_ids=subtask_ids,  # type: ignore[arg-type]
+                layout_cache=layout_cache,
+                episode_cache=episode_cache,
+            )
+        used_full_ids.add(full_episode_id)
         full_start, full_stop = _episode_bounds(full_dataset, full_episode_id)
         full_length = full_stop - full_start
-        if full_length != sum(lengths):
-            raise ValueError(
-                f"full episode {full_episode_id} length {full_length} does not equal subtask sum {sum(lengths)}"
-            )
+        if full_length < sum(lengths) or ends[-1] >= full_length:
+            raise ValueError(f"aligned subtask segments exceed full episode {full_episode_id}")
         specs.append(
             _EpisodeSpec(
                 group_id=group_id,
                 full_episode_id=full_episode_id,
                 subtask_episode_ids=subtask_ids,  # type: ignore[arg-type]
                 lengths=tuple(lengths),  # type: ignore[arg-type]
+                subtask_start_frames=starts,
+                gt_end_frames=ends,
                 full_length=full_length,
                 prompts=manifest.task_prompts,
             )
@@ -259,7 +394,7 @@ def _evaluate_episode(
     full_dataset: Any,
     threshold: float,
 ) -> dict[str, Any]:
-    ends = gt_end_frames(spec.lengths)
+    ends = spec.gt_end_frames
     refs = reference_ticks(ends)
     controller = SemiClosedCompletionController(spec.prompts, threshold=threshold, mode=args.mode)
     feature_cache: dict[tuple[int, int, int], np.ndarray] = {}
@@ -334,6 +469,7 @@ def _evaluate_episode(
         "full_length": spec.full_length,
         "subtask_episode_ids": list(spec.subtask_episode_ids),
         "lengths": list(spec.lengths),
+        "subtask_start_frames": list(spec.subtask_start_frames),
         "gt_end_frames": list(ends),
         "reference_ticks": list(refs),
         "reference_tick_available": [ref < spec.full_length for ref in refs],
@@ -415,7 +551,14 @@ def evaluate(args: argparse.Namespace) -> Path:
     ordered_prompts = _resolve_logical_prompts(metadata.tasks)
     if ordered_prompts != manifest.task_prompts:
         raise ValueError("subtask metadata prompts do not match manifest task_prompts")
-    specs = _episode_specs(manifest, split=args.split, subtask_dataset=subtask_dataset, full_dataset=full_dataset)
+    specs = _episode_specs(
+        manifest,
+        split=args.split,
+        subtask_dataset=subtask_dataset,
+        full_dataset=full_dataset,
+        subtask_root=args.subtask_dataset_root,
+        full_root=args.full_dataset_root,
+    )
     policy, model_api, jax, jnp, compute_fn, state = _prepare_model(args)
     episodes = [
         _evaluate_episode(
