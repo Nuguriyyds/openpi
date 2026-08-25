@@ -7,7 +7,7 @@ can exercise the same causal state machine without importing JAX in its tests.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import itertools
 import numbers
@@ -18,7 +18,7 @@ import numpy as np
 FPS = 30
 TICK_STRIDE_FRAMES = 15
 TASK_COUNT = 4
-HistoryMode = Literal["history", "current_only", "transition"]
+HistoryMode = Literal["history", "current_only", "transition", "raw_prefix_current"]
 GatedClassification = Literal["early", "on_time", "late_trigger", "timeout_forced"]
 GatedSwitchReason = Literal["head_early", "head_on_time", "head_late", "timeout"]
 
@@ -145,7 +145,52 @@ class TickDecision:
         return dataclasses.asdict(self)
 
 
-ScoreFunction = Callable[[np.ndarray], float]
+ScoreFunction = Callable[[Any], Any]
+
+
+def _parse_score_output(value: Any) -> tuple[float, float | None]:
+    """Accepts legacy probability scores or ``(score, logit)`` pairs."""
+
+    logit: float | None = None
+    if isinstance(value, tuple) and len(value) == 2:
+        value, raw_logit = value
+        raw_logit_array = np.asarray(raw_logit)
+        if raw_logit_array.size != 1:
+            raise ValueError(f"score_fn logit must be scalar, got {raw_logit_array.shape}")
+        logit = float(raw_logit_array.reshape(-1)[0])
+        if not np.isfinite(logit):
+            raise ValueError("score_fn logit must be finite")
+    raw_score = np.asarray(value)
+    if raw_score.size != 1:
+        raise ValueError(f"score_fn must return one scalar, got {raw_score.shape}")
+    score = float(raw_score.reshape(-1)[0])
+    if not np.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError("score_fn must return a probability in [0, 1]")
+    return score, logit
+
+
+def _validate_raw_prefix_input(feature: Any) -> dict[str, np.ndarray]:
+    if not isinstance(feature, Mapping):
+        raise ValueError("raw_prefix_current expects a mapping with prefix_out, prefix_mask, and layout ids")
+    required = {"prefix_out", "prefix_mask", "prefix_segment_ids", "prefix_position_ids"}
+    if not required.issubset(feature):
+        raise ValueError(f"raw_prefix_current input is missing {sorted(required - set(feature))}")
+    prefix_out = np.asarray(feature["prefix_out"], dtype=np.float32)
+    prefix_mask = np.asarray(feature["prefix_mask"], dtype=np.bool_)
+    segment_ids = np.asarray(feature["prefix_segment_ids"], dtype=np.int32)
+    position_ids = np.asarray(feature["prefix_position_ids"], dtype=np.int32)
+    if prefix_out.ndim != 2 or prefix_out.shape[-1] <= 0 or not np.isfinite(prefix_out).all():
+        raise ValueError(f"raw_prefix_current prefix_out must be finite [S, D], got {prefix_out.shape}")
+    if prefix_mask.shape != prefix_out.shape[:1]:
+        raise ValueError("raw_prefix_current prefix_mask must have shape [S]")
+    if segment_ids.shape != prefix_mask.shape or position_ids.shape != prefix_mask.shape:
+        raise ValueError("raw_prefix_current layout ids must have shape [S]")
+    return {
+        "prefix_out": prefix_out,
+        "prefix_mask": prefix_mask,
+        "prefix_segment_ids": segment_ids,
+        "prefix_position_ids": position_ids,
+    }
 
 
 class SemiClosedCompletionController:
@@ -166,7 +211,7 @@ class SemiClosedCompletionController:
         maximum = float(np.nextafter(1.0, np.inf))
         if not np.isfinite(threshold) or not 0.0 <= float(threshold) <= maximum:
             raise ValueError("threshold must be in [0, nextafter(1,+inf)]")
-        if mode not in ("history", "current_only", "transition"):
+        if mode not in ("history", "current_only", "transition", "raw_prefix_current"):
             raise ValueError(f"unsupported mode {mode!r}")
         self.prompts = values
         self.threshold = float(threshold)
@@ -218,15 +263,20 @@ class SemiClosedCompletionController:
                 done=True,
             )
 
-        values = np.asarray(feature, dtype=np.float32)
-        if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
-            raise ValueError(f"prefix feature must be a finite non-empty [D] vector, got {values.shape}")
-        history_ready = self.mode == "current_only"
-        if self.mode in ("history", "transition"):
-            self._history.append(np.array(values, copy=True))
-            if len(self._history) > 3:
-                self._history.pop(0)
-            history_ready = len(self._history) == 3
+        if self.mode == "raw_prefix_current":
+            values = None
+            head_input = _validate_raw_prefix_input(feature)
+            history_ready = True
+        else:
+            values = np.asarray(feature, dtype=np.float32)
+            if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+                raise ValueError(f"prefix feature must be a finite non-empty [D] vector, got {values.shape}")
+            history_ready = self.mode == "current_only"
+            if self.mode in ("history", "transition"):
+                self._history.append(np.array(values, copy=True))
+                if len(self._history) > 3:
+                    self._history.pop(0)
+                history_ready = len(self._history) == 3
         if not history_ready:
             return TickDecision(
                 frame_index=frame,
@@ -241,16 +291,12 @@ class SemiClosedCompletionController:
                 done=False,
             )
 
-        if self.mode == "current_only":
-            head_input = np.stack([np.zeros_like(values), np.zeros_like(values), values], axis=0)
-        else:
-            head_input = np.stack(self._history, axis=0).astype(np.float32, copy=False)
-        raw_score = np.asarray(score_fn(head_input))
-        if raw_score.size != 1:
-            raise ValueError(f"score_fn must return one scalar, got {raw_score.shape}")
-        score = float(raw_score.reshape(-1)[0])
-        if not np.isfinite(score) or not 0.0 <= score <= 1.0:
-            raise ValueError("score_fn must return a probability in [0, 1]")
+        if self.mode != "raw_prefix_current":
+            if self.mode == "current_only":
+                head_input = np.stack([np.zeros_like(values), np.zeros_like(values), values], axis=0)
+            else:
+                head_input = np.stack(self._history, axis=0).astype(np.float32, copy=False)
+        score, _logit = _parse_score_output(score_fn(head_input))
         triggered = score >= self.threshold
         task_after = task_before
         if triggered:
@@ -293,9 +339,15 @@ class GatedTaskResult:
     late_delay_ticks: int | None
     late_delay_seconds: float | None
     switch_effective_rollout_tick: int | None
+    trigger_logit: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        value = dataclasses.asdict(self)
+        if value["trigger_logit"] is None:
+            # Keep legacy history/current-only reports byte-for-byte shaped;
+            # raw-prefix reports include this field when a logit was scored.
+            value.pop("trigger_logit")
+        return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,9 +372,13 @@ class GatedTickDecision:
     task_before: int
     task_after: int
     done: bool
+    logit: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        value = dataclasses.asdict(self)
+        if value["logit"] is None:
+            value.pop("logit")
+        return value
 
 
 class GatedCompletionController:
@@ -358,7 +414,7 @@ class GatedCompletionController:
         maximum = float(np.nextafter(1.0, np.inf))
         if not np.isfinite(threshold) or not 0.0 <= float(threshold) <= maximum:
             raise ValueError("threshold must be in [0, nextafter(1,+inf)]")
-        if mode not in ("history", "current_only", "transition"):
+        if mode not in ("history", "current_only", "transition", "raw_prefix_current"):
             raise ValueError(f"unsupported mode {mode!r}")
         seconds = float(timeout_seconds)
         units = seconds * 2.0
@@ -411,7 +467,9 @@ class GatedCompletionController:
     def task_results(self) -> tuple[GatedTaskResult, ...]:
         return tuple(self._task_results)
 
-    def _head_input(self, values: np.ndarray) -> tuple[np.ndarray | None, bool]:
+    def _head_input(self, values: Any) -> tuple[Any | None, bool]:
+        if self.mode == "raw_prefix_current":
+            return _validate_raw_prefix_input(values), True
         history_ready = self.mode == "current_only"
         if self.mode in ("history", "transition"):
             self._history.append(np.array(values, copy=True))
@@ -432,6 +490,7 @@ class GatedCompletionController:
         source_frame: int,
         terminal_hold_tick: int | None,
         score: float | None,
+        logit: float | None,
         classification: GatedClassification,
         switch_reason: GatedSwitchReason,
     ) -> GatedTaskResult:
@@ -465,6 +524,7 @@ class GatedCompletionController:
             late_delay_ticks=late_ticks,
             late_delay_seconds=late_seconds,
             switch_effective_rollout_tick=switch_tick,
+            trigger_logit=logit,
         )
         self._task_results.append(result)
         return result
@@ -503,18 +563,18 @@ class GatedCompletionController:
             if self._terminal_arrival_tick is not None:
                 raise ValueError("non-terminal source frame observed after terminal hold began")
             terminal_hold_tick = None
-        values = np.asarray(feature, dtype=np.float32)
-        if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
-            raise ValueError(f"prefix feature must be a finite non-empty [D] vector, got {values.shape}")
-        head_input, history_ready = self._head_input(values)
+        if self.mode == "raw_prefix_current":
+            values = feature
+            head_input, history_ready = self._head_input(values)
+        else:
+            values = np.asarray(feature, dtype=np.float32)
+            if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+                raise ValueError(f"prefix feature must be a finite non-empty [D] vector, got {values.shape}")
+            head_input, history_ready = self._head_input(values)
         score: float | None = None
+        logit: float | None = None
         if head_input is not None:
-            raw_score = np.asarray(score_fn(head_input))
-            if raw_score.size != 1:
-                raise ValueError(f"score_fn must return one scalar, got {raw_score.shape}")
-            score = float(raw_score.reshape(-1)[0])
-            if not np.isfinite(score) or not 0.0 <= score <= 1.0:
-                raise ValueError("score_fn must return a probability in [0, 1]")
+            score, logit = _parse_score_output(score_fn(head_input))
         triggered = score is not None and score >= self.threshold
         classification: GatedClassification | None = None
         switch_reason: GatedSwitchReason | None = None
@@ -540,6 +600,7 @@ class GatedCompletionController:
                 source_frame=source_frame,
                 terminal_hold_tick=terminal_hold_tick,
                 score=score,
+                logit=logit,
                 classification=classification,
                 switch_reason=switch_reason,
             )
@@ -566,6 +627,7 @@ class GatedCompletionController:
             task_before=task,
             task_after=task_after,
             done=self._done,
+            logit=logit,
         )
 
 

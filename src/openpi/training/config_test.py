@@ -55,6 +55,43 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
     assert isinstance(temporal.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
 
 
+def test_raw_prefix_completion_config_matches_clean_source_and_head_only_freeze():
+    clean = config.get_config("pi05_730_breakfast_subtasks")
+    raw = config.get_config("pi05_agilex_breakfast_raw_prefix_completion_head")
+
+    assert raw.data.repo_id == clean.data.repo_id
+    assert raw.data.assets == clean.data.assets
+    assert raw.data.base_config.lerobot_home == clean.data.base_config.lerobot_home
+    assert raw.completion.uses_raw_prefix_completion
+    assert not raw.completion.requires_completion_labels
+    assert not raw.completion.temporal_sampling
+    assert raw.model.completion_head.variant == "raw_prefix_decoder"
+    assert raw.model.completion_head.resolved_pooling == "raw_prefix"
+    assert (
+        raw.model.completion_head.decoder_dim,
+        raw.model.completion_head.decoder_num_queries,
+        raw.model.completion_head.decoder_num_layers,
+        raw.model.completion_head.decoder_num_heads,
+        raw.model.completion_head.decoder_ffn_dim,
+        raw.model.completion_head.dropout_rate,
+    ) == (256, 16, 4, 8, 1024, 0.1)
+    assert (
+        raw.completion.raw_prefix_positive_per_batch,
+        raw.completion.raw_prefix_hard_negative_per_batch,
+        raw.completion.raw_prefix_ordinary_negative_per_batch,
+        raw.completion.raw_prefix_transition_negative_per_batch,
+    ) == (32, 16, 16, 0)
+    assert raw.batch_size == 64
+    assert raw.num_train_steps == 4_000
+    assert raw.ema_decay is None
+    assert raw.num_workers == 0
+    assert raw.fsdp_devices == 1
+    assert raw.weight_loader.params_path.endswith("breakfast_subtasks_bs64_50k/49999/params")
+    assert raw.weight_loader.missing_regex == r"completion_head/.*"
+    assert raw.weight_loader.reject_unexpected
+    assert isinstance(raw.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
+
+
 def test_temporal_history_carry_config_uses_balanced_transition_batch():
     carry = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_head")
     carry_posweight2 = config.get_config(

@@ -315,7 +315,7 @@ def _episode_specs(
     return tuple(sorted(specs, key=lambda item: item.full_episode_id))
 
 
-def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, Any]:
+def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Loads the requested head and returns policy, dataset model, and JAX prefix fn."""
 
     import flax.nnx as nnx  # noqa: PLC0415
@@ -327,8 +327,14 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
     from openpi.training import config as training_config  # noqa: PLC0415
 
     config = training_config.get_config(args.config_name)
-    if not bool(getattr(config.completion, "uses_temporal_completion", False)):
+    is_raw_prefix = args.mode == "raw_prefix_current"
+    if not bool(getattr(config.completion, "uses_temporal_completion", False)) and not is_raw_prefix:
         raise ValueError(f"config {args.config_name!r} is not a temporal completion-head config")
+    if is_raw_prefix:
+        if not bool(getattr(config.completion, "uses_raw_prefix_completion", False)):
+            raise ValueError("raw_prefix_current mode requires a raw-prefix completion config")
+        if getattr(config.model.completion_head, "variant", None) != "raw_prefix_decoder":
+            raise ValueError("raw_prefix_current mode requires completion_head.variant='raw_prefix_decoder'")
     configured_mode = str(getattr(config.completion, "temporal_input_mode", "history"))
     configured_protocol = str(getattr(config.completion, "temporal_sampling_protocol", "subtask_local"))
     if args.mode == "transition":
@@ -340,7 +346,7 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
                 "transition mode requires a history-carry config "
                 "(temporal_input_mode='history', temporal_sampling_protocol='history_carry')"
             )
-    elif configured_mode != args.mode:
+    elif not is_raw_prefix and configured_mode != args.mode:
         raise ValueError(f"config temporal_input_mode={configured_mode!r} does not match --mode={args.mode!r}")
     checkpoint = args.checkpoint.resolve()
     if not (checkpoint / "params").is_dir():
@@ -354,16 +360,42 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
     if bool(getattr(policy, "_is_pytorch_model", False)):
         raise ValueError("semi-closed evaluator requires a JAX Pi0.5 checkpoint")
     model = policy._model  # noqa: SLF001
-    if not hasattr(model, "compute_prefix_feature"):
+    if is_raw_prefix:
+        if not hasattr(model, "compute_prefix_outputs") or not hasattr(model, "compute_raw_prefix_completion_logits"):
+            raise ValueError("loaded model lacks the raw-prefix shared prefix/completion APIs")
+    elif not hasattr(model, "compute_prefix_feature"):
         raise ValueError("loaded model lacks compute_prefix_feature")
     graphdef, state = nnx.split(model)
 
     def compute_prefix(state_value: Any, observation: Any) -> Any:
         module = nnx.merge(graphdef, state_value)
+        if is_raw_prefix:
+            return module.compute_prefix_outputs(jax.random.key(0), observation, train=False)
         return module.compute_prefix_feature(jax.random.key(0), observation, train=False)
 
     compute_fn = jax.jit(compute_prefix)
-    return policy, model_api, jax, jnp, compute_fn, state
+    score_fn = None
+    if is_raw_prefix:
+
+        def score_raw(
+            state_value: Any,
+            prefix_out: Any,
+            prefix_mask: Any,
+            segment_ids: Any,
+            position_ids: Any,
+        ) -> Any:
+            module = nnx.merge(graphdef, state_value)
+            return module.compute_raw_prefix_completion_logits(
+                jax.random.key(0),
+                prefix_out,
+                prefix_mask,
+                segment_ids,
+                position_ids,
+                train=False,
+            )
+
+        score_fn = jax.jit(score_raw)
+    return policy, model_api, jax, jnp, compute_fn, score_fn, state
 
 
 def _prefix_feature(
@@ -378,7 +410,7 @@ def _prefix_feature(
     episode_id: int,
     frame_index: int,
     prompt: str,
-) -> np.ndarray:
+) -> Any:
     start, stop = _episode_bounds(dataset, episode_id)
     if frame_index < 0 or start + frame_index >= stop:
         raise ValueError(f"full episode {episode_id} frame {frame_index} is out of range")
@@ -391,7 +423,26 @@ def _prefix_feature(
     transformed = policy._input_transform(sample)  # noqa: SLF001
     batched = jax.tree.map(lambda value: jnp.asarray(value)[None, ...], transformed)
     observation = model_api.Observation.from_dict(batched)
-    feature = np.asarray(jax.block_until_ready(compute_fn(state, observation)), dtype=np.float32)
+    computed = compute_fn(state, observation)
+    if isinstance(computed, tuple) and len(computed) == 4:
+        prefix_out, prefix_mask, segment_ids, position_ids = computed
+        prefix_out = np.asarray(jax.block_until_ready(prefix_out), dtype=np.float32)
+        prefix_mask = np.asarray(jax.block_until_ready(prefix_mask), dtype=np.bool_)
+        segment_ids = np.asarray(jax.block_until_ready(segment_ids), dtype=np.int32)
+        position_ids = np.asarray(jax.block_until_ready(position_ids), dtype=np.int32)
+        if prefix_out.ndim != 3 or prefix_out.shape[0] != 1 or prefix_out.shape[-1] != int(policy._model.prefix_feature_dim):  # noqa: SLF001
+            raise ValueError(f"compute_prefix_outputs returned unexpected shape {prefix_out.shape}")
+        if prefix_mask.shape != prefix_out.shape[:2] or segment_ids.shape != (prefix_out.shape[1],):
+            raise ValueError("compute_prefix_outputs returned inconsistent mask/layout shapes")
+        if position_ids.shape != segment_ids.shape or not np.isfinite(prefix_out).all():
+            raise ValueError("compute_prefix_outputs returned invalid values/layout")
+        return {
+            "prefix_out": prefix_out[0],
+            "prefix_mask": prefix_mask[0],
+            "prefix_segment_ids": segment_ids,
+            "prefix_position_ids": position_ids,
+        }
+    feature = np.asarray(jax.block_until_ready(computed), dtype=np.float32)
     if feature.ndim != 2 or feature.shape[0] != 1 or feature.shape[1] != int(policy._model.prefix_feature_dim):  # noqa: SLF001
         raise ValueError(f"compute_prefix_feature returned unexpected shape {feature.shape}")
     if not np.isfinite(feature).all():
@@ -408,6 +459,7 @@ def _evaluate_episode(
     jax: Any,
     jnp: Any,
     compute_fn: Any,
+    score_fn: Any,
     state: Any,
     full_dataset: Any,
     threshold: float,
@@ -440,13 +492,43 @@ def _evaluate_episode(
             frame_index=source_frame,
             prompt=prompt,
         )
-        decision = controller.step(rollout_tick, feature, policy.score_temporal_completion)
+        if args.mode == "raw_prefix_current":
+            if score_fn is None or not isinstance(feature, dict):
+                raise RuntimeError("raw-prefix semi-closed evaluation did not produce a raw prefix/score function")
+
+            def score_raw(raw_input: dict[str, np.ndarray]) -> tuple[float, float]:
+                logits = np.asarray(
+                    jax.block_until_ready(
+                        score_fn(
+                            state,
+                            jnp.asarray(raw_input["prefix_out"])[None, ...],
+                            jnp.asarray(raw_input["prefix_mask"])[None, ...],
+                            jnp.asarray(raw_input["prefix_segment_ids"]),
+                            jnp.asarray(raw_input["prefix_position_ids"]),
+                        )
+                    ),
+                    dtype=np.float32,
+                ).reshape(-1)
+                if logits.shape != (1,) or not np.isfinite(logits).all():
+                    raise ValueError("raw-prefix completion head returned an invalid semi-closed logit")
+                logit = float(logits[0])
+                score = float(1.0 / (1.0 + np.exp(-logit))) if logit >= 0 else float(
+                    np.exp(logit) / (1.0 + np.exp(logit))
+                )
+                return score, logit
+
+            decision = controller.step(rollout_tick, feature, score_raw)
+        else:
+            decision = controller.step(rollout_tick, feature, policy.score_temporal_completion)
         if decision.active_task_index != decision.source_task_index:
             raise RuntimeError(
                 "gated replay invariant violated: active_task_index and source_task_index differ "
                 f"at rollout tick {rollout_tick}"
             )
         tick = decision.to_dict()
+        tick["active_task"] = decision.active_task_index
+        tick["target_boundary_frame"] = ends[decision.active_task_index]
+        tick["target_boundary_tick"] = refs[decision.active_task_index]
         tick["prompt_mismatch"] = False
         tick["wrong_prompt"] = False
         ticks.append(tick)
@@ -528,7 +610,26 @@ def _distribution(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _timing_summary(boundaries: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    timing = [
+        float(result["timing_error_seconds"])
+        for result in boundaries
+        if bool(result.get("reference_tick_available")) and result.get("timing_error_seconds") is not None
+    ]
+    values = np.asarray(timing, dtype=np.float64)
+    return {
+        "timing_error_count": int(values.size),
+        "timing_error_seconds_mean": float(np.mean(values)) if values.size else None,
+        "timing_error_seconds_median": float(np.median(values)) if values.size else None,
+        "mean_absolute_timing_error": float(np.mean(np.abs(values))) if values.size else None,
+    }
+
+
+def _gated_summary(
+    results: list[dict[str, Any]],
+    *,
+    boundaries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     counts = dict.fromkeys(("early", "on_time", "late_trigger", "timeout_forced"), 0)
     for result in results:
         counts[str(result["classification"])] += 1
@@ -539,6 +640,8 @@ def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         for result in results
         if result["classification"] == "early" and result["remaining_source_frames"] is not None
     ]
+    early_0_5s = [value for value in early_remaining if value >= 15.0]
+    early_at_least_1s = [value for value in early_remaining if value >= 30.0]
     late_delays = [
         float(result["late_delay_seconds"])
         for result in results
@@ -553,6 +656,10 @@ def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "late_trigger_count": counts["late_trigger"],
         "timeout_forced_count": counts["timeout_forced"],
         "early_rate": counts["early"] / task_count if task_count else None,
+        "early_0_5s_count": len(early_0_5s),
+        "early_0_5s_rate": len(early_0_5s) / task_count if task_count else None,
+        "early_at_least_1s_count": len(early_at_least_1s),
+        "early_at_least_1s_rate": len(early_at_least_1s) / task_count if task_count else None,
         "on_time_rate": counts["on_time"] / task_count if task_count else None,
         "late_trigger_rate": counts["late_trigger"] / task_count if task_count else None,
         "timeout_forced_rate": counts["timeout_forced"] / task_count if task_count else None,
@@ -568,27 +675,114 @@ def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "late_delay_seconds_median": late_stats["median"],
         "late_delay_seconds_p90": late_stats["p90"],
         "late_delay_seconds_max": late_stats["max"],
+        **(_timing_summary(boundaries) if boundaries is not None else {}),
     }
 
 
 def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     task_results = [result for episode in episodes for result in episode["task_results"]]
-    per_task = {
-        str(task): _gated_summary([result for result in task_results if int(result["task_index"]) == task])
-        for task in range(4)
-    }
+    boundary_results = [result for episode in episodes for result in episode["boundary_results"]]
+    per_task: dict[str, dict[str, Any]] = {}
+    for task in range(4):
+        task_results_for_task = [result for result in task_results if int(result["task_index"]) == task]
+        task_boundaries = [result for result in boundary_results if int(result["task_index"]) == task]
+        task_summary = _gated_summary(task_results_for_task, boundaries=task_boundaries)
+        task_summary.update(
+            {
+                "early_episode_ids": sorted(
+                    int(episode["full_episode_id"])
+                    for episode in episodes
+                    if any(
+                        int(result["task_index"]) == task and result["classification"] == "early"
+                        for result in episode["task_results"]
+                    )
+                ),
+                "early_0_5s_episode_ids": sorted(
+                    int(episode["full_episode_id"])
+                    for episode in episodes
+                    if any(
+                        int(result["task_index"]) == task
+                        and result["classification"] == "early"
+                        and result["remaining_source_frames"] is not None
+                        and int(result["remaining_source_frames"]) >= 15
+                        for result in episode["task_results"]
+                    )
+                ),
+                "early_at_least_1s_episode_ids": sorted(
+                    int(episode["full_episode_id"])
+                    for episode in episodes
+                    if any(
+                        int(result["task_index"]) == task
+                        and result["classification"] == "early"
+                        and result["remaining_source_frames"] is not None
+                        and int(result["remaining_source_frames"]) >= 30
+                        for result in episode["task_results"]
+                    )
+                ),
+                "on_time_episode_ids": sorted(
+                    int(episode["full_episode_id"])
+                    for episode in episodes
+                    if any(
+                        int(result["task_index"]) == task and result["classification"] == "on_time"
+                        for result in episode["task_results"]
+                    )
+                ),
+                "late_trigger_episode_ids": sorted(
+                    int(episode["full_episode_id"])
+                    for episode in episodes
+                    if any(
+                        int(result["task_index"]) == task and result["classification"] == "late_trigger"
+                        for result in episode["task_results"]
+                    )
+                ),
+                "timeout_forced_episode_ids": sorted(
+                    int(episode["full_episode_id"])
+                    for episode in episodes
+                    if any(
+                        int(result["task_index"]) == task and result["classification"] == "timeout_forced"
+                        for result in episode["task_results"]
+                    )
+                ),
+            }
+        )
+        per_task[str(task)] = task_summary
     all_ticks = sum(len(item["ticks"]) for item in episodes)
     mismatches = sum(int(item["wrong_prompt_tick_count"]) for item in episodes)
     warmups = sum(int(item["history_not_ready_count"]) for item in episodes)
     all_on_time_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["all_on_time"])
+    on_time_ids = sorted(
+        int(item["full_episode_id"])
+        for item in episodes
+        if any(result["classification"] == "on_time" for result in item["task_results"])
+    )
     early_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_early_switch"])
+    early_0_5s_ids = sorted(
+        int(item["full_episode_id"])
+        for item in episodes
+        if any(
+            result["classification"] == "early"
+            and result["remaining_source_frames"] is not None
+            and int(result["remaining_source_frames"]) >= 15
+            for result in item["task_results"]
+        )
+    )
+    early_at_least_1s_ids = sorted(
+        int(item["full_episode_id"])
+        for item in episodes
+        if any(
+            result["classification"] == "early"
+            and result["remaining_source_frames"] is not None
+            and int(result["remaining_source_frames"]) >= 30
+            for result in item["task_results"]
+        )
+    )
     late_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_late_trigger"])
     timeout_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_timeout_forced"])
     not_autonomous_ids = sorted(int(item["full_episode_id"]) for item in episodes if not item["fully_autonomous"])
     episode_count = len(episodes)
     fully_autonomous_count = sum(bool(item["fully_autonomous"]) for item in episodes)
     all_on_time_count = len(all_on_time_ids)
-    overall = _gated_summary(task_results)
+    overall = _gated_summary(task_results, boundaries=boundary_results)
     return {
         "episode_count": episode_count,
         "fully_autonomous_episode_count": fully_autonomous_count,
@@ -612,6 +806,10 @@ def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "late_trigger_count": overall["late_trigger_count"],
         "timeout_forced_count": overall["timeout_forced_count"],
         "early_rate": overall["early_rate"],
+        "early_0_5s_count": overall["early_0_5s_count"],
+        "early_0_5s_rate": overall["early_0_5s_rate"],
+        "early_at_least_1s_count": overall["early_at_least_1s_count"],
+        "early_at_least_1s_rate": overall["early_at_least_1s_rate"],
         "on_time_rate": overall["on_time_rate"],
         "late_trigger_rate": overall["late_trigger_rate"],
         "timeout_forced_rate": overall["timeout_forced_rate"],
@@ -625,10 +823,17 @@ def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "late_delay_seconds_median": overall["late_delay_seconds_median"],
         "late_delay_seconds_p90": overall["late_delay_seconds_p90"],
         "late_delay_seconds_max": overall["late_delay_seconds_max"],
+        "timing_error_count": overall["timing_error_count"],
+        "timing_error_seconds_mean": overall["timing_error_seconds_mean"],
+        "timing_error_seconds_median": overall["timing_error_seconds_median"],
+        "mean_absolute_timing_error": overall["mean_absolute_timing_error"],
         "overall": overall,
         "per_task": per_task,
         "all_on_time_episode_ids": all_on_time_ids,
+        "on_time_episode_ids": on_time_ids,
         "early_episode_ids": early_ids,
+        "early_0_5s_episode_ids": early_0_5s_ids,
+        "early_at_least_1s_episode_ids": early_at_least_1s_ids,
         "late_trigger_episode_ids": late_ids,
         "timeout_forced_episode_ids": timeout_ids,
         "not_fully_autonomous_episode_ids": not_autonomous_ids,
@@ -673,7 +878,7 @@ def evaluate(args: argparse.Namespace) -> Path:
         subtask_root=args.subtask_dataset_root,
         full_root=args.full_dataset_root,
     )
-    policy, model_api, jax, jnp, compute_fn, state = _prepare_model(args)
+    policy, model_api, jax, jnp, compute_fn, score_fn, state = _prepare_model(args)
     episodes = [
         _evaluate_episode(
             spec,
@@ -683,6 +888,7 @@ def evaluate(args: argparse.Namespace) -> Path:
             jax=jax,
             jnp=jnp,
             compute_fn=compute_fn,
+            score_fn=score_fn,
             state=state,
             full_dataset=full_dataset,
             threshold=threshold,
@@ -719,7 +925,7 @@ def evaluate(args: argparse.Namespace) -> Path:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("history", "current_only", "transition"), required=True)
+    parser.add_argument("--mode", choices=("history", "current_only", "transition", "raw_prefix_current"), required=True)
     parser.add_argument("--config-name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--full-dataset-root", type=Path, default=DEFAULT_FULL_DATASET_ROOT)

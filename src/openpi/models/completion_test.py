@@ -24,6 +24,101 @@ def test_completion_head_output_shape_and_finite_logits():
     assert all(variable.value.dtype == jnp.float32 for variable in nnx.state(head, nnx.Param).flat_state().values())
 
 
+def _raw_prefix_test_inputs():
+    prefix = jax.random.normal(jax.random.key(20), (2, 7, 8), dtype=jnp.float16)
+    mask = jnp.asarray([[True, True, True, True, True, False, False], [True, True, True, True, True, True, False]])
+    segment_ids = jnp.asarray([0, 0, 1, 1, 2, 3, 3], dtype=jnp.int32)
+    position_ids = jnp.asarray([0, 1, 0, 1, 0, 0, 1], dtype=jnp.int32)
+    return prefix, mask, segment_ids, position_ids
+
+
+def _small_raw_prefix_head(*, dropout_rate: float = 0.1):
+    return completion.RawPrefixCompletionHead(
+        8,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="raw_prefix_decoder",
+            decoder_dim=16,
+            decoder_num_queries=4,
+            decoder_num_layers=2,
+            decoder_num_heads=4,
+            decoder_ffn_dim=32,
+            dropout_rate=dropout_rate,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+
+
+def test_raw_prefix_completion_head_shape_dtype_layout_and_fp32_params():
+    head = _small_raw_prefix_head()
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+
+    logits = head(prefix, mask, segment_ids, position_ids, train=False)
+
+    assert logits.shape == (2,)
+    assert logits.dtype == jnp.float32
+    assert np.all(np.isfinite(logits))
+    assert all(variable.value.dtype == jnp.float32 for variable in nnx.state(head, nnx.Param).flat_state().values())
+
+
+def test_raw_prefix_completion_head_mask_ignores_padding_content():
+    head = _small_raw_prefix_head(dropout_rate=0.0)
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+    changed_padding = prefix.at[0, 5:].set(jnp.asarray([[1.0e4] * 8, [-1.0e4] * 8], dtype=jnp.float16))
+
+    logits_a = head(prefix, mask, segment_ids, position_ids, train=False)
+    logits_b = head(changed_padding, mask, segment_ids, position_ids, train=False)
+
+    np.testing.assert_array_equal(logits_a, logits_b)
+
+
+def test_raw_prefix_completion_head_stops_gradient_and_does_not_pool(monkeypatch):
+    head = _small_raw_prefix_head(dropout_rate=0.0)
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+
+    def fail_masked_mean(*_args, **_kwargs):
+        raise AssertionError("raw-prefix decoder must not call masked_mean_pool")
+
+    monkeypatch.setattr(completion, "masked_mean_pool", fail_masked_mean)
+    gradient = jax.grad(
+        lambda value: jnp.sum(head(value, mask, segment_ids, position_ids, train=False))
+    )(prefix.astype(jnp.float32))
+
+    np.testing.assert_array_equal(gradient, jnp.zeros_like(gradient))
+
+
+def test_raw_prefix_completion_head_dropout_requires_rng_only_during_training():
+    head = _small_raw_prefix_head()
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+
+    np.testing.assert_array_equal(
+        head(prefix, mask, segment_ids, position_ids, train=False),
+        head(prefix, mask, segment_ids, position_ids, train=False),
+    )
+    with pytest.raises(ValueError, match="requires an RNG"):
+        head(prefix, mask, segment_ids, position_ids, train=True)
+    train_logits = head(
+        prefix,
+        mask,
+        segment_ids,
+        position_ids,
+        rng=jax.random.key(21),
+        train=True,
+    )
+    assert train_logits.shape == (2,)
+
+
+def test_raw_prefix_layout_uses_image_order_and_prompt_state_segment():
+    segment_ids, position_ids = completion.build_raw_prefix_layout(
+        ("left", "base", "right"),
+        (2, 1, 3),
+        2,
+    )
+
+    np.testing.assert_array_equal(segment_ids, jnp.asarray([0, 0, 1, 2, 2, 2, 3, 3], dtype=jnp.int32))
+    np.testing.assert_array_equal(position_ids, jnp.asarray([0, 1, 0, 0, 1, 2, 0, 1], dtype=jnp.int32))
+
+
 def test_masked_attention_pool_ignores_padding_tokens():
     valid_tokens = jnp.asarray([[[1.0, 2.0], [3.0, 4.0]]])
     padding_a = jnp.asarray([[[10.0, 20.0], [30.0, 40.0]]])

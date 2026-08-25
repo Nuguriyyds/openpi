@@ -28,24 +28,33 @@ def _temporal_mixed_restore_dtype(path) -> jnp.dtype:
 
 
 def _jax_checkpoint_restore_dtype(train_config: _config.TrainConfig):
-    """Returns the legacy BF16 cast or temporal mixed-precision policy."""
+    """Returns the legacy BF16 cast or frozen-prefix head mixed-precision policy."""
 
-    return _temporal_mixed_restore_dtype if train_config.completion.uses_temporal_completion else jnp.bfloat16
+    uses_frozen_prefix_head = (
+        train_config.completion.uses_temporal_completion or train_config.completion.uses_raw_prefix_completion
+    )
+    return _temporal_mixed_restore_dtype if uses_frozen_prefix_head else jnp.bfloat16
 
 
-def _audit_temporal_head_fp32(model: Any) -> None:
+def _audit_completion_head_fp32(model: Any) -> None:
     import flax.nnx as nnx  # noqa: PLC0415
 
     if not hasattr(model, "completion_head"):
-        raise ValueError("temporal policy checkpoint has no completion_head")
+        raise ValueError("completion policy checkpoint has no completion_head")
     state = nnx.state(model.completion_head, nnx.Param).flat_state()
     if not state:
-        raise ValueError("temporal policy completion_head has no parameters")
+        raise ValueError("completion policy completion_head has no parameters")
     non_fp32 = [
         "/".join(str(part) for part in path) for path, variable in state.items() if variable.value.dtype != jnp.float32
     ]
     if non_fp32:
-        raise ValueError(f"temporal policy completion_head parameters must remain FP32: {non_fp32[:5]}")
+        raise ValueError(f"completion policy completion_head parameters must remain FP32: {non_fp32[:5]}")
+
+
+def _audit_temporal_head_fp32(model: Any) -> None:
+    """Backward-compatible private alias for existing temporal callers."""
+
+    _audit_completion_head_fp32(model)
 
 
 def create_trained_policy(
@@ -95,8 +104,8 @@ def create_trained_policy(
                 dtype=_jax_checkpoint_restore_dtype(train_config),
             )
         )
-        if train_config.completion.uses_temporal_completion:
-            _audit_temporal_head_fp32(model)
+        if train_config.completion.uses_temporal_completion or train_config.completion.uses_raw_prefix_completion:
+            _audit_completion_head_fp32(model)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure

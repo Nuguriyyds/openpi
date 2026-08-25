@@ -10,7 +10,9 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.completion import CompletionHead
+from openpi.models.completion import RawPrefixCompletionHead
 from openpi.models.completion import TemporalCompletionHead
+from openpi.models.completion import build_raw_prefix_layout
 from openpi.models.completion import masked_mean_pool
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
@@ -117,6 +119,12 @@ class Pi0(_model.BaseModel):
                     config.completion_head,
                     rngs=rngs,
                 )
+            elif config.completion_head.variant == "raw_prefix_decoder":
+                self.completion_head = RawPrefixCompletionHead(
+                    paligemma_config.width,
+                    config.completion_head,
+                    rngs=rngs,
+                )
             else:  # CompletionHeadConfig validates this before model construction.
                 raise ValueError(f"unsupported completion head variant: {config.completion_head.variant!r}")
 
@@ -127,14 +135,28 @@ class Pi0(_model.BaseModel):
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        tokens, input_mask, ar_mask, _image_names, _image_token_counts, _language_token_count = (
+            self._embed_prefix_components(obs)
+        )
+        return tokens, input_mask, ar_mask
+
+    def _embed_prefix_components(
+        self, obs: _model.Observation
+    ) -> tuple[jax.Array, jax.Array, jax.Array, tuple[str, ...], tuple[int, ...], int]:
+        """Embeds the legacy prefix and records metadata for raw-prefix callers."""
+
         input_mask = []
         ar_mask = []
         tokens = []
+        image_names: list[str] = []
+        image_token_counts: list[int] = []
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             tokens.append(image_tokens)
+            image_names.append(name)
+            image_token_counts.append(int(image_tokens.shape[1]))
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
@@ -146,16 +168,38 @@ class Pi0(_model.BaseModel):
             ar_mask += [False] * image_tokens.shape[1]
 
         # add language (aka tokenized inputs)
+        language_token_count = 0
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
+            language_token_count = int(tokenized_inputs.shape[1])
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        return (
+            tokens,
+            input_mask,
+            ar_mask,
+            tuple(image_names),
+            tuple(image_token_counts),
+            language_token_count,
+        )
+
+    def embed_prefix_with_layout(
+        self, obs: _model.Observation
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Embeds a prefix and returns the exact token layout used by the VLM."""
+
+        tokens, input_mask, ar_mask, image_names, image_token_counts, language_token_count = (
+            self._embed_prefix_components(obs)
+        )
+        segment_ids, position_ids = build_raw_prefix_layout(image_names, image_token_counts, language_token_count)
+        if segment_ids.shape != (tokens.shape[1],) or position_ids.shape != (tokens.shape[1],):
+            raise ValueError("raw-prefix layout length does not match embedded prefix length")
+        return tokens, input_mask, ar_mask, segment_ids, position_ids
 
     @at.typecheck
     def embed_suffix(
@@ -239,15 +283,27 @@ class Pi0(_model.BaseModel):
 
         if not hasattr(self, "completion_head"):
             raise ValueError("completion head is disabled in Pi0Config")
-        if self.completion_head_variant != "legacy_attention":
+        if self.completion_head_variant not in ("legacy_attention", "raw_prefix_decoder"):
             raise ValueError(
-                "compute_completion_logits is the legacy single-observation API; "
-                "use compute_prefix_feature and compute_temporal_completion_logits for a temporal completion head"
+                "compute_completion_logits supports only legacy_attention and raw_prefix_decoder; "
+                "use compute_prefix_feature and compute_temporal_completion_logits for temporal_mlp"
             )
         preprocess_rng = jax.random.fold_in(rng, 0xC0A4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        prefix_out, prefix_mask = self._compute_prefix_outputs(observation)
+        if self.completion_head_variant == "raw_prefix_decoder":
+            prefix_out, prefix_mask, segment_ids, position_ids = self._compute_prefix_outputs_with_layout(observation)
+        else:
+            prefix_out, prefix_mask = self._compute_prefix_outputs(observation)
         head_rng = jax.random.fold_in(rng, 0xC0A5)
+        if self.completion_head_variant == "raw_prefix_decoder":
+            return self.completion_head(
+                prefix_out,
+                prefix_mask,
+                segment_ids,
+                position_ids,
+                rng=head_rng,
+                train=train,
+            )
         return self.completion_head(prefix_out, prefix_mask, rng=head_rng, train=train)
 
     def _compute_prefix_outputs(self, observation: _model.Observation) -> tuple[jax.Array, jax.Array]:
@@ -267,6 +323,39 @@ class Pi0(_model.BaseModel):
                 f"prefix output must have shape [batch, tokens, {self.prefix_feature_dim}], got {prefix_out.shape}"
             )
         return prefix_out, prefix_mask
+
+    def _compute_prefix_outputs_with_layout(
+        self, observation: _model.Observation
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Runs the prefix and retains the layout needed by raw-prefix heads."""
+
+        prefix_tokens, prefix_mask, prefix_ar_mask, segment_ids, position_ids = self.embed_prefix_with_layout(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+        )
+        assert prefix_out is not None
+        if prefix_out.ndim != 3 or prefix_out.shape[-1] != self.prefix_feature_dim:
+            raise ValueError(
+                f"prefix output must have shape [batch, tokens, {self.prefix_feature_dim}], got {prefix_out.shape}"
+            )
+        return prefix_out, prefix_mask, segment_ids, position_ids
+
+    def compute_prefix_outputs(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        train: bool = False,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Returns the complete pre-pooling prefix and its shared token layout."""
+
+        preprocess_rng = jax.random.fold_in(rng, 0xC0A4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        return self._compute_prefix_outputs_with_layout(observation)
 
     def compute_prefix_feature(
         self,
@@ -300,6 +389,32 @@ class Pi0(_model.BaseModel):
             raise ValueError("compute_temporal_completion_logits requires completion_head.variant='temporal_mlp'")
         head_rng = jax.random.fold_in(rng, 0xC0A5)
         return self.completion_head(prefix_history, rng=head_rng, train=train)
+
+    def compute_raw_prefix_completion_logits(
+        self,
+        rng: at.KeyArrayLike,
+        prefix_out: jax.Array,
+        prefix_mask: jax.Array,
+        prefix_segment_ids: jax.Array,
+        prefix_position_ids: jax.Array,
+        *,
+        train: bool = False,
+    ) -> jax.Array:
+        """Scores an already extracted raw prefix without another VLM forward."""
+
+        if not hasattr(self, "completion_head"):
+            raise ValueError("completion head is disabled in Pi0Config")
+        if self.completion_head_variant != "raw_prefix_decoder":
+            raise ValueError("compute_raw_prefix_completion_logits requires completion_head.variant='raw_prefix_decoder'")
+        head_rng = jax.random.fold_in(rng, 0xC0A5)
+        return self.completion_head(
+            prefix_out,
+            prefix_mask,
+            prefix_segment_ids,
+            prefix_position_ids,
+            rng=head_rng,
+            train=train,
+        )
 
     def _compute_action_loss_and_prefix(
         self,
@@ -430,7 +545,7 @@ class Pi0(_model.BaseModel):
             delay=delay,
         )
 
-    def _sample_actions_with_prefix_feature(
+    def sample_actions_with_completion_logits(
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation,
@@ -440,6 +555,33 @@ class Pi0(_model.BaseModel):
         action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
         delay: at.Int[at.Array, " b"] | at.Int[at.Array, ""] | int | None = None,
     ) -> tuple[_model.Actions, jax.Array]:
+        """Samples actions and scores raw-prefix completion from one prefix forward."""
+
+        if not hasattr(self, "completion_head") or self.completion_head_variant != "raw_prefix_decoder":
+            raise ValueError("sample_actions_with_completion_logits requires a raw_prefix_decoder completion head")
+        result = self._sample_actions_with_prefix_feature(
+            rng,
+            observation,
+            num_steps=num_steps,
+            noise=noise,
+            action_prefix=action_prefix,
+            delay=delay,
+            return_completion_logits=True,
+        )
+        actions, _prefix_feature, completion_logits = result
+        return actions, completion_logits
+
+    def _sample_actions_with_prefix_feature(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        delay: at.Int[at.Array, " b"] | at.Int[at.Array, ""] | int | None = None,
+        return_completion_logits: bool = False,
+    ) -> tuple[_model.Actions, jax.Array | None] | tuple[_model.Actions, jax.Array | None, jax.Array]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -463,14 +605,32 @@ class Pi0(_model.BaseModel):
             action_prefix_mask = jnp.arange(self.action_horizon)[None, :] < delay[:, None]
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        if return_completion_logits:
+            prefix_tokens, prefix_mask, prefix_ar_mask, prefix_segment_ids, prefix_position_ids = (
+                self.embed_prefix_with_layout(observation)
+            )
+        else:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
         assert prefix_out is not None
-        prefix_feature = masked_mean_pool(prefix_out, prefix_mask)
+        # The raw-prefix action+completion API does not need a pooled feature:
+        # completion reads the same token-preserving prefix output below.  The
+        # pooled feature remains available for the pre-existing API only.
+        prefix_feature = None if return_completion_logits else masked_mean_pool(prefix_out, prefix_mask)
+        completion_logits = None
+        if return_completion_logits:
+            completion_logits = self.compute_raw_prefix_completion_logits(
+                rng,
+                prefix_out,
+                prefix_mask,
+                prefix_segment_ids,
+                prefix_position_ids,
+                train=False,
+            )
 
         def step(carry):
             x_t, time = carry
@@ -524,4 +684,7 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         if action_prefix is not None:
             x_0 = jnp.where(action_prefix_mask[:, :, None], action_prefix, x_0)
+        if return_completion_logits:
+            assert completion_logits is not None
+            return x_0, prefix_feature, completion_logits
         return x_0, prefix_feature

@@ -217,6 +217,7 @@ def train_step(
         tuple[_model.Observation, _model.Actions]
         | tuple[_model.Observation, _model.Actions, at.Array]
         | tuple[at.Array, at.Array]
+        | tuple[at.Array, at.Array, at.Array, at.Array, at.Array]
     ),
     *,
     pos_weight: float | None = None,
@@ -231,12 +232,15 @@ def train_step(
 
     if completion_stage == "head":
         uses_temporal = config.completion.uses_temporal_completion
+        uses_raw_prefix = config.completion.uses_raw_prefix_completion
         if uses_temporal:
             prefix_history, completion_targets = batch
             prefix_history = _completion.apply_temporal_input_mode(
                 prefix_history,
                 config.completion.temporal_input_mode,
             )
+        elif uses_raw_prefix:
+            prefix_out, prefix_mask, prefix_segment_ids, prefix_position_ids, completion_targets = batch
         else:
             observation, _actions, completion_targets = batch
         completion_targets = jnp.asarray(completion_targets, dtype=jnp.float32)
@@ -250,6 +254,12 @@ def train_step(
         if uses_temporal:
             # The temporal config is the source of truth; do not let a stale
             # caller argument silently change the configured loss ablation.
+            pos_weight = (
+                config.completion.bce_pos_weight_override
+                if config.completion.bce_pos_weight_override is not None
+                else 1.0
+            )
+        elif uses_raw_prefix:
             pos_weight = (
                 config.completion.bce_pos_weight_override
                 if config.completion.bce_pos_weight_override is not None
@@ -275,6 +285,49 @@ def train_step(
                 argnums=diff_state,
             )(model, train_rng, prefix_history, completion_targets)
             completion_loss = loss
+        elif uses_raw_prefix:
+            def raw_prefix_completion_loss_fn(
+                model,
+                rng,
+                raw_prefix,
+                raw_prefix_mask,
+                segment_ids,
+                position_ids,
+                targets,
+            ):
+                logits = model.compute_raw_prefix_completion_logits(
+                    rng,
+                    raw_prefix,
+                    raw_prefix_mask,
+                    segment_ids,
+                    position_ids,
+                    train=True,
+                )
+                if logits.shape != targets.shape:
+                    raise ValueError(
+                        f"raw-prefix completion target shape {targets.shape} does not match logits shape {logits.shape}"
+                    )
+                return jnp.mean(_completion.weighted_bce_with_logits(logits, targets, pos_weight)), logits
+
+            (loss, raw_prefix_logits), grads = nnx.value_and_grad(
+                raw_prefix_completion_loss_fn,
+                argnums=diff_state,
+                has_aux=True,
+            )(
+                model,
+                train_rng,
+                prefix_out,
+                prefix_mask,
+                prefix_segment_ids,
+                prefix_position_ids,
+                completion_targets,
+            )
+            completion_loss = loss
+            raw_prefix_scores = jax.nn.sigmoid(jnp.asarray(raw_prefix_logits, dtype=jnp.float32))
+            raw_positive_mask = completion_targets == 1.0
+            raw_positive_score_mean = jnp.sum(jnp.where(raw_positive_mask, raw_prefix_scores, 0.0)) / jnp.maximum(
+                jnp.sum(raw_positive_mask), 1.0
+            )
         elif uses_progress:
 
             def progress_loss_fn(model, rng, observation, targets):
@@ -390,6 +443,9 @@ def train_step(
             if uses_temporal:
                 head_info["pos_weight"] = jnp.asarray(pos_weight, dtype=jnp.float32)
                 head_info["temporal_history_steps"] = jnp.asarray(3.0, dtype=jnp.float32)
+            elif uses_raw_prefix:
+                head_info["pos_weight"] = jnp.asarray(pos_weight, dtype=jnp.float32)
+                head_info["raw_prefix_positive_score_mean"] = raw_positive_score_mean
             elif uses_focal:
                 head_info["focal_gamma"] = jnp.asarray(focal_gamma, dtype=jnp.float32)
                 head_info["focal_alpha"] = jnp.asarray(focal_alpha, dtype=jnp.float32)
@@ -441,6 +497,33 @@ def temporal_completion_eval_step(
     logits = model.compute_temporal_completion_logits(rng, prefix_history, train=False)
     if logits.shape != targets.shape:
         raise ValueError(f"temporal completion target shape {targets.shape} does not match logits shape {logits.shape}")
+    return logits, targets
+
+
+def raw_prefix_completion_eval_step(
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[at.Array, at.Array, at.Array, at.Array, at.Array],
+) -> tuple[jax.Array, jax.Array]:
+    """Scores cached current-frame raw prefixes without running the VLM."""
+
+    eval_params = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, eval_params)
+    model.eval()
+    prefix_out, prefix_mask, segment_ids, position_ids, targets = batch
+    targets = jnp.asarray(targets, dtype=jnp.float32)
+    if targets.ndim == 2 and targets.shape[-1] == 1:
+        targets = targets[..., 0]
+    logits = model.compute_raw_prefix_completion_logits(
+        rng,
+        prefix_out,
+        prefix_mask,
+        segment_ids,
+        position_ids,
+        train=False,
+    )
+    if logits.shape != targets.shape:
+        raise ValueError(f"raw-prefix completion target shape {targets.shape} does not match logits shape {logits.shape}")
     return logits, targets
 
 
@@ -689,6 +772,94 @@ def evaluate_temporal_completion_loader(
     return metrics, selection
 
 
+def raw_prefix_completion_metrics(
+    rows: list[Any] | tuple[Any, ...],
+    logits: np.ndarray,
+    *,
+    prefix: str = "val/raw_prefix",
+) -> dict[str, float]:
+    """Reports natural raw-prefix ranking and paired event metrics."""
+
+    logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if len(rows) != logits.size or logits.size == 0:
+        raise ValueError(f"raw-prefix metrics rows/logits mismatch: {len(rows)}/{logits.shape}")
+
+    def one_group(group_rows: list[Any] | tuple[Any, ...], group_logits: np.ndarray) -> dict[str, float]:
+        labels = np.asarray([int(row.label) for row in group_rows], dtype=np.int64)
+        group_scores = _temporal_metrics.stable_sigmoid(group_logits)
+        ranking = _temporal_metrics.binary_ranking_metrics(labels, group_scores)
+        positive_scores = group_scores[labels == 1]
+        hard_scores = group_scores[
+            np.asarray([row.sample_kind == "hard_negative" for row in group_rows], dtype=np.bool_)
+        ]
+        ordinary_scores = group_scores[
+            np.asarray([row.sample_kind == "ordinary_negative" for row in group_rows], dtype=np.bool_)
+        ]
+        paired: list[tuple[float, float]] = []
+        events: dict[tuple[str, int, int], dict[str, float]] = {}
+        for row, score in zip(group_rows, group_scores, strict=True):
+            event = (str(row.trajectory_id), int(row.task_index), int(row.boundary_tick))
+            event_values = events.setdefault(event, {})
+            if row.sample_kind == "positive":
+                event_values["positive"] = float(score)
+            elif row.sample_kind == "hard_negative":
+                event_values["hard"] = float(score)
+        for values in events.values():
+            if "positive" in values and "hard" in values:
+                paired.append((values["positive"], values["hard"]))
+        margins = np.asarray([positive - hard for positive, hard in paired], dtype=np.float64)
+        return {
+            "sample_count": float(ranking["sample_count"]),
+            "positive_count": float(ranking["positive_count"]),
+            "negative_count": float(ranking["negative_count"]),
+            "auprc": float(ranking["auprc"]),
+            "auroc": float(ranking["roc_auc"]),
+            "bce": float(np.mean(np.logaddexp(0.0, group_logits) - labels * group_logits)),
+            "positive_score_mean": float(np.mean(positive_scores)) if positive_scores.size else float("nan"),
+            "hard_negative_score_mean": float(np.mean(hard_scores)) if hard_scores.size else float("nan"),
+            "ordinary_negative_score_mean": (
+                float(np.mean(ordinary_scores)) if ordinary_scores.size else float("nan")
+            ),
+            "positive_hard_paired_ordering_accuracy": (
+                float(np.mean([positive > hard for positive, hard in paired])) if paired else float("nan")
+            ),
+            "positive_hard_margin_mean": float(np.mean(margins)) if margins.size else float("nan"),
+            "positive_hard_margin_median": float(np.median(margins)) if margins.size else float("nan"),
+        }
+
+    overall = one_group(rows, logits)
+    metrics = {f"{prefix}/overall/{name}": value for name, value in overall.items()}
+    task_auprcs: list[float] = []
+    for task_index in range(4):
+        indices = np.asarray([index for index, row in enumerate(rows) if int(row.task_index) == task_index])
+        task_rows = tuple(rows[int(index)] for index in indices)
+        task_metrics = one_group(task_rows, logits[indices])
+        metrics.update({f"{prefix}/task_{task_index}/{name}": value for name, value in task_metrics.items()})
+        if np.isfinite(task_metrics["auprc"]):
+            task_auprcs.append(task_metrics["auprc"])
+    metrics[f"{prefix}/macro_task_auprc"] = float(np.mean(task_auprcs)) if task_auprcs else float("nan")
+    return metrics
+
+
+def evaluate_raw_prefix_completion_loader(
+    eval_step,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    data_loader: _data_loader.RawPrefixDataLoaderImpl,
+) -> dict[str, float]:
+    """Evaluates natural raw-prefix rows without training-time resampling."""
+
+    all_logits: list[np.ndarray] = []
+    for batch_index, batch in enumerate(data_loader):
+        logits, _targets = eval_step(jax.random.fold_in(rng, batch_index), state, batch)
+        all_logits.append(np.asarray(jax.device_get(logits)).reshape(-1))
+    rows = data_loader.dataset.samples
+    if not all_logits:
+        raise ValueError("raw-prefix validation loader produced no examples")
+    logits = np.concatenate(all_logits)[: len(rows)]
+    return raw_prefix_completion_metrics(rows, logits)
+
+
 def temporal_validation_rank(metrics: dict[str, float]) -> tuple[float, float, float]:
     """Locked validation-only ordering (natural AUPRC, hard AUPRC, margin)."""
 
@@ -839,13 +1010,17 @@ def main(config: _config.TrainConfig):
     uses_completion_data = config.completion.uses_completion_data
     trains_completion_head = config.completion.trains_completion_head
     uses_temporal_completion = config.completion.uses_temporal_completion
+    uses_raw_prefix_completion = config.completion.uses_raw_prefix_completion
     completion_data_info = None
     temporal_data_info = None
+    raw_prefix_data_info = None
     val_data_loader = None
     train_eval_data_loader = None
     pos_weight = None
     if uses_temporal_completion:
         temporal_data_info = _data_loader.prepare_temporal_completion_data(config)
+    elif uses_raw_prefix_completion:
+        raw_prefix_data_info = _data_loader.prepare_raw_prefix_completion_data(config)
     elif uses_completion_data:
         completion_data_info = _data_loader.prepare_completion_data(config)
     if trains_completion_head:
@@ -856,9 +1031,16 @@ def main(config: _config.TrainConfig):
                 if config.completion.bce_pos_weight_override is not None
                 else 1.0
             )
+        elif uses_raw_prefix_completion:
+            assert raw_prefix_data_info is not None
+            pos_weight = (
+                config.completion.bce_pos_weight_override
+                if config.completion.bce_pos_weight_override is not None
+                else 1.0
+            )
         else:
             assert completion_data_info is not None
-        if not uses_temporal_completion and not config.completion.uses_progress_objective:
+        if not uses_temporal_completion and not uses_raw_prefix_completion and not config.completion.uses_progress_objective:
             pos_weight = (
                 config.completion.bce_pos_weight_override
                 if config.completion.bce_pos_weight_override is not None
@@ -873,6 +1055,14 @@ def main(config: _config.TrainConfig):
             config,
             split="train",
             temporal_data_info=temporal_data_info,
+            sharding=data_sharding,
+        )
+    elif uses_raw_prefix_completion:
+        assert raw_prefix_data_info is not None
+        data_loader = _data_loader.create_raw_prefix_data_loader(
+            config,
+            split="train",
+            raw_prefix_data_info=raw_prefix_data_info,
             sharding=data_sharding,
         )
     else:
@@ -921,7 +1111,9 @@ def main(config: _config.TrainConfig):
 
     # The val split is disabled for boundary training (val_groups=0); the merged
     # test split is evaluated only offline, never during training.
-    has_validation = trains_completion_head and (uses_temporal_completion or config.completion.val_groups > 0)
+    has_validation = trains_completion_head and (
+        uses_temporal_completion or uses_raw_prefix_completion or config.completion.val_groups > 0
+    )
     if has_validation:
         if uses_temporal_completion:
             assert temporal_data_info is not None
@@ -929,6 +1121,14 @@ def main(config: _config.TrainConfig):
                 config,
                 split="val",
                 temporal_data_info=temporal_data_info,
+                sharding=data_sharding,
+            )
+        elif uses_raw_prefix_completion:
+            assert raw_prefix_data_info is not None
+            val_data_loader = _data_loader.create_raw_prefix_data_loader(
+                config,
+                split="val",
+                raw_prefix_data_info=raw_prefix_data_info,
                 sharding=data_sharding,
             )
         else:
@@ -939,7 +1139,11 @@ def main(config: _config.TrainConfig):
                 sharding=data_sharding,
                 shuffle=False,
             )
-        if not uses_temporal_completion and config.completion.train_episode_limit is not None:
+        if (
+            not uses_temporal_completion
+            and not uses_raw_prefix_completion
+            and config.completion.train_episode_limit is not None
+        ):
             train_eval_data_loader = _data_loader.create_data_loader(
                 config,
                 split="train",
@@ -975,15 +1179,15 @@ def main(config: _config.TrainConfig):
             resume_epoch,
             skip_batches,
         )
-    elif uses_temporal_completion:
+    elif uses_temporal_completion or uses_raw_prefix_completion:
         temporal_sampler = data_loader.temporal_sampler
         if temporal_sampler is None:
-            raise ValueError("temporal completion train loader did not expose its batch sampler")
+            raise ValueError("cached completion train loader did not expose its batch sampler")
         temporal_steps_per_epoch = temporal_sampler.steps_per_epoch
         temporal_sampler.set_epoch(start_step // temporal_steps_per_epoch)
         temporal_sampler.set_skip_batches(start_step % temporal_steps_per_epoch)
         logging.info(
-            "Temporal sampler resume: start_step=%d epoch=%d skip_batches=%d steps_per_epoch=%d",
+            "Cached completion sampler resume: start_step=%d epoch=%d skip_batches=%d steps_per_epoch=%d",
             start_step,
             start_step // temporal_steps_per_epoch,
             start_step % temporal_steps_per_epoch,
@@ -995,7 +1199,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    if not uses_temporal_completion:
+    if not uses_temporal_completion and not uses_raw_prefix_completion:
         images_to_log = [
             wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
             for i in range(min(5, len(next(iter(batch[0].images.values())))))
@@ -1037,6 +1241,26 @@ def main(config: _config.TrainConfig):
                 dataset_metrics.update(
                     {f"dataset/train_pool_{name}": value for name, value in temporal_sampler.pool_sizes.items()}
                 )
+        elif uses_raw_prefix_completion:
+            assert raw_prefix_data_info is not None
+            dataset_metrics = {
+                "dataset/raw_prefix_manifest_schema": float(raw_prefix_data_info.manifest.schema_version),
+                "dataset/raw_prefix_cache_schema": float(raw_prefix_data_info.cache.metadata.schema_version),
+                "dataset/train_trajectory_count": raw_prefix_data_info.manifest.split_counts.train,
+                "dataset/val_trajectory_count": raw_prefix_data_info.manifest.split_counts.val,
+                "dataset/test_trajectory_count": raw_prefix_data_info.manifest.split_counts.test,
+                "dataset/train_candidate_count": raw_prefix_data_info.sample_count("train"),
+                "dataset/val_candidate_count": raw_prefix_data_info.sample_count("val"),
+                "dataset/test_candidate_count": raw_prefix_data_info.sample_count("test"),
+                "dataset/raw_prefix_token_count": raw_prefix_data_info.cache.metadata.token_count,
+                "dataset/raw_prefix_input_dim": raw_prefix_data_info.cache.metadata.input_dim,
+                "dataset/effective_pos_weight": float(pos_weight),
+            }
+            raw_sampler = data_loader.temporal_sampler
+            if raw_sampler is not None:
+                dataset_metrics.update(
+                    {f"dataset/raw_prefix_train_pool_{name}": value for name, value in raw_sampler.pool_sizes.items()}
+                )
         else:
             assert completion_data_info is not None
             dataset_metrics = {
@@ -1044,7 +1268,7 @@ def main(config: _config.TrainConfig):
                 "dataset/val_episode_count": len(completion_data_info.manifest.episode_ids("val")),
                 "dataset/test_episode_count": len(completion_data_info.manifest.episode_ids("test")),
             }
-        if not uses_temporal_completion and config.completion.uses_progress_objective:
+        if not uses_temporal_completion and not uses_raw_prefix_completion and config.completion.uses_progress_objective:
             dataset_metrics.update(
                 {
                     "dataset/progress_objective": 1.0,
@@ -1052,7 +1276,7 @@ def main(config: _config.TrainConfig):
                     "dataset/progress_huber_delta": config.completion.huber_delta,
                 }
             )
-        elif not uses_temporal_completion and completion_data_info.pos_weight is not None:
+        elif not uses_temporal_completion and not uses_raw_prefix_completion and completion_data_info.pos_weight is not None:
             dataset_metrics.update(
                 {
                     "dataset/train_positive_count": completion_data_info.train_positive_count,
@@ -1126,6 +1350,8 @@ def main(config: _config.TrainConfig):
         pcompletion_eval_step = jax.jit(
             functools.partial(temporal_completion_eval_step, config)
             if uses_temporal_completion
+            else raw_prefix_completion_eval_step
+            if uses_raw_prefix_completion
             else completion_eval_step,
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         )
@@ -1251,6 +1477,17 @@ def main(config: _config.TrainConfig):
                         input_mode=config.completion.temporal_input_mode,
                     ),
                 }
+            elif uses_raw_prefix_completion:
+                assert raw_prefix_data_info is not None
+                expected_val_count = raw_prefix_data_info.sample_count("val")
+                with sharding.set_mesh(mesh):
+                    val_metrics = evaluate_raw_prefix_completion_loader(
+                        pcompletion_eval_step,
+                        jax.random.fold_in(train_rng, step + 1),
+                        train_state,
+                        val_data_loader,
+                    )
+                actual_val_count = int(val_metrics["val/raw_prefix/overall/sample_count"])
             else:
                 assert completion_data_info is not None
                 expected_val_count = sum(

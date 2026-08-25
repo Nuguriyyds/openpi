@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.training.completion as _completion
 import openpi.training.completion_data as _completion_data
 import openpi.training.config as _config
+import openpi.training.raw_prefix_completion_features as _raw_prefix_features
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.temporal_completion_data as _temporal_data
 import openpi.training.temporal_completion_features as _temporal_features
@@ -64,6 +65,17 @@ class TemporalCompletionDataInfo:
 
     manifest: _temporal_data.TemporalCompletionManifest
     cache: _temporal_features.TemporalFeatureCache
+
+    def sample_count(self, split: _temporal_data.SplitName) -> int:
+        return int(self.cache.indices_for_split(split).size)
+
+
+@dataclasses.dataclass(frozen=True)
+class RawPrefixCompletionDataInfo:
+    """Sealed manifest and token-preserving current-frame prefix cache."""
+
+    manifest: _temporal_data.TemporalCompletionManifest
+    cache: _raw_prefix_features.RawPrefixCompletionCache
 
     def sample_count(self, split: _temporal_data.SplitName) -> int:
         return int(self.cache.indices_for_split(split).size)
@@ -690,6 +702,34 @@ def prepare_temporal_completion_data(config: _config.TrainConfig) -> TemporalCom
     return TemporalCompletionDataInfo(manifest=manifest, cache=cache)
 
 
+def prepare_raw_prefix_completion_data(config: _config.TrainConfig) -> RawPrefixCompletionDataInfo:
+    """Loads the sealed manifest/cache pair for raw-prefix head training."""
+
+    if not config.completion.uses_raw_prefix_completion:
+        raise ValueError("raw-prefix preparation requires completion.raw_prefix_sampling=True")
+    manifest_path = config.completion.split_manifest_path
+    cache_path = config.completion.raw_prefix_cache_path
+    if manifest_path is None or cache_path is None:
+        raise ValueError("raw-prefix completion requires split_manifest_path and raw_prefix_cache_path")
+    with open(manifest_path, encoding="utf-8") as file:
+        manifest = _temporal_data.TemporalCompletionManifest.from_dict(json.load(file))
+    cache = _raw_prefix_features.load_raw_prefix_cache(
+        cache_path,
+        manifest=manifest,
+        expected_checkpoint_path=config.completion.raw_prefix_source_checkpoint_path,
+        expected_model_config_name=config.completion.raw_prefix_source_model_config_name,
+    )
+    logging.info(
+        "Raw-prefix completion cache: manifest=%s rows=%d tokens=%d dim=%d checkpoint=%s",
+        manifest_path,
+        cache.metadata.row_count,
+        cache.metadata.token_count,
+        cache.metadata.input_dim,
+        cache.metadata.checkpoint_path,
+    )
+    return RawPrefixCompletionDataInfo(manifest=manifest, cache=cache)
+
+
 def create_temporal_feature_data_loader(
     config: _config.TrainConfig,
     *,
@@ -744,6 +784,58 @@ def create_temporal_feature_data_loader(
     return TemporalDataLoaderImpl(data_config, torch_loader, dataset)
 
 
+def create_raw_prefix_data_loader(
+    config: _config.TrainConfig,
+    *,
+    split: _temporal_data.SplitName,
+    raw_prefix_data_info: RawPrefixCompletionDataInfo,
+    sharding: jax.sharding.Sharding | None = None,
+    num_batches: int | None = None,
+) -> DataLoader[tuple[jax.Array, ...]]:
+    """Creates the fixed 32/16/16/0 training or natural eval raw loader."""
+
+    if not config.completion.uses_raw_prefix_completion:
+        raise ValueError("raw-prefix loader requires completion.raw_prefix_sampling=True")
+    if jax.process_count() != 1:
+        raise ValueError("raw-prefix completion supports one JAX process; multi-GPU within that process is supported")
+    data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = _raw_prefix_features.RawPrefixCompletionDataset(raw_prefix_data_info.cache, split)
+    local_batch_size = config.batch_size // jax.process_count()
+    if split == "train":
+        if config.batch_size != 64:
+            raise ValueError("raw-prefix completion requires global batch_size=64")
+        batch_sampler = _temporal_sampler.TemporalCompletionBatchSampler(
+            dataset.samples,
+            seed=config.seed,
+            positive_per_batch=config.completion.raw_prefix_positive_per_batch,
+            hard_negative_per_batch=config.completion.raw_prefix_hard_negative_per_batch,
+            ordinary_negative_per_batch=config.completion.raw_prefix_ordinary_negative_per_batch,
+            transition_negative_per_batch=config.completion.raw_prefix_transition_negative_per_batch,
+        )
+        repeat = True
+        drop_last = True
+    else:
+        batch_sampler = _temporal_sampler.NaturalTemporalEvalBatchSampler(
+            dataset.samples,
+            batch_size=local_batch_size,
+        )
+        repeat = False
+        drop_last = False
+    torch_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=sharding,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+        repeat=repeat,
+        drop_last=drop_last,
+        batch_sampler=batch_sampler,
+        temporal_sampler=batch_sampler if split == "train" else None,
+    )
+    return RawPrefixDataLoaderImpl(data_config, torch_loader, dataset)
+
+
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -768,6 +860,8 @@ def create_data_loader(
     """
     if config.completion.uses_temporal_completion:
         raise ValueError("temporal completion must use create_temporal_feature_data_loader")
+    if config.completion.uses_raw_prefix_completion:
+        raise ValueError("raw-prefix completion must use create_raw_prefix_data_loader")
     if natural_train_eval and split != "train":
         raise ValueError("natural_train_eval is only valid for the train split")
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -1300,4 +1394,36 @@ class TemporalDataLoaderImpl(DataLoader[tuple[jax.Array, jax.Array]]):
         return len(self.dataset)
 
     def __iter__(self) -> Iterator[tuple[jax.Array, jax.Array]]:
+        yield from self._data_loader
+
+
+class RawPrefixDataLoaderImpl(DataLoader[tuple[jax.Array, ...]]):
+    """Passes cached ``(prefix_out, mask, layout, target)`` batches unchanged."""
+
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader,
+        dataset: _raw_prefix_features.RawPrefixCompletionDataset,
+    ) -> None:
+        self._data_config = data_config
+        self._data_loader = data_loader
+        self.dataset = dataset
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    @property
+    def boundary_sampler(self) -> None:
+        return None
+
+    @property
+    def temporal_sampler(self) -> _temporal_sampler.TemporalCompletionBatchSampler | None:
+        return self._data_loader.temporal_sampler
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.dataset)
+
+    def __iter__(self) -> Iterator[tuple[jax.Array, ...]]:
         yield from self._data_loader

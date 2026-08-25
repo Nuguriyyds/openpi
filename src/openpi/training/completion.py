@@ -107,6 +107,20 @@ class CompletionTrainingConfig:
     temporal_val_fraction: float = 0.08
     temporal_test_fraction: float = 0.20
 
+    # Current-only raw-prefix decoder mode.  Unlike temporal_sampling this
+    # consumes a token-preserving cache and never constructs observation/action
+    # batches or invokes the VLM during head training.
+    raw_prefix_sampling: bool = False
+    raw_prefix_cache_path: str | None = None
+    raw_prefix_source_model_config_name: str = "pi05_730_breakfast_subtasks"
+    raw_prefix_source_checkpoint_path: str = (
+        "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999"
+    )
+    raw_prefix_positive_per_batch: int = 32
+    raw_prefix_hard_negative_per_batch: int = 16
+    raw_prefix_ordinary_negative_per_batch: int = 16
+    raw_prefix_transition_negative_per_batch: int = 0
+
     def __post_init__(self) -> None:
         if self.stage not in ("disabled", "action", "head"):
             raise ValueError(f"unsupported completion training stage: {self.stage!r}")
@@ -246,6 +260,33 @@ class CompletionTrainingConfig:
                 raise ValueError("subtask temporal completion uses unweighted BCE, not focal loss")
             if self.temporal_sampling_protocol == "subtask_local" and self.bce_pos_weight_override not in (None, 1.0):
                 raise ValueError("subtask-local temporal completion requires bce_pos_weight_override=1.0")
+        if self.raw_prefix_sampling:
+            if self.stage != "head":
+                raise ValueError("completion.raw_prefix_sampling is only supported for stage 'head'")
+            if self.objective != "binary":
+                raise ValueError("raw-prefix completion requires the binary objective")
+            if self.epochs is not None or self.train_steps is not None or self.eval_checkpoint_step is not None:
+                raise ValueError("raw-prefix completion uses the standard num_train_steps budget")
+            if self.temporal_sampling or self.boundary_sampling or self.balanced_sampling:
+                raise ValueError("raw-prefix completion is mutually exclusive with temporal/boundary/balanced sampling")
+            if self.raw_prefix_cache_path is None or not self.raw_prefix_cache_path:
+                raise ValueError("raw-prefix completion requires raw_prefix_cache_path")
+            if not self.raw_prefix_source_model_config_name:
+                raise ValueError("raw-prefix completion requires raw_prefix_source_model_config_name")
+            if not self.raw_prefix_source_checkpoint_path:
+                raise ValueError("raw-prefix completion requires raw_prefix_source_checkpoint_path")
+            counts = (
+                self.raw_prefix_positive_per_batch,
+                self.raw_prefix_hard_negative_per_batch,
+                self.raw_prefix_ordinary_negative_per_batch,
+                self.raw_prefix_transition_negative_per_batch,
+            )
+            if counts != (32, 16, 16, 0):
+                raise ValueError("raw-prefix completion requires batch counts (32, 16, 16, 0)")
+            if self.bce_pos_weight_override not in (None, 1.0):
+                raise ValueError("raw-prefix completion requires bce_pos_weight_override=1.0")
+            if self.focal_gamma != 0.0:
+                raise ValueError("raw-prefix completion uses unweighted BCE, not focal loss")
 
     @property
     def uses_completion_data(self) -> bool:
@@ -257,7 +298,7 @@ class CompletionTrainingConfig:
     def uses_legacy_completion_data(self) -> bool:
         """Whether the legacy per-frame LeRobot preparation path is required."""
 
-        return self.stage != "disabled" and not self.temporal_sampling
+        return self.stage != "disabled" and not self.temporal_sampling and not self.raw_prefix_sampling
 
     @property
     def trains_completion_head(self) -> bool:
@@ -270,7 +311,7 @@ class CompletionTrainingConfig:
         # Temporal labels live in the sealed trajectory manifest/feature cache;
         # asking the legacy loader to audit a per-frame ``completion`` column
         # would silently mix the two incompatible label definitions.
-        return self.stage == "head" and not self.temporal_sampling
+        return self.stage == "head" and not self.temporal_sampling and not self.raw_prefix_sampling
 
     @property
     def uses_focal_loss(self) -> bool:
@@ -301,6 +342,12 @@ class CompletionTrainingConfig:
         """Whether the strict three-prefix 2 Hz event path is selected."""
 
         return self.stage == "head" and self.temporal_sampling
+
+    @property
+    def uses_raw_prefix_completion(self) -> bool:
+        """Whether the current-frame token-preserving cache path is selected."""
+
+        return self.stage == "head" and self.raw_prefix_sampling
 
     @property
     def is_epoch_based(self) -> bool:
