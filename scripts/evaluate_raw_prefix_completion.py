@@ -110,8 +110,9 @@ def _predict_logits(config: Any, checkpoint: Path, cache: Any, indices: np.ndarr
     chunks: list[np.ndarray] = []
     for start in range(0, len(indices), batch_size):
         selected = indices[start : start + batch_size]
-        prefix_out = jnp.asarray(cache.prefix_out[selected])
-        prefix_mask = jnp.asarray(cache.prefix_mask[selected])
+        selected_prefix_out, selected_prefix_mask = cache.features_for_rows(selected)
+        prefix_out = jnp.asarray(selected_prefix_out)
+        prefix_mask = jnp.asarray(selected_prefix_mask)
         segment_ids = jnp.asarray(cache.prefix_segment_ids)
         position_ids = jnp.asarray(cache.prefix_position_ids)
         logits = np.asarray(

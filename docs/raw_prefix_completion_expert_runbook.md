@@ -33,7 +33,9 @@ uv run scripts/extract_current_raw_prefix_tokens.py \
   --batch-size 16
 ```
 
-脚本会复用现有 evaluation repack/norm/tokenizer，`train=False`，只读取每个 canonical row 的当前 source frame。cache 中 `prefix_out` 为 float16、`prefix_mask` 为 bool，并保存一份共享的 `prefix_segment_ids` / `prefix_position_ids`。目标目录已存在时命令会拒绝覆盖。
+脚本会复用现有 evaluation repack/norm/tokenizer，`train=False`，只读取每个 canonical row 的当前 source frame。cache 中 `prefix_out` 为 float16、`prefix_mask` 为 bool，并保存一份共享的 `prefix_segment_ids` / `prefix_position_ids`。raw prefix 按唯一 `(source episode, frame, prompt)` 保存，canonical row 通过索引映射到对应特征；特征以最大约 1 GiB 的 NPY 文件分片流式写入，不再生成几十 GiB 的单个 `prefix_out.npy`，也不会在保存前把全部 row 展开到内存。目标目录已存在时命令会拒绝覆盖。
+
+如需调整单个分片上限，可以额外传入 `--max-shard-bytes`；通常保持默认值即可。若上一轮提取在写单文件时失败，需要先删除那一轮留下的隐藏临时目录，再重新运行本节命令。正式目标目录 `current_raw_prefix_tokens_v1` 不存在时无需处理。
 
 ## 2. 启动 4000-step head training
 
@@ -100,4 +102,3 @@ uv run scripts/evaluate_temporal_completion_semiclosed.py \
 ## 6. 本地验证边界
 
 本地只运行不需要远程数据、远程 checkpoint 或 GPU 的定向单元测试。完整 cache 提取、4000-step 训练、自然 val/test 推理和 full-episode 半闭环命令留给远程训练机执行。
-

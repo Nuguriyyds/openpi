@@ -180,10 +180,17 @@ def extract_raw_prefix(args: argparse.Namespace) -> Path:
     dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, root=dataset_root)
     episode_from = dataset.episode_data_index["from"]
     episode_to = dataset.episode_data_index["to"]
-    unique_prefixes: list[np.ndarray] = []
-    unique_masks: list[np.ndarray] = []
     layout_segment_ids: np.ndarray | None = None
     layout_position_ids: np.ndarray | None = None
+    writer = raw_features.RawPrefixCacheWriter(
+        output,
+        manifest=manifest,
+        row_feature_indices=plan.row_key_indices,
+        feature_count=len(plan.keys),
+        model_config_name=args.config_name,
+        checkpoint_path=str(checkpoint),
+        max_shard_bytes=args.max_shard_bytes,
+    )
 
     for batch_start in range(0, len(plan.keys), args.batch_size):
         batch_keys = plan.keys[batch_start : batch_start + args.batch_size]
@@ -224,30 +231,21 @@ def extract_raw_prefix(args: argparse.Namespace) -> Path:
         if layout_segment_ids is None:
             layout_segment_ids = segment_ids_np
             layout_position_ids = position_ids_np
+            bytes_per_feature = prefix_out_np.shape[1] * (
+                prefix_out_np.shape[2] * np.dtype(np.float16).itemsize + np.dtype(np.bool_).itemsize
+            )
+            estimated_gib = len(plan.keys) * bytes_per_feature / float(1 << 30)
+            print(f"Estimated sharded cache payload: {estimated_gib:.2f} GiB")
         elif not np.array_equal(layout_segment_ids, segment_ids_np) or not np.array_equal(
             layout_position_ids, position_ids_np
         ):
             raise ValueError("prefix layout changed between extraction batches")
-        unique_prefixes.extend(np.asarray(prefix_out_np, dtype=np.float16))
-        unique_masks.extend(prefix_mask_np)
+        writer.append(prefix_out_np, prefix_mask_np, segment_ids_np, position_ids_np)
         print(f"Extracted {min(batch_start + len(batch_keys), len(plan.keys))}/{len(plan.keys)} unique current prefixes")
 
-    assert layout_segment_ids is not None and layout_position_ids is not None
-    unique_values = np.asarray(unique_prefixes, dtype=np.float16)
-    unique_masks_array = np.asarray(unique_masks, dtype=np.bool_)
-    row_indices = np.asarray(plan.row_key_indices, dtype=np.int64)
-    row_prefix_out = unique_values[row_indices]
-    row_prefix_mask = unique_masks_array[row_indices]
-    raw_features.save_raw_prefix_cache(
-        output,
-        manifest=manifest,
-        prefix_out=row_prefix_out,
-        prefix_mask=row_prefix_mask,
-        prefix_segment_ids=layout_segment_ids,
-        prefix_position_ids=layout_position_ids,
-        model_config_name=args.config_name,
-        checkpoint_path=str(checkpoint),
-    )
+    assert layout_segment_ids is not None
+    assert layout_position_ids is not None
+    cache_metadata = writer.finalize()
 
     split_counts = Counter(row.split for row in rows)
     task_counts = Counter(row.task_index for row in rows)
@@ -260,8 +258,10 @@ def extract_raw_prefix(args: argparse.Namespace) -> Path:
         f"positive={kind_counts['positive']} hard_negative={kind_counts['hard_negative']} "
         f"ordinary_negative={kind_counts['ordinary_negative']}"
     )
-    print(f"token_shape: {row_prefix_out.shape[1:]}")
-    print(f"dtype: {row_prefix_out.dtype}")
+    print(f"unique_feature_count: {cache_metadata.feature_count}")
+    print(f"shard_count: {cache_metadata.shard_count}")
+    print(f"token_shape: {(cache_metadata.token_count, cache_metadata.input_dim)}")
+    print(f"dtype: {cache_metadata.storage_dtype}")
     print(f"output: {output}")
     return output
 
@@ -275,6 +275,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hf-lerobot-home", type=Path, default=DEFAULT_HF_LEROBOT_HOME)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--batch-size", type=int, default=16, help="number of unique current prefixes per VLA batch")
+    parser.add_argument(
+        "--max-shard-bytes",
+        type=int,
+        default=raw_features.DEFAULT_MAX_SHARD_BYTES,
+        help="maximum prefix payload per NPY shard (default: 1 GiB)",
+    )
     return parser
 
 

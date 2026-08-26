@@ -57,6 +57,8 @@ def test_raw_prefix_cache_round_trip_and_dataset_current_row(tmp_path):
     )
 
     assert metadata.row_count == len(rows)
+    assert metadata.feature_count == len(rows)
+    assert metadata.shard_count == 1
     assert loaded.prefix_out.dtype == np.float16
     assert loaded.prefix_mask.dtype == np.bool_
     assert loaded.prefix_out.shape == (len(rows), 3, 4)
@@ -73,3 +75,33 @@ def test_raw_prefix_cache_round_trip_and_dataset_current_row(tmp_path):
     assert row.source_episode_ids[-1] >= 0
     assert row.source_frame_indices[-1] == row.logical_tick
 
+
+def test_raw_prefix_cache_shards_unique_features_and_maps_rows(tmp_path):
+    manifest = _manifest(tmp_path)
+    rows = raw_features.manifest_rows(manifest)
+    prefix_out = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+    prefix_mask = np.ones((2, 3), dtype=np.bool_)
+    row_feature_indices = np.arange(len(rows), dtype=np.int64) % 2
+    cache_path = tmp_path / "raw-cache-sharded"
+
+    metadata = raw_features.save_raw_prefix_cache(
+        cache_path,
+        manifest=manifest,
+        prefix_out=prefix_out,
+        prefix_mask=prefix_mask,
+        prefix_segment_ids=np.asarray([0, 1, 3], dtype=np.int32),
+        prefix_position_ids=np.asarray([0, 0, 0], dtype=np.int32),
+        model_config_name="clean-config",
+        checkpoint_path="/clean/checkpoint",
+        row_feature_indices=row_feature_indices,
+        max_shard_bytes=27,
+    )
+    loaded = raw_features.load_raw_prefix_cache(cache_path, manifest=manifest)
+
+    assert metadata.feature_count == 2
+    assert metadata.shard_count == 2
+    assert loaded.prefix_out.shape == (2, 3, 4)
+    np.testing.assert_array_equal(loaded.row_feature_indices, row_feature_indices)
+    values, masks = loaded.features_for_rows(np.asarray([0, 1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(values, prefix_out[[0, 1, 0]].astype(np.float16))
+    np.testing.assert_array_equal(masks, prefix_mask[[0, 1, 0]])
