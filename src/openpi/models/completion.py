@@ -417,6 +417,39 @@ class _RawPrefixDecoderBlock(nnx.Module):
         return jnp.asarray(queries, dtype=jnp.float32)
 
 
+class _RawPrefixDecoderStack(nnx.Module):
+    """Old-NNX-compatible decoder container with string-only state paths."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        *,
+        dropout_rate: float,
+        rngs: nnx.Rngs,
+    ) -> None:
+        self.num_layers = num_layers
+        for layer_index in range(num_layers):
+            setattr(
+                self,
+                f"block_{layer_index}",
+                _RawPrefixDecoderBlock(
+                    dim,
+                    num_heads,
+                    ffn_dim,
+                    dropout_rate=dropout_rate,
+                    rngs=rngs,
+                ),
+            )
+
+    def block(self, layer_index: int) -> _RawPrefixDecoderBlock:
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(layer_index)
+        return getattr(self, f"block_{layer_index}")
+
+
 class RawPrefixCompletionHead(nnx.Module):
     """Current-frame decoder over every frozen raw prefix token.
 
@@ -471,18 +504,14 @@ class RawPrefixCompletionHead(nnx.Module):
             )
             / math.sqrt(config.decoder_dim)
         )
-        # The repository's pinned Flax NNX traverses ordinary Python lists of
-        # Modules; ``nnx.List`` only exists in newer Flax releases.
-        self.decoder_blocks = [
-            _RawPrefixDecoderBlock(
-                config.decoder_dim,
-                config.decoder_num_heads,
-                config.decoder_ffn_dim,
-                dropout_rate=config.dropout_rate,
-                rngs=rngs,
-            )
-            for _ in range(config.decoder_num_layers)
-        ]
+        self.decoder_blocks = _RawPrefixDecoderStack(
+            config.decoder_num_layers,
+            config.decoder_dim,
+            config.decoder_num_heads,
+            config.decoder_ffn_dim,
+            dropout_rate=config.dropout_rate,
+            rngs=rngs,
+        )
         self.output_norm = nnx.LayerNorm(config.decoder_dim, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
         self.output = nnx.Linear(config.decoder_dim, 1, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
 
@@ -535,7 +564,8 @@ class RawPrefixCompletionHead(nnx.Module):
             layer_rngs = jax.random.split(rng, self.decoder_num_layers * 3)
         else:
             layer_rngs = None
-        for layer_index, block in enumerate(self.decoder_blocks):
+        for layer_index in range(self.decoder_num_layers):
+            block = self.decoder_blocks.block(layer_index)
             block_rngs = None
             if layer_rngs is not None:
                 start = layer_index * 3

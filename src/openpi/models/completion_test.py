@@ -1,4 +1,5 @@
 import flax.nnx as nnx
+import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -61,6 +62,11 @@ def test_raw_prefix_completion_head_shape_dtype_layout_and_fp32_params():
     flat_parameters = nnx.state(head, nnx.Param).flat_state()
     assert all(variable.value.dtype == jnp.float32 for variable in flat_parameters.values())
     assert any(path[0] == "decoder_blocks" for path in flat_parameters)
+    flattened_for_checkpoint_loader = flax.traverse_util.flatten_dict(
+        nnx.state(head, nnx.Param).to_pure_dict(),
+        sep="/",
+    )
+    assert any(path.startswith("decoder_blocks/block_0/") for path in flattened_for_checkpoint_loader)
 
 
 def test_raw_prefix_completion_head_mask_ignores_padding_content():
