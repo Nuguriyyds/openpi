@@ -471,18 +471,18 @@ class RawPrefixCompletionHead(nnx.Module):
             )
             / math.sqrt(config.decoder_dim)
         )
-        self.decoder_blocks = nnx.List(
-            [
-                _RawPrefixDecoderBlock(
-                    config.decoder_dim,
-                    config.decoder_num_heads,
-                    config.decoder_ffn_dim,
-                    dropout_rate=config.dropout_rate,
-                    rngs=rngs,
-                )
-                for _ in range(config.decoder_num_layers)
-            ]
-        )
+        # The repository's pinned Flax NNX traverses ordinary Python lists of
+        # Modules; ``nnx.List`` only exists in newer Flax releases.
+        self.decoder_blocks = [
+            _RawPrefixDecoderBlock(
+                config.decoder_dim,
+                config.decoder_num_heads,
+                config.decoder_ffn_dim,
+                dropout_rate=config.dropout_rate,
+                rngs=rngs,
+            )
+            for _ in range(config.decoder_num_layers)
+        ]
         self.output_norm = nnx.LayerNorm(config.decoder_dim, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
         self.output = nnx.Linear(config.decoder_dim, 1, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
 

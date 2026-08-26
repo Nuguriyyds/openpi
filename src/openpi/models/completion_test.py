@@ -58,7 +58,9 @@ def test_raw_prefix_completion_head_shape_dtype_layout_and_fp32_params():
     assert logits.shape == (2,)
     assert logits.dtype == jnp.float32
     assert np.all(np.isfinite(logits))
-    assert all(variable.value.dtype == jnp.float32 for variable in nnx.state(head, nnx.Param).flat_state().values())
+    flat_parameters = nnx.state(head, nnx.Param).flat_state()
+    assert all(variable.value.dtype == jnp.float32 for variable in flat_parameters.values())
+    assert any(path[0] == "decoder_blocks" for path in flat_parameters)
 
 
 def test_raw_prefix_completion_head_mask_ignores_padding_content():
