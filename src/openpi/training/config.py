@@ -682,6 +682,43 @@ class TrainConfig:
                 raise ValueError("raw-prefix completion may initialize only completion_head/.* from scratch")
             if not self.weight_loader.reject_unexpected:
                 raise ValueError("raw-prefix completion requires reject_unexpected=True for clean checkpoint loading")
+        if self.completion.uses_temporal_raw_prefix_completion:
+            if self.training_time_rtc.enabled:
+                raise ValueError("temporal raw-prefix completion requires the clean non-TTRTC source checkpoint")
+            if getattr(completion_head, "variant", None) != "temporal_raw_prefix_decoder":
+                raise ValueError(
+                    "temporal raw-prefix completion requires "
+                    "completion_head.variant='temporal_raw_prefix_decoder'"
+                )
+            if getattr(completion_head, "resolved_pooling", None) != "raw_prefix":
+                raise ValueError("temporal raw-prefix completion requires raw-prefix token memory")
+            if self.batch_size != 64:
+                raise ValueError("temporal raw-prefix completion requires batch_size=64")
+            if self.save_interval != self.completion.val_interval or self.keep_period != self.completion.val_interval:
+                raise ValueError(
+                    "temporal raw-prefix completion requires save_interval=keep_period=val_interval so every "
+                    "validation checkpoint is retained"
+                )
+            if self.num_train_steps % self.completion.val_interval:
+                raise ValueError(
+                    "temporal raw-prefix completion num_train_steps must end on a validation/checkpoint interval"
+                )
+            if not isinstance(self.weight_loader, weight_loaders.CheckpointWeightLoader):
+                raise ValueError("temporal raw-prefix completion requires CheckpointWeightLoader for the clean backbone")
+            expected_params_path = self.completion.raw_prefix_source_checkpoint_path.rstrip("/") + "/params"
+            if self.weight_loader.params_path.rstrip("/") != expected_params_path:
+                raise ValueError(
+                    "temporal raw-prefix completion weight_loader.params_path must match "
+                    "raw_prefix_source_checkpoint_path/params"
+                )
+            if self.weight_loader.missing_regex != r"completion_head/.*":
+                raise ValueError(
+                    "temporal raw-prefix completion may initialize only completion_head/.* from scratch"
+                )
+            if not self.weight_loader.reject_unexpected:
+                raise ValueError(
+                    "temporal raw-prefix completion requires reject_unexpected=True for clean checkpoint loading"
+                )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1131,6 +1168,91 @@ _CONFIGS = [
             completion_head=pi0_config.CompletionHeadConfig(
                 enabled=True,
                 variant="raw_prefix_decoder",
+            ),
+        ).get_completion_head_only_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999/params",
+            missing_regex=r"completion_head/.*",
+            reject_unexpected=True,
+        ),
+        num_train_steps=4_000,
+        ema_decay=None,
+        batch_size=64,
+        log_interval=100,
+        save_interval=200,
+        keep_period=200,
+        num_workers=0,
+        fsdp_devices=1,
+        seed=42,
+        checkpoint_base_dir="/mnt/data/models/wyt/checkpoints",
+        wandb_enabled=False,
+    ),
+    # Three-frame raw-prefix decoder.  It reuses the current-frame cache and
+    # reads only the history sidecar's base/extension location map.
+    TrainConfig(
+        name="pi05_agilex_breakfast_temporal_raw_prefix_completion_head",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(
+                enabled=True,
+                variant="temporal_raw_prefix_decoder",
+                decoder_dim=256,
+                decoder_num_queries=16,
+                decoder_num_layers=4,
+                decoder_num_heads=8,
+                decoder_ffn_dim=1024,
+                dropout_rate=0.1,
+                temporal_steps=3,
+            ),
+        ),
+        data=LeRobotAGILEXDataConfig(
+            repo_id="modanqing/agilex_make_breakfast_subtask_730",
+            assets=AssetsConfig(
+                assets_dir=(
+                    "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
+                    "breakfast_subtasks_bs64_50k/49999/assets"
+                ),
+                asset_id="agilex_make_breakfast_subtasks",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_home="/mnt/data/dataset/ei/huggingface",
+            ),
+        ),
+        completion=_completion.CompletionTrainingConfig(
+            stage="head",
+            objective="binary",
+            split_manifest_path=(
+                "/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json"
+            ),
+            temporal_raw_prefix_sampling=True,
+            raw_prefix_cache_path="/mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1",
+            temporal_raw_prefix_history_path=(
+                "/mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_v1"
+            ),
+            raw_prefix_source_model_config_name="pi05_730_breakfast_subtasks",
+            raw_prefix_source_checkpoint_path=(
+                "/mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/"
+                "breakfast_subtasks_bs64_50k/49999"
+            ),
+            raw_prefix_positive_per_batch=32,
+            raw_prefix_hard_negative_per_batch=16,
+            raw_prefix_ordinary_negative_per_batch=16,
+            raw_prefix_transition_negative_per_batch=0,
+            bce_pos_weight_override=1.0,
+            focal_gamma=0.0,
+            val_interval=200,
+            warmup_steps=100,
+            peak_lr=3e-5,
+            decay_lr=3e-6,
+            weight_decay=1e-4,
+            gradient_clip_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            completion_head=pi0_config.CompletionHeadConfig(
+                enabled=True,
+                variant="temporal_raw_prefix_decoder",
             ),
         ).get_completion_head_only_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader(

@@ -156,6 +156,43 @@ def test_raw_prefix_completion_parameter_audit_freezes_backbone_and_trains_only_
     )
 
 
+def test_temporal_raw_prefix_completion_parameter_audit_freezes_backbone_and_trains_only_head():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        completion_head=_pi0_config.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_raw_prefix_decoder",
+            decoder_dim=16,
+            decoder_num_queries=4,
+            decoder_num_layers=2,
+            decoder_num_heads=4,
+            decoder_ffn_dim=32,
+            dropout_rate=0.0,
+            temporal_steps=3,
+        ),
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    audit = _pi0_config.audit_frozen_vlm_parameters(
+        abstract_model,
+        config.get_completion_head_only_freeze_filter(),
+        trainable_groups=("completion",),
+    )
+
+    assert isinstance(abstract_model.completion_head, _completion.TemporalRawPrefixCompletionHead)
+    assert audit.frozen_vlm
+    assert audit.frozen_action
+    assert not audit.trainable_action
+    assert audit.trainable_completion
+    assert all(path.startswith("completion_head/") for path in audit.trainable_completion)
+    assert abstract_model.completion_head.frame_embedding.value.shape == (3, 16)
+    assert all(
+        variable.value.dtype == jnp.float32
+        for variable in nnx.state(abstract_model.completion_head, nnx.Param).flat_state().values()
+    )
+
+
 def test_completion_default_variant_preserves_legacy_attention_head():
     config = _pi0_config.Pi0Config(
         pi05=True,

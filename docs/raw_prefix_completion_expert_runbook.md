@@ -102,3 +102,89 @@ uv run scripts/evaluate_temporal_completion_semiclosed.py \
 ## 6. 本地验证边界
 
 本地只运行不需要远程数据、远程 checkpoint 或 GPU 的定向单元测试。完整 cache 提取、4000-step 训练、自然 val/test 推理和 full-episode 半闭环命令留给远程训练机执行。
+
+## 7. 三帧 temporal raw-prefix decoder
+
+这条实验是独立的 `temporal_raw_prefix_decoder` 路径。它固定使用同一 subtask、同一 prompt 的 `[t-30, t-15, t]` 三帧；每帧保留完整 raw prefix token，三帧 token 按 oldest→current 展平为 decoder memory。训练和离线 validation 只读取 cache，不运行 VLM；只有 sidecar 生成命令在缺失历史 key 时运行 clean Pi0.5 prefix 提取。
+
+Pi0.5 的实际 prefix width 为 `D=2048`。按 `decoder_dim=256`、`16` queries、`4` layers、`8` heads、FFN `1024` 及所有 Linear bias/LayerNorm 参数计算，新 head 的 trainable completion-head 参数量为 `4,814,593`；相对 current-only raw head 仅增加 `[3,256]` 的 `768` 个 frame-embedding 参数。
+
+远程仓库为 `10.11.0.109:/openpi_completion`，以下命令应在该仓库内执行，并固定使用 GPU 1。已有 `current_raw_prefix_tokens_v1` 不会被覆盖；sidecar 只写 base/extension location map 和缺失特征的 float16 分片。
+
+### 7.1 生成 history sidecar
+
+```bash
+CUDA_VISIBLE_DEVICES=1 uv run scripts/extract_temporal_raw_prefix_history.py \
+  --config-name pi05_730_breakfast_subtasks \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999 \
+  --dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json \
+  --base-cache /mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1 \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_v1 \
+  --batch-size 16 \
+  --max-shard-bytes 268435456
+```
+
+默认 extension shard 上限约为 1 GiB；脚本按模型 batch 直接写入 NPY 分片，不会先建立完整的 `extension_values` 或大 mmap，因此峰值内存只随 `--batch-size` 增长。如需更小的单片上限，可追加 `--max-shard-bytes 268435456`。脚本会打印 `row_count`、`base_reused_slots`、`unique_missing_feature_count`、`extension_shard_count`、`token_shape` 和 `output`。
+
+### 7.2 启动 4000-step 训练
+
+```bash
+CUDA_VISIBLE_DEVICES=1 uv run scripts/train.py \
+  pi05_agilex_breakfast_temporal_raw_prefix_completion_head \
+  --exp-name temporal_raw_prefix_seed42
+```
+
+配置固定 `batch_size=64`、`32/16/16/0`、标准 BCE `pos_weight=1.0`、`num_train_steps=4000`、`save_interval=keep_period=val_interval=200`、`seed=42`、`ema_decay=None`、`num_workers=0`，并从 clean checkpoint 初始化，仅随机初始化 `completion_head/*`。预期 checkpoint 为：
+
+```text
+/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_completion_head/temporal_raw_prefix_seed42/{200,400,...,4000}
+```
+
+### 7.3 validation 与 test
+
+下面命令按自然 `val` 候选顺序评测所有保存 step；根据 `metrics.macro_task_auprc` 选出 `<BEST_STEP>`，再只对该 step 评测 test。`--predictions-output` 会写出包含 `trajectory_id`、`full_episode_id`、`task_index`、`logical_tick`、`boundary_tick`、当前 source episode/frame、`sample_kind`、`target`、`logit` 和 `sigmoid_score` 的逐样本 JSON。
+
+```bash
+for step in $(seq 200 200 4000); do
+  CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_raw_prefix_completion.py \
+    --config-name pi05_agilex_breakfast_temporal_raw_prefix_completion_head \
+    --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_completion_head/temporal_raw_prefix_seed42/${step} \
+    --base-cache /mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1 \
+    --history-cache /mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_v1 \
+    --split val \
+    --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_reports/temporal_raw_prefix_seed42_step${step}_val.json \
+    --predictions-output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_reports/temporal_raw_prefix_seed42_step${step}_val_predictions.json \
+    --batch-size 64
+done
+
+CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_raw_prefix_completion.py \
+  --config-name pi05_agilex_breakfast_temporal_raw_prefix_completion_head \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_completion_head/temporal_raw_prefix_seed42/<BEST_STEP> \
+  --base-cache /mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1 \
+  --history-cache /mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_v1 \
+  --split test \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_reports/temporal_raw_prefix_seed42_step<BEST_STEP>_test.json \
+  --predictions-output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_reports/temporal_raw_prefix_seed42_step<BEST_STEP>_test_predictions.json \
+  --batch-size 64
+```
+
+报告根目录为 `/mnt/data/models/wyt/evaluations/temporal_raw_prefix_reports`。报告中的 `metrics.overall` 包含 sample/positive/negative count、AUPRC、AUROC、BCE、positive/hard/ordinary score mean、paired ordering accuracy、margin mean/median，以及 `per_task` 和 `macro_task_auprc`。
+
+### 7.4 full-episode 半闭环
+
+用 validation 选出的 threshold 运行新增的 `raw_prefix_history` 模式。每个 2 Hz tick 用 active prompt 生成当前 raw prefix；前两帧不打分，第三帧开始把最近三帧按 oldest→current 输入新 head；prompt 切换后清空历史，原有 terminal hold、timeout 和 JSON summary 保持不变。
+
+```bash
+CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_completion_semiclosed.py \
+  --mode raw_prefix_history \
+  --config-name pi05_agilex_breakfast_temporal_raw_prefix_completion_head \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_completion_head/temporal_raw_prefix_seed42/<BEST_STEP> \
+  --full-dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730 \
+  --subtask-dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json \
+  --threshold <VALIDATION_SELECTED_THRESHOLD> \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_reports/temporal_raw_prefix_seed42_step<BEST_STEP>_semiclosed.json
+```
+
+本地没有执行上述远程 sidecar 提取、训练、val/test 推理或半闭环评测；这些步骤需要远程数据、checkpoint 和 GPU 1。

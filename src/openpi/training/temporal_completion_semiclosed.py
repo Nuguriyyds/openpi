@@ -18,7 +18,7 @@ import numpy as np
 FPS = 30
 TICK_STRIDE_FRAMES = 15
 TASK_COUNT = 4
-HistoryMode = Literal["history", "current_only", "transition", "raw_prefix_current"]
+HistoryMode = Literal["history", "current_only", "transition", "raw_prefix_current", "raw_prefix_history"]
 GatedClassification = Literal["early", "on_time", "late_trigger", "timeout_forced"]
 GatedSwitchReason = Literal["head_early", "head_on_time", "head_late", "timeout"]
 
@@ -193,6 +193,10 @@ def _validate_raw_prefix_input(feature: Any) -> dict[str, np.ndarray]:
     }
 
 
+def _copy_raw_prefix_input(feature: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {name: np.array(value, copy=True) for name, value in feature.items()}
+
+
 class SemiClosedCompletionController:
     """Causal prompt-switching state for one full trajectory.
 
@@ -211,7 +215,7 @@ class SemiClosedCompletionController:
         maximum = float(np.nextafter(1.0, np.inf))
         if not np.isfinite(threshold) or not 0.0 <= float(threshold) <= maximum:
             raise ValueError("threshold must be in [0, nextafter(1,+inf)]")
-        if mode not in ("history", "current_only", "transition", "raw_prefix_current"):
+        if mode not in ("history", "current_only", "transition", "raw_prefix_current", "raw_prefix_history"):
             raise ValueError(f"unsupported mode {mode!r}")
         self.prompts = values
         self.threshold = float(threshold)
@@ -220,7 +224,7 @@ class SemiClosedCompletionController:
 
     def reset(self) -> None:
         self._task_index = 0
-        self._history: list[np.ndarray] = []
+        self._history: list[Any] = []
         self._last_frame: int | None = None
         self._done = False
 
@@ -267,6 +271,14 @@ class SemiClosedCompletionController:
             values = None
             head_input = _validate_raw_prefix_input(feature)
             history_ready = True
+        elif self.mode == "raw_prefix_history":
+            values = None
+            current = _validate_raw_prefix_input(feature)
+            self._history.append(_copy_raw_prefix_input(current))
+            if len(self._history) > 3:
+                self._history.pop(0)
+            history_ready = len(self._history) == 3
+            head_input = tuple(self._history) if history_ready else None
         else:
             values = np.asarray(feature, dtype=np.float32)
             if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
@@ -291,7 +303,7 @@ class SemiClosedCompletionController:
                 done=False,
             )
 
-        if self.mode != "raw_prefix_current":
+        if self.mode not in ("raw_prefix_current", "raw_prefix_history"):
             if self.mode == "current_only":
                 head_input = np.stack([np.zeros_like(values), np.zeros_like(values), values], axis=0)
             else:
@@ -305,7 +317,7 @@ class SemiClosedCompletionController:
             else:
                 task_after = task_before + 1
                 self._task_index = task_after
-                if self.mode == "history":
+                if self.mode in ("history", "raw_prefix_history"):
                     self._history.clear()
         return TickDecision(
             frame_index=frame,
@@ -414,7 +426,7 @@ class GatedCompletionController:
         maximum = float(np.nextafter(1.0, np.inf))
         if not np.isfinite(threshold) or not 0.0 <= float(threshold) <= maximum:
             raise ValueError("threshold must be in [0, nextafter(1,+inf)]")
-        if mode not in ("history", "current_only", "transition", "raw_prefix_current"):
+        if mode not in ("history", "current_only", "transition", "raw_prefix_current", "raw_prefix_history"):
             raise ValueError(f"unsupported mode {mode!r}")
         seconds = float(timeout_seconds)
         units = seconds * 2.0
@@ -432,7 +444,7 @@ class GatedCompletionController:
     def reset(self) -> None:
         self._task_index = 0
         self._source_frame = self.playback_start_frames[0]
-        self._history: list[np.ndarray] = []
+        self._history: list[Any] = []
         self._terminal_arrival_tick: int | None = None
         self._last_rollout_tick: int | None = None
         self._done = False
@@ -470,6 +482,13 @@ class GatedCompletionController:
     def _head_input(self, values: Any) -> tuple[Any | None, bool]:
         if self.mode == "raw_prefix_current":
             return _validate_raw_prefix_input(values), True
+        if self.mode == "raw_prefix_history":
+            current = _validate_raw_prefix_input(values)
+            self._history.append(_copy_raw_prefix_input(current))
+            if len(self._history) > 3:
+                self._history.pop(0)
+            history_ready = len(self._history) == 3
+            return (tuple(self._history), True) if history_ready else (None, False)
         history_ready = self.mode == "current_only"
         if self.mode in ("history", "transition"):
             self._history.append(np.array(values, copy=True))
@@ -537,7 +556,7 @@ class GatedCompletionController:
         self._task_index = task + 1
         self._source_frame = self.playback_start_frames[self._task_index]
         self._terminal_arrival_tick = None
-        if self.mode == "history":
+        if self.mode in ("history", "raw_prefix_history"):
             self._history.clear()
 
     def step(self, rollout_tick: int, feature: np.ndarray, score_fn: ScoreFunction) -> GatedTickDecision:
@@ -563,7 +582,7 @@ class GatedCompletionController:
             if self._terminal_arrival_tick is not None:
                 raise ValueError("non-terminal source frame observed after terminal hold began")
             terminal_hold_tick = None
-        if self.mode == "raw_prefix_current":
+        if self.mode in ("raw_prefix_current", "raw_prefix_history"):
             values = feature
             head_input, history_ready = self._head_input(values)
         else:

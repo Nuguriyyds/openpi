@@ -92,6 +92,45 @@ def test_raw_prefix_completion_config_matches_clean_source_and_head_only_freeze(
     assert isinstance(raw.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
 
 
+def test_temporal_raw_prefix_completion_config_matches_locked_scheme():
+    clean = config.get_config("pi05_730_breakfast_subtasks")
+    temporal_raw = config.get_config("pi05_agilex_breakfast_temporal_raw_prefix_completion_head")
+
+    assert temporal_raw.data.repo_id == clean.data.repo_id
+    assert temporal_raw.data.assets == clean.data.assets
+    assert temporal_raw.completion.uses_temporal_raw_prefix_completion
+    assert temporal_raw.completion.uses_any_raw_prefix_completion
+    assert not temporal_raw.completion.uses_raw_prefix_completion
+    assert not temporal_raw.completion.requires_completion_labels
+    assert temporal_raw.model.completion_head.variant == "temporal_raw_prefix_decoder"
+    assert temporal_raw.model.completion_head.resolved_pooling == "raw_prefix"
+    assert temporal_raw.model.completion_head.temporal_steps == 3
+    assert (
+        temporal_raw.model.completion_head.decoder_dim,
+        temporal_raw.model.completion_head.decoder_num_queries,
+        temporal_raw.model.completion_head.decoder_num_layers,
+        temporal_raw.model.completion_head.decoder_num_heads,
+        temporal_raw.model.completion_head.decoder_ffn_dim,
+        temporal_raw.model.completion_head.dropout_rate,
+    ) == (256, 16, 4, 8, 1024, 0.1)
+    assert (
+        temporal_raw.completion.raw_prefix_positive_per_batch,
+        temporal_raw.completion.raw_prefix_hard_negative_per_batch,
+        temporal_raw.completion.raw_prefix_ordinary_negative_per_batch,
+        temporal_raw.completion.raw_prefix_transition_negative_per_batch,
+    ) == (32, 16, 16, 0)
+    assert temporal_raw.batch_size == 64
+    assert temporal_raw.num_train_steps == 4_000
+    assert temporal_raw.ema_decay is None
+    assert temporal_raw.completion.temporal_raw_prefix_history_path.endswith(
+        "evaluations/temporal_raw_prefix_history_v1"
+    )
+    assert temporal_raw.weight_loader.params_path.endswith("breakfast_subtasks_bs64_50k/49999/params")
+    assert temporal_raw.weight_loader.missing_regex == r"completion_head/.*"
+    assert temporal_raw.weight_loader.reject_unexpected
+    assert isinstance(temporal_raw.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
+
+
 def test_temporal_history_carry_config_uses_balanced_transition_batch():
     carry = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_head")
     carry_posweight2 = config.get_config(

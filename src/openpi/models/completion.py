@@ -10,7 +10,12 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
-CompletionHeadVariant = Literal["legacy_attention", "temporal_mlp", "raw_prefix_decoder"]
+CompletionHeadVariant = Literal[
+    "legacy_attention",
+    "temporal_mlp",
+    "raw_prefix_decoder",
+    "temporal_raw_prefix_decoder",
+]
 CompletionPooling = Literal["masked_attention", "masked_mean", "raw_prefix"]
 RAW_PREFIX_SEGMENT_COUNT = 4
 RAW_PREFIX_MAX_WITHIN_SEGMENT_POSITION = 256
@@ -75,7 +80,12 @@ class CompletionHeadConfig:
     decoder_ffn_dim: int = 1024
 
     def __post_init__(self) -> None:
-        if self.variant not in ("legacy_attention", "temporal_mlp", "raw_prefix_decoder"):
+        if self.variant not in (
+            "legacy_attention",
+            "temporal_mlp",
+            "raw_prefix_decoder",
+            "temporal_raw_prefix_decoder",
+        ):
             raise ValueError(f"unknown completion_head.variant: {self.variant!r}")
         if self.pooling not in (None, "masked_attention", "masked_mean", "raw_prefix"):
             raise ValueError(f"unknown completion_head.pooling: {self.pooling!r}")
@@ -98,13 +108,14 @@ class CompletionHeadConfig:
             raise ValueError("completion_head.decoder_dim must be divisible by decoder_num_heads")
         if not 0.0 <= self.dropout_rate < 1.0:
             raise ValueError("completion_head.dropout_rate must be in [0, 1)")
-        if self.variant == "temporal_mlp" and self.temporal_steps != 3:
+        if self.variant in ("temporal_mlp", "temporal_raw_prefix_decoder") and self.temporal_steps != 3:
             raise ValueError("temporal completion requires exactly three prefix time steps")
 
         expected_pooling = {
             "legacy_attention": "masked_attention",
             "temporal_mlp": "masked_mean",
             "raw_prefix_decoder": "raw_prefix",
+            "temporal_raw_prefix_decoder": "raw_prefix",
         }[self.variant]
         if self.pooling is not None and self.pooling != expected_pooling:
             raise ValueError(
@@ -119,6 +130,7 @@ class CompletionHeadConfig:
             "legacy_attention": "masked_attention",
             "temporal_mlp": "masked_mean",
             "raw_prefix_decoder": "raw_prefix",
+            "temporal_raw_prefix_decoder": "raw_prefix",
         }[self.variant]
 
 
@@ -571,6 +583,174 @@ class RawPrefixCompletionHead(nnx.Module):
                 start = layer_index * 3
                 block_rngs = tuple(layer_rngs[start : start + 3])  # type: ignore[assignment]
             queries = block(queries, memory, prefix_mask, rngs=block_rngs, train=train)
+
+        cls = self.output_norm(queries[:, 0, :])
+        logits = self.output(cls)
+        return jnp.asarray(logits[:, 0], dtype=jnp.float32)
+
+
+class TemporalRawPrefixCompletionHead(nnx.Module):
+    """Three-frame decoder over every frozen raw-prefix token.
+
+    The three memories are kept separate until frame, segment, and within-
+    segment position embeddings have been added.  They are then flattened in
+    oldest-to-newest order and consumed by the same token-preserving decoder
+    blocks as :class:`RawPrefixCompletionHead`.
+    """
+
+    _SEGMENT_COUNT = 4
+    _MAX_WITHIN_SEGMENT_POSITION = 256
+    _TEMPORAL_STEPS = 3
+
+    def __init__(self, input_dim: int, config: CompletionHeadConfig, *, rngs: nnx.Rngs):
+        if input_dim <= 0:
+            raise ValueError("temporal raw-prefix completion head input_dim must be positive")
+        if config.variant != "temporal_raw_prefix_decoder":
+            raise ValueError(
+                "TemporalRawPrefixCompletionHead requires "
+                "completion_head.variant='temporal_raw_prefix_decoder'"
+            )
+        if config.resolved_pooling != "raw_prefix":
+            raise ValueError("TemporalRawPrefixCompletionHead does not use a pooling operation")
+        if config.temporal_steps != self._TEMPORAL_STEPS:
+            raise ValueError("temporal raw-prefix completion requires exactly three prefix time steps")
+
+        self.input_dim = input_dim
+        self.temporal_steps = config.temporal_steps
+        self.decoder_dim = config.decoder_dim
+        self.decoder_num_queries = config.decoder_num_queries
+        self.decoder_num_layers = config.decoder_num_layers
+        self.decoder_num_heads = config.decoder_num_heads
+        self.decoder_ffn_dim = config.decoder_ffn_dim
+        self.dropout_rate = config.dropout_rate
+
+        self.memory_norm = nnx.LayerNorm(input_dim, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
+        self.memory_projection = nnx.Linear(
+            input_dim,
+            config.decoder_dim,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            rngs=rngs,
+        )
+        self.frame_embedding = nnx.Param(
+            jax.random.normal(
+                rngs.params(),
+                (self._TEMPORAL_STEPS, config.decoder_dim),
+                dtype=jnp.float32,
+            )
+            * 0.02
+        )
+        self.segment_embedding = nnx.Param(
+            jax.random.normal(rngs.params(), (self._SEGMENT_COUNT, config.decoder_dim), dtype=jnp.float32) * 0.02
+        )
+        self.position_embedding = nnx.Param(
+            jax.random.normal(
+                rngs.params(),
+                (self._MAX_WITHIN_SEGMENT_POSITION, config.decoder_dim),
+                dtype=jnp.float32,
+            )
+            * 0.02
+        )
+        self.completion_queries = nnx.Param(
+            jax.random.normal(
+                rngs.params(),
+                (config.decoder_num_queries, config.decoder_dim),
+                dtype=jnp.float32,
+            )
+            / math.sqrt(config.decoder_dim)
+        )
+        self.decoder_blocks = _RawPrefixDecoderStack(
+            config.decoder_num_layers,
+            config.decoder_dim,
+            config.decoder_num_heads,
+            config.decoder_ffn_dim,
+            dropout_rate=config.dropout_rate,
+            rngs=rngs,
+        )
+        self.output_norm = nnx.LayerNorm(config.decoder_dim, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
+        self.output = nnx.Linear(config.decoder_dim, 1, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
+
+    def __call__(
+        self,
+        prefix_out_history: jax.Array,
+        prefix_mask_history: jax.Array,
+        prefix_segment_ids: jax.Array,
+        prefix_position_ids: jax.Array,
+        *,
+        rng: jax.Array | None = None,
+        train: bool = False,
+    ) -> jax.Array:
+        # The public boundary is stop-gradient so cached or directly-produced
+        # VLM features cannot receive completion-head gradients.
+        prefix_out_history = jax.lax.stop_gradient(jnp.asarray(prefix_out_history, dtype=jnp.float32))
+        prefix_mask_history = jnp.asarray(prefix_mask_history, dtype=jnp.bool_)
+        segment_ids = jnp.asarray(prefix_segment_ids, dtype=jnp.int32)
+        position_ids = jnp.asarray(prefix_position_ids, dtype=jnp.int32)
+        if prefix_out_history.ndim != 4:
+            raise ValueError(
+                "temporal raw-prefix completion tokens must have shape [B, 3, S, D], "
+                f"got {prefix_out_history.shape}"
+            )
+        if prefix_out_history.shape[1] != self._TEMPORAL_STEPS:
+            raise ValueError(
+                "temporal raw-prefix completion requires three prefix frames, "
+                f"got {prefix_out_history.shape[1]}"
+            )
+        if prefix_out_history.shape[2] <= 0:
+            raise ValueError("temporal raw-prefix completion tokens must contain at least one prefix token")
+        if prefix_out_history.shape[3] != self.input_dim:
+            raise ValueError(
+                f"temporal raw-prefix completion input width must be {self.input_dim}, "
+                f"got {prefix_out_history.shape[3]}"
+            )
+        expected_mask_shape = prefix_out_history.shape[:3]
+        if prefix_mask_history.shape != expected_mask_shape:
+            raise ValueError(
+                "temporal raw-prefix completion mask shape "
+                f"{prefix_mask_history.shape} does not match tokens {expected_mask_shape}"
+            )
+        # PyTorch's default collate stacks the shared [S] layout into [B, S].
+        # Accept that representation while keeping the dataset/cache contract
+        # shared-layout-only.
+        token_count = prefix_out_history.shape[2]
+        if segment_ids.ndim == 2 and segment_ids.shape == (prefix_out_history.shape[0], token_count):
+            segment_ids = segment_ids[0]
+        if position_ids.ndim == 2 and position_ids.shape == (prefix_out_history.shape[0], token_count):
+            position_ids = position_ids[0]
+        if segment_ids.shape != (token_count,) or position_ids.shape != (token_count,):
+            raise ValueError(
+                "temporal raw-prefix layout ids must each have shape [S], "
+                f"got {segment_ids.shape} and {position_ids.shape} for S={token_count}"
+            )
+
+        memory = self.memory_projection(self.memory_norm(prefix_out_history))
+        memory = memory + self.frame_embedding.value[None, :, None, :]
+        memory = memory + self.segment_embedding.value[segment_ids][None, None, :, :]
+        memory = memory + self.position_embedding.value[position_ids][None, None, :, :]
+        memory = jnp.reshape(
+            memory,
+            (prefix_out_history.shape[0], self._TEMPORAL_STEPS * token_count, self.decoder_dim),
+        )
+        memory_mask = jnp.reshape(prefix_mask_history, (prefix_out_history.shape[0], self._TEMPORAL_STEPS * token_count))
+        queries = jnp.broadcast_to(
+            self.completion_queries.value[None, :, :],
+            (prefix_out_history.shape[0], self.decoder_num_queries, self.decoder_dim),
+        )
+        if train and self.dropout_rate:
+            if rng is None:
+                raise ValueError(
+                    "temporal raw-prefix completion head requires an RNG when dropout is enabled during training"
+                )
+            layer_rngs = jax.random.split(rng, self.decoder_num_layers * 3)
+        else:
+            layer_rngs = None
+        for layer_index in range(self.decoder_num_layers):
+            block = self.decoder_blocks.block(layer_index)
+            block_rngs = None
+            if layer_rngs is not None:
+                start = layer_index * 3
+                block_rngs = tuple(layer_rngs[start : start + 3])  # type: ignore[assignment]
+            queries = block(queries, memory, memory_mask, rngs=block_rngs, train=train)
 
         cls = self.output_norm(queries[:, 0, :])
         logits = self.output(cls)

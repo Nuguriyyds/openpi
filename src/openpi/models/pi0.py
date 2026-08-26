@@ -12,6 +12,7 @@ from openpi.models import pi0_config
 from openpi.models.completion import CompletionHead
 from openpi.models.completion import RawPrefixCompletionHead
 from openpi.models.completion import TemporalCompletionHead
+from openpi.models.completion import TemporalRawPrefixCompletionHead
 from openpi.models.completion import build_raw_prefix_layout
 from openpi.models.completion import masked_mean_pool
 import openpi.models.gemma as _gemma
@@ -121,6 +122,12 @@ class Pi0(_model.BaseModel):
                 )
             elif config.completion_head.variant == "raw_prefix_decoder":
                 self.completion_head = RawPrefixCompletionHead(
+                    paligemma_config.width,
+                    config.completion_head,
+                    rngs=rngs,
+                )
+            elif config.completion_head.variant == "temporal_raw_prefix_decoder":
+                self.completion_head = TemporalRawPrefixCompletionHead(
                     paligemma_config.width,
                     config.completion_head,
                     rngs=rngs,
@@ -410,6 +417,35 @@ class Pi0(_model.BaseModel):
         return self.completion_head(
             prefix_out,
             prefix_mask,
+            prefix_segment_ids,
+            prefix_position_ids,
+            rng=head_rng,
+            train=train,
+        )
+
+    def compute_temporal_raw_prefix_completion_logits(
+        self,
+        rng: at.KeyArrayLike,
+        prefix_out_history: jax.Array,
+        prefix_mask_history: jax.Array,
+        prefix_segment_ids: jax.Array,
+        prefix_position_ids: jax.Array,
+        *,
+        train: bool = False,
+    ) -> jax.Array:
+        """Scores three cached raw prefixes without another VLM forward."""
+
+        if not hasattr(self, "completion_head"):
+            raise ValueError("completion head is disabled in Pi0Config")
+        if self.completion_head_variant != "temporal_raw_prefix_decoder":
+            raise ValueError(
+                "compute_temporal_raw_prefix_completion_logits requires "
+                "completion_head.variant='temporal_raw_prefix_decoder'"
+            )
+        head_rng = jax.random.fold_in(rng, 0xC0A5)
+        return self.completion_head(
+            prefix_out_history,
+            prefix_mask_history,
             prefix_segment_ids,
             prefix_position_ids,
             rng=head_rng,

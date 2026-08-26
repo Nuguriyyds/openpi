@@ -23,6 +23,15 @@ def test_temporal_policy_restore_preserves_native_mixed_precision_checkpoint():
     assert raw_dtype((DictKey("params"), DictKey("completion_head"), DictKey("output"))) == jnp.float32
     assert raw_dtype((DictKey("params"), DictKey("PaliGemma"), DictKey("llm"))) == jnp.bfloat16
 
+    temporal_raw = config.get_config("pi05_agilex_breakfast_temporal_raw_prefix_completion_head")
+    temporal_raw_dtype = policy_config._jax_checkpoint_restore_dtype(temporal_raw)  # noqa: SLF001
+    assert callable(temporal_raw_dtype)
+    assert (
+        temporal_raw_dtype((DictKey("params"), DictKey("completion_head"), DictKey("frame_embedding")))
+        == jnp.float32
+    )
+    assert temporal_raw_dtype((DictKey("params"), DictKey("PaliGemma"), DictKey("llm"))) == jnp.bfloat16
+
     restore_args = model_api._restore_args_tree(  # noqa: SLF001
         {"params": {"completion_head": {"kernel": 0}, "PaliGemma": {"kernel": 0}}},
         sharding=None,

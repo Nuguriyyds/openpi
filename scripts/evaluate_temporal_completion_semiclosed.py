@@ -327,14 +327,24 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
     from openpi.training import config as training_config  # noqa: PLC0415
 
     config = training_config.get_config(args.config_name)
-    is_raw_prefix = args.mode == "raw_prefix_current"
+    is_raw_prefix = args.mode in ("raw_prefix_current", "raw_prefix_history")
+    is_temporal_raw_prefix = args.mode == "raw_prefix_history"
     if not bool(getattr(config.completion, "uses_temporal_completion", False)) and not is_raw_prefix:
         raise ValueError(f"config {args.config_name!r} is not a temporal completion-head config")
     if is_raw_prefix:
-        if not bool(getattr(config.completion, "uses_raw_prefix_completion", False)):
-            raise ValueError("raw_prefix_current mode requires a raw-prefix completion config")
-        if getattr(config.model.completion_head, "variant", None) != "raw_prefix_decoder":
-            raise ValueError("raw_prefix_current mode requires completion_head.variant='raw_prefix_decoder'")
+        if is_temporal_raw_prefix:
+            if not bool(getattr(config.completion, "uses_temporal_raw_prefix_completion", False)):
+                raise ValueError("raw_prefix_history mode requires a temporal raw-prefix completion config")
+            if getattr(config.model.completion_head, "variant", None) != "temporal_raw_prefix_decoder":
+                raise ValueError(
+                    "raw_prefix_history mode requires "
+                    "completion_head.variant='temporal_raw_prefix_decoder'"
+                )
+        else:
+            if not bool(getattr(config.completion, "uses_raw_prefix_completion", False)):
+                raise ValueError("raw_prefix_current mode requires a raw-prefix completion config")
+            if getattr(config.model.completion_head, "variant", None) != "raw_prefix_decoder":
+                raise ValueError("raw_prefix_current mode requires completion_head.variant='raw_prefix_decoder'")
     configured_mode = str(getattr(config.completion, "temporal_input_mode", "history"))
     configured_protocol = str(getattr(config.completion, "temporal_sampling_protocol", "subtask_local"))
     if args.mode == "transition":
@@ -361,7 +371,12 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
         raise ValueError("semi-closed evaluator requires a JAX Pi0.5 checkpoint")
     model = policy._model  # noqa: SLF001
     if is_raw_prefix:
-        if not hasattr(model, "compute_prefix_outputs") or not hasattr(model, "compute_raw_prefix_completion_logits"):
+        score_api = (
+            "compute_temporal_raw_prefix_completion_logits"
+            if is_temporal_raw_prefix
+            else "compute_raw_prefix_completion_logits"
+        )
+        if not hasattr(model, "compute_prefix_outputs") or not hasattr(model, score_api):
             raise ValueError("loaded model lacks the raw-prefix shared prefix/completion APIs")
     elif not hasattr(model, "compute_prefix_feature"):
         raise ValueError("loaded model lacks compute_prefix_feature")
@@ -385,6 +400,15 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
             position_ids: Any,
         ) -> Any:
             module = nnx.merge(graphdef, state_value)
+            if is_temporal_raw_prefix:
+                return module.compute_temporal_raw_prefix_completion_logits(
+                    jax.random.key(0),
+                    prefix_out,
+                    prefix_mask,
+                    segment_ids,
+                    position_ids,
+                    train=False,
+                )
             return module.compute_raw_prefix_completion_logits(
                 jax.random.key(0),
                 prefix_out,
@@ -492,19 +516,39 @@ def _evaluate_episode(
             frame_index=source_frame,
             prompt=prompt,
         )
-        if args.mode == "raw_prefix_current":
+        if args.mode in ("raw_prefix_current", "raw_prefix_history"):
             if score_fn is None or not isinstance(feature, dict):
                 raise RuntimeError("raw-prefix semi-closed evaluation did not produce a raw prefix/score function")
 
-            def score_raw(raw_input: dict[str, np.ndarray]) -> tuple[float, float]:
+            def score_raw(raw_input: Any) -> tuple[float, float]:
+                if args.mode == "raw_prefix_history":
+                    if not isinstance(raw_input, tuple) or len(raw_input) != 3:
+                        raise ValueError("raw_prefix_history head input must contain three raw-prefix mappings")
+                    prefix_history = np.stack(
+                        [np.asarray(item["prefix_out"]) for item in raw_input],
+                        axis=0,
+                    )[None, ...]
+                    prefix_mask_history = np.stack(
+                        [np.asarray(item["prefix_mask"]) for item in raw_input],
+                        axis=0,
+                    )[None, ...]
+                    segment_ids = np.asarray(raw_input[0]["prefix_segment_ids"])
+                    position_ids = np.asarray(raw_input[0]["prefix_position_ids"])
+                else:
+                    if not isinstance(raw_input, dict):
+                        raise ValueError("raw_prefix_current head input must be a raw-prefix mapping")
+                    prefix_history = np.asarray(raw_input["prefix_out"])[None, ...]
+                    prefix_mask_history = np.asarray(raw_input["prefix_mask"])[None, ...]
+                    segment_ids = np.asarray(raw_input["prefix_segment_ids"])
+                    position_ids = np.asarray(raw_input["prefix_position_ids"])
                 logits = np.asarray(
                     jax.block_until_ready(
                         score_fn(
                             state,
-                            jnp.asarray(raw_input["prefix_out"])[None, ...],
-                            jnp.asarray(raw_input["prefix_mask"])[None, ...],
-                            jnp.asarray(raw_input["prefix_segment_ids"]),
-                            jnp.asarray(raw_input["prefix_position_ids"]),
+                            jnp.asarray(prefix_history),
+                            jnp.asarray(prefix_mask_history),
+                            jnp.asarray(segment_ids),
+                            jnp.asarray(position_ids),
                         )
                     ),
                     dtype=np.float32,
@@ -925,7 +969,11 @@ def evaluate(args: argparse.Namespace) -> Path:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("history", "current_only", "transition", "raw_prefix_current"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("history", "current_only", "transition", "raw_prefix_current", "raw_prefix_history"),
+        required=True,
+    )
     parser.add_argument("--config-name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--full-dataset-root", type=Path, default=DEFAULT_FULL_DATASET_ROOT)

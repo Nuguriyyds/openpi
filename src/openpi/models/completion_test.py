@@ -116,6 +116,102 @@ def test_raw_prefix_completion_head_dropout_requires_rng_only_during_training():
     assert train_logits.shape == (2,)
 
 
+def _small_temporal_raw_prefix_head(*, dropout_rate: float = 0.0):
+    return completion.TemporalRawPrefixCompletionHead(
+        8,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_raw_prefix_decoder",
+            decoder_dim=16,
+            decoder_num_queries=4,
+            decoder_num_layers=2,
+            decoder_num_heads=4,
+            decoder_ffn_dim=32,
+            dropout_rate=dropout_rate,
+            temporal_steps=3,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+
+
+def test_temporal_raw_prefix_completion_head_shape_dtype_and_fp32_params():
+    head = _small_temporal_raw_prefix_head()
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+    prefix_history = jnp.stack((prefix, prefix + 1.0, prefix + 2.0), axis=1)
+    mask_history = jnp.stack((mask, mask, mask), axis=1)
+
+    logits = head(prefix_history, mask_history, segment_ids, position_ids, train=False)
+
+    assert logits.shape == (2,)
+    assert logits.dtype == jnp.float32
+    assert np.all(np.isfinite(logits))
+    assert head.frame_embedding.value.shape == (3, 16)
+    assert all(variable.value.dtype == jnp.float32 for variable in nnx.state(head, nnx.Param).flat_state().values())
+
+
+def test_temporal_raw_prefix_head_flattens_each_frame_and_ignores_masked_content():
+    head = _small_temporal_raw_prefix_head()
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+    prefix_history = jnp.stack((prefix, prefix + 1.0, prefix + 2.0), axis=1)
+    mask_history = jnp.stack((mask, mask, mask), axis=1)
+    changed_padding = prefix_history.at[0, 1, 5:].set(
+        jnp.asarray([[1.0e4] * 8, [-1.0e4] * 8], dtype=jnp.float16)
+    )
+
+    logits_a = head(prefix_history, mask_history, segment_ids, position_ids, train=False)
+    logits_b = head(changed_padding, mask_history, segment_ids, position_ids, train=False)
+    logits_collated_layout = head(
+        prefix_history,
+        mask_history,
+        jnp.broadcast_to(segment_ids, (2, segment_ids.shape[0])),
+        jnp.broadcast_to(position_ids, (2, position_ids.shape[0])),
+        train=False,
+    )
+
+    np.testing.assert_array_equal(logits_a, logits_b)
+    np.testing.assert_array_equal(logits_a, logits_collated_layout)
+
+
+def test_temporal_raw_prefix_head_uses_frame_embeddings_and_stops_gradient(monkeypatch):
+    head = _small_temporal_raw_prefix_head()
+    prefix, mask, segment_ids, position_ids = _raw_prefix_test_inputs()
+    prefix_history = jnp.stack((prefix, prefix + 1.0, prefix + 2.0), axis=1)
+    mask_history = jnp.stack((mask, mask, mask), axis=1)
+
+    def fail_masked_mean(*_args, **_kwargs):
+        raise AssertionError("temporal raw-prefix decoder must not call masked_mean_pool")
+
+    monkeypatch.setattr(completion, "masked_mean_pool", fail_masked_mean)
+    baseline = head(prefix_history, mask_history, segment_ids, position_ids, train=False)
+    head.frame_embedding.value = jnp.zeros_like(head.frame_embedding.value)
+    without_frame_identity = head(prefix_history, mask_history, segment_ids, position_ids, train=False)
+    assert not np.allclose(baseline, without_frame_identity)
+
+    gradient = jax.grad(
+        lambda value: jnp.sum(head(value, mask_history, segment_ids, position_ids, train=False))
+    )(prefix_history.astype(jnp.float32))
+    np.testing.assert_array_equal(gradient, jnp.zeros_like(gradient))
+
+
+def test_temporal_raw_prefix_completion_config_is_strict():
+    config = completion.CompletionHeadConfig(enabled=True, variant="temporal_raw_prefix_decoder")
+
+    assert config.temporal_steps == 3
+    assert config.resolved_pooling == "raw_prefix"
+    with pytest.raises(ValueError, match="exactly three"):
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_raw_prefix_decoder",
+            temporal_steps=2,
+        )
+    with pytest.raises(ValueError, match="requires pooling"):
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="temporal_raw_prefix_decoder",
+            pooling="masked_mean",
+        )
+
+
 def test_raw_prefix_layout_uses_image_order_and_prompt_state_segment():
     segment_ids, position_ids = completion.build_raw_prefix_layout(
         ("left", "base", "right"),

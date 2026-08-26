@@ -31,7 +31,9 @@ def _jax_checkpoint_restore_dtype(train_config: _config.TrainConfig):
     """Returns the legacy BF16 cast or frozen-prefix head mixed-precision policy."""
 
     uses_frozen_prefix_head = (
-        train_config.completion.uses_temporal_completion or train_config.completion.uses_raw_prefix_completion
+        train_config.completion.uses_temporal_completion
+        or train_config.completion.uses_raw_prefix_completion
+        or train_config.completion.uses_temporal_raw_prefix_completion
     )
     return _temporal_mixed_restore_dtype if uses_frozen_prefix_head else jnp.bfloat16
 
@@ -104,7 +106,11 @@ def create_trained_policy(
                 dtype=_jax_checkpoint_restore_dtype(train_config),
             )
         )
-        if train_config.completion.uses_temporal_completion or train_config.completion.uses_raw_prefix_completion:
+        if (
+            train_config.completion.uses_temporal_completion
+            or train_config.completion.uses_raw_prefix_completion
+            or train_config.completion.uses_temporal_raw_prefix_completion
+        ):
             _audit_completion_head_fp32(model)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
