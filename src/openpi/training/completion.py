@@ -125,6 +125,14 @@ class CompletionTrainingConfig:
     # raw-prefix cache and binds a lightweight history index/extension sidecar.
     temporal_raw_prefix_sampling: bool = False
     temporal_raw_prefix_history_path: str | None = None
+    temporal_raw_prefix_sampling_protocol: Literal["subtask_local", "start_terminal"] = "subtask_local"
+    temporal_raw_prefix_endpoint_positive_per_batch: int = 16
+    temporal_raw_prefix_terminal_one_hold_positive_per_batch: int = 8
+    temporal_raw_prefix_terminal_full_hold_positive_per_batch: int = 8
+    temporal_raw_prefix_hard_negative_per_batch: int = 16
+    temporal_raw_prefix_ordinary_negative_per_batch: int = 8
+    temporal_raw_prefix_start_0_negative_per_batch: int = 4
+    temporal_raw_prefix_start_15_negative_per_batch: int = 4
 
     def __post_init__(self) -> None:
         if self.stage not in ("disabled", "action", "head"):
@@ -135,6 +143,11 @@ class CompletionTrainingConfig:
             raise ValueError(f"unsupported temporal_input_mode: {self.temporal_input_mode!r}")
         if self.temporal_sampling_protocol not in ("subtask_local", "history_carry"):
             raise ValueError(f"unsupported temporal_sampling_protocol: {self.temporal_sampling_protocol!r}")
+        if self.temporal_raw_prefix_sampling_protocol not in ("subtask_local", "start_terminal"):
+            raise ValueError(
+                "unsupported temporal_raw_prefix_sampling_protocol: "
+                f"{self.temporal_raw_prefix_sampling_protocol!r}"
+            )
         if not self.temporal_sampling and self.temporal_input_mode != "history":
             raise ValueError("temporal_input_mode='current_only' requires temporal_sampling=True")
         if not self.label_key:
@@ -300,7 +313,7 @@ class CompletionTrainingConfig:
             if self.objective != "binary":
                 raise ValueError("temporal raw-prefix completion requires the binary objective")
             if self.temporal_sampling_protocol != "subtask_local":
-                raise ValueError("temporal raw-prefix completion requires subtask_local sampling")
+                raise ValueError("temporal raw-prefix completion requires temporal_sampling_protocol=subtask_local")
             if self.temporal_history_steps != 3 or self.temporal_stride_frames != 15:
                 raise ValueError("temporal raw-prefix completion requires the fixed three-step 2 Hz history")
             if self.epochs is not None or self.train_steps is not None or self.eval_checkpoint_step is not None:
@@ -317,14 +330,32 @@ class CompletionTrainingConfig:
                 raise ValueError("temporal raw-prefix completion requires raw_prefix_source_model_config_name")
             if not self.raw_prefix_source_checkpoint_path:
                 raise ValueError("temporal raw-prefix completion requires raw_prefix_source_checkpoint_path")
-            counts = (
-                self.raw_prefix_positive_per_batch,
-                self.raw_prefix_hard_negative_per_batch,
-                self.raw_prefix_ordinary_negative_per_batch,
-                self.raw_prefix_transition_negative_per_batch,
-            )
-            if counts != (32, 16, 16, 0):
-                raise ValueError("temporal raw-prefix completion requires batch counts (32, 16, 16, 0)")
+            if self.temporal_raw_prefix_sampling_protocol == "subtask_local":
+                counts = (
+                    self.raw_prefix_positive_per_batch,
+                    self.raw_prefix_hard_negative_per_batch,
+                    self.raw_prefix_ordinary_negative_per_batch,
+                    self.raw_prefix_transition_negative_per_batch,
+                )
+                if counts != (32, 16, 16, 0):
+                    raise ValueError("temporal raw-prefix subtask_local requires batch counts (32, 16, 16, 0)")
+            else:
+                counts = (
+                    self.temporal_raw_prefix_endpoint_positive_per_batch,
+                    self.temporal_raw_prefix_terminal_one_hold_positive_per_batch,
+                    self.temporal_raw_prefix_terminal_full_hold_positive_per_batch,
+                    self.temporal_raw_prefix_hard_negative_per_batch,
+                    self.temporal_raw_prefix_ordinary_negative_per_batch,
+                    self.temporal_raw_prefix_start_0_negative_per_batch,
+                    self.temporal_raw_prefix_start_15_negative_per_batch,
+                )
+                if counts != (16, 8, 8, 16, 8, 4, 4):
+                    raise ValueError(
+                        "temporal raw-prefix start_terminal requires batch counts "
+                        "(16, 8, 8, 16, 8, 4, 4)"
+                    )
+                if self.raw_prefix_transition_negative_per_batch != 0:
+                    raise ValueError("temporal raw-prefix start_terminal does not support transition negatives")
             if self.bce_pos_weight_override not in (None, 1.0):
                 raise ValueError("temporal raw-prefix completion requires bce_pos_weight_override=1.0")
             if self.focal_gamma != 0.0:
@@ -406,6 +437,12 @@ class CompletionTrainingConfig:
         """Whether the three-frame token-preserving history path is selected."""
 
         return self.stage == "head" and self.temporal_raw_prefix_sampling
+
+    @property
+    def uses_temporal_raw_prefix_start_terminal(self) -> bool:
+        """Whether the seven-pool start/terminal history protocol is active."""
+
+        return self.uses_temporal_raw_prefix_completion and self.temporal_raw_prefix_sampling_protocol == "start_terminal"
 
     @property
     def uses_any_raw_prefix_completion(self) -> bool:

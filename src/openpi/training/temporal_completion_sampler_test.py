@@ -2,6 +2,7 @@ import dataclasses
 
 import pytest
 
+import openpi.training.temporal_completion_data as _temporal_data
 import openpi.training.temporal_completion_sampler as _sampler
 
 
@@ -95,6 +96,110 @@ def _make_history_carry_rows(trajectory_count: int = 12) -> list[_Row]:
     return rows
 
 
+def _make_start_terminal_rows(trajectory_count: int = 12, *, boundary: int | None = None):
+    rows: list[_temporal_data.TemporalSampleRow] = []
+    for trajectory in range(trajectory_count):
+        for task_index in _sampler.TEMPORAL_TASK_INDICES:
+            event_boundary = boundary if boundary is not None else 1000 + 300 * task_index
+            episode_id = trajectory * 4 + task_index
+
+            def add_local(
+                current: int,
+                *,
+                label: int,
+                sample_kind: str,
+                window_variant: str,
+                _trajectory: int = trajectory,
+                _task_index: int = task_index,
+                _event_boundary: int = event_boundary,
+                _episode_id: int = episode_id,
+            ) -> None:
+                history = (current - 30, current - 15, current)
+                rows.append(
+                    _temporal_data.TemporalSampleRow(
+                        trajectory_id=f"trajectory-{_trajectory}",
+                        full_episode_id=_trajectory,
+                        task_index=_task_index,
+                        split="train",
+                        logical_tick=current,
+                        label=label,
+                        sample_kind=sample_kind,
+                        boundary_tick=_event_boundary,
+                        prompt_index=_task_index,
+                        history_logical_ticks=history,
+                        source_episode_ids=(_episode_id, _episode_id, _episode_id),
+                        source_frame_indices=history,
+                        terminal_hold_flags=(False, False, False),
+                        window_variant=window_variant,
+                    )
+                )
+
+            add_local(event_boundary, label=1, sample_kind="positive", window_variant="endpoint_positive")
+            rows.append(
+                _temporal_data.TemporalSampleRow(
+                    trajectory_id=f"trajectory-{trajectory}",
+                    full_episode_id=trajectory,
+                    task_index=task_index,
+                    split="train",
+                    logical_tick=event_boundary + 15,
+                    label=1,
+                    sample_kind="positive",
+                    boundary_tick=event_boundary,
+                    prompt_index=task_index,
+                    history_logical_ticks=(event_boundary - 15, event_boundary, event_boundary + 15),
+                    source_episode_ids=(episode_id, episode_id, episode_id),
+                    source_frame_indices=(event_boundary - 15, event_boundary, event_boundary),
+                    terminal_hold_flags=(False, False, True),
+                    window_variant="terminal_one_hold_positive",
+                )
+            )
+            rows.append(
+                _temporal_data.TemporalSampleRow(
+                    trajectory_id=f"trajectory-{trajectory}",
+                    full_episode_id=trajectory,
+                    task_index=task_index,
+                    split="train",
+                    logical_tick=event_boundary + 30,
+                    label=1,
+                    sample_kind="positive",
+                    boundary_tick=event_boundary,
+                    prompt_index=task_index,
+                    history_logical_ticks=(event_boundary, event_boundary + 15, event_boundary + 30),
+                    source_episode_ids=(episode_id, episode_id, episode_id),
+                    source_frame_indices=(event_boundary, event_boundary, event_boundary),
+                    terminal_hold_flags=(False, True, True),
+                    window_variant="terminal_full_hold_positive",
+                )
+            )
+            add_local(
+                event_boundary - 15,
+                label=0,
+                sample_kind="hard_negative",
+                window_variant="hard_negative",
+            )
+            add_local(
+                event_boundary - 30,
+                label=0,
+                sample_kind="ordinary_negative",
+                window_variant="ordinary_negative",
+            )
+            if event_boundary >= 60:
+                add_local(
+                    30,
+                    label=0,
+                    sample_kind="ordinary_negative",
+                    window_variant="start_0_negative",
+                )
+            if event_boundary >= 75:
+                add_local(
+                    45,
+                    label=0,
+                    sample_kind="ordinary_negative",
+                    window_variant="start_15_negative",
+                )
+    return rows
+
+
 def test_train_batch_has_exact_composition_unique_positives_and_paired_hard_negatives():
     rows = _make_rows()
     sampler = _sampler.TemporalCompletionBatchSampler(rows, seed=42, batches_per_epoch=4)
@@ -167,6 +272,66 @@ def test_history_carry_batch_is_task_balanced_and_rotates_transition_steps():
             if row.sample_kind == "transition_negative":
                 transition_counts[(row.task_index, row.logical_tick)] += 1
     assert transition_counts == dict.fromkeys(transition_counts, 2)
+
+
+def test_start_terminal_batch_has_exact_seven_pool_composition_and_event_pairing():
+    rows = _make_start_terminal_rows()
+    sampler = _sampler.StartTerminalTemporalCompletionBatchSampler(rows, seed=42, batches_per_epoch=3)
+
+    expected_counts = {
+        "endpoint_positive": 16,
+        "terminal_one_hold_positive": 8,
+        "terminal_full_hold_positive": 8,
+        "hard_negative": 16,
+        "ordinary_negative": 8,
+        "start_0_negative": 4,
+        "start_15_negative": 4,
+    }
+    for batch in sampler:
+        selected = [rows[index] for index in batch]
+        audit = sampler.audit_batch(batch)
+        assert audit.variant_counts == expected_counts
+        assert audit.task_counts == {
+            variant: (count // 4,) * 4 for variant, count in expected_counts.items()
+        }
+        assert all(row.window_variant in expected_counts for row in selected)
+        endpoint_events = {
+            (row.trajectory_id, row.task_index, row.boundary_tick)
+            for row in selected
+            if row.window_variant == "endpoint_positive"
+        }
+        assert all(
+            (row.trajectory_id, row.task_index, row.boundary_tick) in endpoint_events
+            for row in selected
+            if row.window_variant == "hard_negative"
+        )
+        assert not any(row.sample_kind == "transition_negative" for row in selected)
+
+
+def test_start_terminal_sampler_uses_deterministic_replacement_for_small_pools():
+    rows = _make_start_terminal_rows(trajectory_count=1)
+    sampler = _sampler.StartTerminalTemporalCompletionBatchSampler(rows, seed=7)
+    batch = next(iter(sampler))
+
+    assert sampler.audit_batch(batch).variant_counts == sampler.batch_composition
+    assert len(batch) == 64
+    assert sampler.pool_event_sizes == {
+        "endpoint_positive": 4,
+        "terminal_one_hold_positive": 4,
+        "terminal_full_hold_positive": 4,
+        "hard_negative": 4,
+        "ordinary_negative": 4,
+        "start_0_negative": 4,
+        "start_15_negative": 4,
+    }
+
+
+def test_start_terminal_sampler_rejects_ordinary_start_window_overlap():
+    with pytest.raises(ValueError, match="identical source window"):
+        _sampler.StartTerminalTemporalCompletionBatchSampler(
+            _make_start_terminal_rows(trajectory_count=4, boundary=75),
+            seed=1,
+        )
 
 
 def test_history_carry_32_16_12_4_keeps_positive_count_and_pairs_hard_subset():

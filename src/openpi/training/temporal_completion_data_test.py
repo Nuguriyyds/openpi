@@ -202,6 +202,64 @@ def test_natural_index_has_one_positive_per_task_and_exact_negative_pools():
         ) == (15, 15)
 
 
+def test_start_terminal_rows_have_exact_hold_windows_and_boundary_eligibility():
+    group = _group(lengths=(61, 76, 100, 100))
+    rows = temporal_data.build_start_terminal_sample_rows(
+        group,
+        trajectory_id="full-000000",
+        full_episode_id=0,
+        split="train",
+    )
+
+    # Keep the task assertions explicit so the two eligibility thresholds are
+    # visible in the test rather than hidden in a helper.
+    task0 = [row for row in rows if row.task_index == 0]
+    task1 = [row for row in rows if row.task_index == 1]
+    assert {row.window_variant for row in task0} == {
+        "endpoint_positive",
+        "terminal_one_hold_positive",
+        "terminal_full_hold_positive",
+        "hard_negative",
+        "start_0_negative",
+    }
+    assert {row.window_variant for row in task1} == {
+        "endpoint_positive",
+        "terminal_one_hold_positive",
+        "terminal_full_hold_positive",
+        "hard_negative",
+        "start_0_negative",
+        "start_15_negative",
+    }
+    assert not any(row.window_variant == "ordinary_negative" for row in task0 + task1)
+
+    task0_one_hold = next(row for row in task0 if row.window_variant == "terminal_one_hold_positive")
+    assert task0_one_hold.history_logical_ticks == (45, 60, 75)
+    assert task0_one_hold.source_frame_indices == (45, 60, 60)
+    assert task0_one_hold.terminal_hold_flags == (False, False, True)
+    task0_full_hold = next(row for row in task0 if row.window_variant == "terminal_full_hold_positive")
+    assert task0_full_hold.history_logical_ticks == (60, 75, 90)
+    assert task0_full_hold.source_frame_indices == (60, 60, 60)
+    assert task0_full_hold.terminal_hold_flags == (False, True, True)
+
+
+def test_start_terminal_removes_exact_start_windows_from_ordinary_pool():
+    group = _group(lengths=(61, 76, 76, 76))
+    rows = temporal_data.build_start_terminal_sample_rows(
+        group,
+        trajectory_id="full-000000",
+        full_episode_id=0,
+        split="train",
+    )
+
+    ordinary = [row for row in rows if row.window_variant == "ordinary_negative"]
+    start = [row for row in rows if row.window_variant in ("start_0_negative", "start_15_negative")]
+    assert all(row.source_frame_indices not in {candidate.source_frame_indices for candidate in start} for row in ordinary)
+    assert not any(row.source_frame_indices == (0, 15, 30) for row in ordinary)
+    assert not any(row.source_frame_indices == (15, 30, 45) for row in ordinary)
+    assert any(row.window_variant == "start_0_negative" and row.boundary_tick == 60 for row in start)
+    assert any(row.window_variant == "start_15_negative" and row.boundary_tick == 75 for row in start)
+
+
 def test_history_carry_rows_keep_previous_episode_and_prompt_identity():
     group = _group(lengths=(100, 100, 100, 100))
     rows = temporal_data.build_history_carry_transition_rows(

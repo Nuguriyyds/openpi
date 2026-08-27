@@ -15,7 +15,6 @@ import os
 import pathlib
 import shutil
 import tempfile
-from typing import Any
 
 import numpy as np
 
@@ -73,13 +72,33 @@ def _row_history_keys(row: _temporal_data.TemporalSampleRow) -> tuple[TemporalRa
     )
 
 
+def manifest_rows(
+    manifest: _temporal_data.TemporalCompletionManifest,
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
+) -> tuple[_temporal_data.TemporalSampleRow, ...]:
+    """Materialize sidecar rows for the selected protocol in sealed order."""
+
+    _temporal_data.validate_temporal_manifest(manifest)
+    return tuple(
+        row
+        for split in _temporal_data.SPLIT_NAMES
+        for row in _temporal_data.build_manifest_sample_rows(
+            manifest,
+            split,
+            sampling_protocol=sampling_protocol,
+        )
+    )
+
+
 def build_temporal_raw_prefix_history_plan(
     manifest: _temporal_data.TemporalCompletionManifest,
     base_cache: _raw_features.RawPrefixCompletionCache,
+    *,
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
 ) -> TemporalRawPrefixHistoryPlan:
     """Maps every sealed history slot to the base cache or a new extension row."""
 
-    rows = _raw_features.manifest_rows(manifest)
+    rows = manifest_rows(manifest, sampling_protocol)
     base_cache.validate(manifest)
     if base_cache.metadata.task_prompts != manifest.task_prompts:
         raise ValueError("base raw-prefix cache prompts differ from the sealed manifest")
@@ -133,6 +152,7 @@ class TemporalRawPrefixHistoryCacheMetadata:
     schema_version: int = TEMPORAL_RAW_PREFIX_CACHE_SCHEMA_VERSION
     storage_format: str = TEMPORAL_RAW_PREFIX_STORAGE_FORMAT
     storage_dtype: str = "float16"
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local"
 
     def __post_init__(self) -> None:
         if self.schema_version != TEMPORAL_RAW_PREFIX_CACHE_SCHEMA_VERSION:
@@ -147,6 +167,10 @@ class TemporalRawPrefixHistoryCacheMetadata:
             )
         if self.storage_dtype != "float16":
             raise ValueError("temporal raw-prefix history storage_dtype must be 'float16'")
+        if self.sampling_protocol not in ("subtask_local", "start_terminal"):
+            raise ValueError(
+                "temporal raw-prefix history sampling_protocol must be 'subtask_local' or 'start_terminal'"
+            )
         if not self.model_config_name or not self.checkpoint_path or not self.base_cache_path:
             raise ValueError("temporal raw-prefix history source bindings must be non-empty")
         if len(self.task_prompts) != _temporal_data.TASKS_PER_TRAJECTORY or any(
@@ -173,11 +197,16 @@ class TemporalRawPrefixHistoryCacheMetadata:
     def from_json(cls, value: str) -> TemporalRawPrefixHistoryCacheMetadata:
         payload = json.loads(value)
         expected = {field.name for field in dataclasses.fields(cls)}
-        if set(payload) != expected:
+        missing = expected - set(payload)
+        unexpected = set(payload) - expected
+        # Metadata written by schema-v1 sidecars predates the protocol field;
+        # its only valid interpretation is the original subtask-local rows.
+        if unexpected or missing - {"sampling_protocol"}:
             raise ValueError(
                 "temporal raw-prefix history metadata fields do not match schema; "
-                f"missing={sorted(expected - set(payload))}, unexpected={sorted(set(payload) - expected)}"
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
+        payload.setdefault("sampling_protocol", "subtask_local")
         payload["task_prompts"] = tuple(str(prompt) for prompt in payload["task_prompts"])
         payload["extension_shard_rows"] = tuple(int(rows) for rows in payload["extension_shard_rows"])
         return cls(**payload)
@@ -225,7 +254,7 @@ class TemporalRawPrefixHistoryCache:
         return self.metadata.extension_count
 
     def validate(self, manifest: _temporal_data.TemporalCompletionManifest) -> None:
-        expected_rows = _raw_features.manifest_rows(manifest)
+        expected_rows = manifest_rows(manifest, self.metadata.sampling_protocol)
         if self.rows != expected_rows:
             raise ValueError("temporal raw-prefix history rows differ from the sealed manifest")
         if self.metadata.task_prompts != manifest.task_prompts:
@@ -397,8 +426,9 @@ class TemporalRawPrefixHistoryWriter:
         plan: TemporalRawPrefixHistoryPlan,
         base_cache_path: str | os.PathLike[str],
         max_shard_bytes: int = DEFAULT_MAX_SHARD_BYTES,
+        sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
     ) -> None:
-        expected_rows = _raw_features.manifest_rows(manifest)
+        expected_rows = manifest_rows(manifest, sampling_protocol)
         if plan.rows != expected_rows:
             raise ValueError("temporal raw-prefix history plan rows differ from the manifest")
         base_cache.validate(manifest)
@@ -415,6 +445,7 @@ class TemporalRawPrefixHistoryWriter:
         self.manifest = manifest
         self.base_cache = base_cache
         self.plan = plan
+        self.sampling_protocol = sampling_protocol
         self.output_path = pathlib.Path(path)
         if self.output_path.exists():
             raise FileExistsError(f"refusing to overwrite sealed temporal raw-prefix history: {self.output_path}")
@@ -532,6 +563,7 @@ class TemporalRawPrefixHistoryWriter:
             extension_shard_count=self._shard_count,
             extension_shard_rows=shard_rows,
             base_cache_schema_version=self.base_cache.metadata.schema_version,
+            sampling_protocol=self.sampling_protocol,
         )
         try:
             np.save(
@@ -569,6 +601,7 @@ def save_temporal_raw_prefix_history(
     extension_prefix_mask: np.ndarray,
     base_cache_path: str | os.PathLike[str],
     max_shard_bytes: int = DEFAULT_MAX_SHARD_BYTES,
+    sampling_protocol: _temporal_data.SamplingProtocol = "subtask_local",
 ) -> TemporalRawPrefixHistoryCacheMetadata:
     """Writes an immutable sidecar from an already materialized test/helper array.
 
@@ -598,6 +631,7 @@ def save_temporal_raw_prefix_history(
         plan=plan,
         base_cache_path=base_cache_path,
         max_shard_bytes=max_shard_bytes,
+        sampling_protocol=sampling_protocol,
     )
     try:
         if plan.extension_count:
@@ -616,6 +650,7 @@ def load_temporal_raw_prefix_history(
     expected_base_cache_path: str | os.PathLike[str] | None = None,
     expected_checkpoint_path: str | None = None,
     expected_model_config_name: str | None = None,
+    expected_sampling_protocol: _temporal_data.SamplingProtocol | None = None,
 ) -> TemporalRawPrefixHistoryCache:
     """Loads and validates an immutable history sidecar plus its base cache."""
 
@@ -633,6 +668,8 @@ def load_temporal_raw_prefix_history(
         raise ValueError("temporal raw-prefix history checkpoint does not match the requested source checkpoint")
     if expected_model_config_name is not None and metadata.model_config_name != expected_model_config_name:
         raise ValueError("temporal raw-prefix history model config does not match")
+    if expected_sampling_protocol is not None and metadata.sampling_protocol != expected_sampling_protocol:
+        raise ValueError("temporal raw-prefix history sampling protocol does not match the requested protocol")
 
     base_cache.validate(manifest)
     location_kind = np.load(cache_path / "history_location_kind.npy", allow_pickle=False, mmap_mode="r")
@@ -641,7 +678,7 @@ def load_temporal_raw_prefix_history(
     extension = _load_extension(cache_path, metadata)
     cache = TemporalRawPrefixHistoryCache(
         metadata=metadata,
-        rows=_raw_features.manifest_rows(manifest),
+        rows=manifest_rows(manifest, metadata.sampling_protocol),
         base_cache=base_cache,
         extension=extension,
         history_location_kind=location_kind,

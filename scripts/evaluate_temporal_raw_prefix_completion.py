@@ -18,10 +18,48 @@ from openpi.training import temporal_raw_prefix_completion_features as temporal_
 DEFAULT_CONFIG_NAME = "pi05_agilex_breakfast_temporal_raw_prefix_completion_head"
 DEFAULT_BASE_CACHE = Path("/mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1")
 DEFAULT_HISTORY_CACHE = Path("/mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_v1")
+START_TERMINAL_WINDOW_VARIANTS = (
+    "endpoint_positive",
+    "terminal_one_hold_positive",
+    "terminal_full_hold_positive",
+    "hard_negative",
+    "ordinary_negative",
+    "start_0_negative",
+    "start_15_negative",
+)
 
 
 def _bce(logits: np.ndarray, labels: np.ndarray) -> float:
     return float(np.mean(np.logaddexp(0.0, logits) - labels * logits))
+
+
+def _window_variant(row: Any) -> str:
+    variant = getattr(row, "window_variant", "base")
+    if variant != "base":
+        return str(variant)
+    return {
+        "positive": "endpoint_positive",
+        "hard_negative": "hard_negative",
+        "ordinary_negative": "ordinary_negative",
+        "transition_negative": "transition_negative",
+    }[str(row.sample_kind)]
+
+
+def _variant_metrics(rows: tuple[Any, ...], scores: np.ndarray) -> dict[str, dict[str, float]]:
+    """Summarize every start/terminal pool without changing old metrics."""
+
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if len(rows) != scores.size:
+        raise ValueError(f"variant metrics rows/scores mismatch: {len(rows)}/{scores.shape}")
+    result: dict[str, dict[str, float]] = {}
+    for variant in START_TERMINAL_WINDOW_VARIANTS:
+        selected = np.asarray([_window_variant(row) == variant for row in rows], dtype=np.bool_)
+        values = scores[selected]
+        result[variant] = {
+            "count": float(values.size),
+            "score_mean": float(np.mean(values)) if values.size else math.nan,
+        }
+    return result
 
 
 def _metrics(rows: tuple[Any, ...], logits: np.ndarray) -> dict[str, float]:
@@ -32,20 +70,23 @@ def _metrics(rows: tuple[Any, ...], logits: np.ndarray) -> dict[str, float]:
     scores = temporal_metrics.stable_sigmoid(logits)
     ranking = temporal_metrics.binary_ranking_metrics(labels, scores)
     positive = labels == 1
-    hard = np.asarray([row.sample_kind == "hard_negative" for row in rows], dtype=np.bool_)
-    ordinary = np.asarray([row.sample_kind == "ordinary_negative" for row in rows], dtype=np.bool_)
-    paired: list[tuple[float, float]] = []
+    variants = [_window_variant(row) for row in rows]
+    hard = np.asarray([variant == "hard_negative" for variant in variants], dtype=np.bool_)
+    ordinary = np.asarray([variant == "ordinary_negative" for variant in variants], dtype=np.bool_)
     events: dict[tuple[str, int, int], dict[str, float]] = {}
     for row, score in zip(rows, scores, strict=True):
         key = (str(row.trajectory_id), int(row.task_index), int(row.boundary_tick))
         values = events.setdefault(key, {})
-        if row.sample_kind == "positive":
+        variant = _window_variant(row)
+        if variant == "endpoint_positive":
             values["positive"] = float(score)
-        elif row.sample_kind == "hard_negative":
+        elif variant == "hard_negative":
             values["hard"] = float(score)
-    for values in events.values():
-        if "positive" in values and "hard" in values:
-            paired.append((values["positive"], values["hard"]))
+    paired = [
+        (values["positive"], values["hard"])
+        for values in events.values()
+        if "positive" in values and "hard" in values
+    ]
     margins = np.asarray([positive_score - hard_score for positive_score, hard_score in paired], dtype=np.float64)
     return {
         "sample_count": float(ranking["sample_count"]),
@@ -62,6 +103,11 @@ def _metrics(rows: tuple[Any, ...], logits: np.ndarray) -> dict[str, float]:
         ),
         "positive_hard_margin_mean": float(np.mean(margins)) if margins.size else math.nan,
         "positive_hard_margin_median": float(np.median(margins)) if margins.size else math.nan,
+        "endpoint_hard_paired_ordering_accuracy": (
+            float(np.mean([positive_score > hard_score for positive_score, hard_score in paired])) if paired else math.nan
+        ),
+        "endpoint_hard_margin_mean": float(np.mean(margins)) if margins.size else math.nan,
+        "endpoint_hard_margin_median": float(np.median(margins)) if margins.size else math.nan,
     }
 
 
@@ -175,6 +221,7 @@ def evaluate(args: argparse.Namespace) -> Path:
         expected_base_cache_path=base_cache_path,
         expected_checkpoint_path=config.completion.raw_prefix_source_checkpoint_path,
         expected_model_config_name=config.completion.raw_prefix_source_model_config_name,
+        expected_sampling_protocol=config.completion.temporal_raw_prefix_sampling_protocol,
     )
     checkpoint = args.checkpoint.resolve()
     if not (checkpoint / "params").is_dir():
@@ -213,6 +260,7 @@ def evaluate(args: argparse.Namespace) -> Path:
             "source_episode_id": row.source_episode_ids[-1],
             "source_frame_index": row.source_frame_indices[-1],
             "sample_kind": row.sample_kind,
+            "window_variant": _window_variant(row),
             "target": row.label,
             "logit": float(logit),
             "sigmoid_score": float(score),
@@ -226,11 +274,13 @@ def evaluate(args: argparse.Namespace) -> Path:
         "raw_prefix_cache": str(base_cache_path),
         "raw_prefix_base_cache": str(base_cache_path),
         "temporal_raw_prefix_history_cache": str(history_cache_path),
+        "sampling_protocol": cache.metadata.sampling_protocol,
         "split": args.split,
         "metrics": {
             "overall": overall,
             "macro_task_auprc": float(np.mean(finite_task_auprc)) if finite_task_auprc else math.nan,
             "per_task": per_task,
+            "variant_metrics": _variant_metrics(rows, scores),
         },
         "predictions_path": str(predictions_path),
     }

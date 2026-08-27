@@ -131,6 +131,36 @@ def test_temporal_raw_prefix_completion_config_matches_locked_scheme():
     assert isinstance(temporal_raw.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
 
 
+def test_start_terminal_temporal_raw_prefix_config_uses_independent_seven_pool_protocol():
+    clean = config.get_config("pi05_730_breakfast_subtasks")
+    start_terminal = config.get_config("pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head")
+
+    assert start_terminal.data.repo_id == clean.data.repo_id
+    assert start_terminal.model.completion_head.variant == "temporal_raw_prefix_decoder"
+    assert start_terminal.completion.uses_temporal_raw_prefix_start_terminal
+    assert start_terminal.completion.temporal_raw_prefix_sampling_protocol == "start_terminal"
+    assert (
+        start_terminal.completion.temporal_raw_prefix_endpoint_positive_per_batch,
+        start_terminal.completion.temporal_raw_prefix_terminal_one_hold_positive_per_batch,
+        start_terminal.completion.temporal_raw_prefix_terminal_full_hold_positive_per_batch,
+        start_terminal.completion.temporal_raw_prefix_hard_negative_per_batch,
+        start_terminal.completion.temporal_raw_prefix_ordinary_negative_per_batch,
+        start_terminal.completion.temporal_raw_prefix_start_0_negative_per_batch,
+        start_terminal.completion.temporal_raw_prefix_start_15_negative_per_batch,
+    ) == (16, 8, 8, 16, 8, 4, 4)
+    assert start_terminal.completion.raw_prefix_transition_negative_per_batch == 0
+    assert start_terminal.completion.temporal_raw_prefix_history_path.endswith(
+        "evaluations/temporal_raw_prefix_history_start_terminal_v1"
+    )
+    assert start_terminal.batch_size == 64
+    assert start_terminal.num_train_steps == 4_000
+    assert start_terminal.ema_decay is None
+    assert start_terminal.completion.bce_pos_weight_override == 1.0
+    assert start_terminal.completion.focal_gamma == 0.0
+    assert start_terminal.weight_loader.params_path.endswith("breakfast_subtasks_bs64_50k/49999/params")
+    assert isinstance(start_terminal.freeze_filter, pi0_config.FreezeAllExceptCompletionFilter)
+
+
 def test_temporal_history_carry_config_uses_balanced_transition_batch():
     carry = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_head")
     carry_posweight2 = config.get_config(

@@ -27,7 +27,18 @@ SPLIT_RATIOS: Mapping[str, float] = {"train": 0.72, "val": 0.08, "test": 0.20}
 SplitName = Literal["train", "val", "test"]
 SPLIT_NAMES: tuple[SplitName, ...] = ("train", "val", "test")
 SampleKind = Literal["positive", "hard_negative", "ordinary_negative", "transition_negative"]
-SamplingProtocol = Literal["subtask_local", "history_carry"]
+WindowVariant = Literal[
+    "base",
+    "endpoint_positive",
+    "terminal_one_hold_positive",
+    "terminal_full_hold_positive",
+    "hard_negative",
+    "ordinary_negative",
+    "start_0_negative",
+    "start_15_negative",
+    "transition_negative",
+]
+SamplingProtocol = Literal["subtask_local", "history_carry", "start_terminal"]
 MappingStatus = Literal["matched", "subtask_only", "full_only", "ambiguous"]
 TrajectorySource = Literal["subtask_logical", "full_identity"]
 
@@ -954,6 +965,9 @@ class TemporalSampleRow:
     source_episode_ids: tuple[int, int, int]
     source_frame_indices: tuple[int, int, int]
     terminal_hold_flags: tuple[bool, bool, bool]
+    # ``base`` is deliberately the default so rows serialized by the existing
+    # current/temporal caches remain byte-for-byte compatible in meaning.
+    window_variant: WindowVariant = "base"
 
     @property
     def subtask_episode_id(self) -> int:
@@ -971,6 +985,19 @@ class TemporalSampleRow:
             return (self.task_index - 1, self.task_index - 1, self.task_index)
         return (self.task_index - 1, self.task_index, self.task_index)
 
+    @property
+    def effective_window_variant(self) -> WindowVariant:
+        """Returns the explicit variant, or the old kind-derived variant."""
+
+        if self.window_variant != "base":
+            return self.window_variant
+        return {
+            "positive": "endpoint_positive",
+            "hard_negative": "hard_negative",
+            "ordinary_negative": "ordinary_negative",
+            "transition_negative": "transition_negative",
+        }[self.sample_kind]
+
     def __post_init__(self) -> None:
         if not self.trajectory_id or self.full_episode_id < 0:
             raise ValueError("sample requires a valid trajectory and full episode identity")
@@ -978,6 +1005,18 @@ class TemporalSampleRow:
             raise ValueError(f"sample has invalid split {self.split!r}")
         if self.sample_kind not in ("positive", "hard_negative", "ordinary_negative", "transition_negative"):
             raise ValueError(f"sample has invalid sample_kind {self.sample_kind!r}")
+        if self.window_variant not in (
+            "base",
+            "endpoint_positive",
+            "terminal_one_hold_positive",
+            "terminal_full_hold_positive",
+            "hard_negative",
+            "ordinary_negative",
+            "start_0_negative",
+            "start_15_negative",
+            "transition_negative",
+        ):
+            raise ValueError(f"sample has invalid window_variant {self.window_variant!r}")
         if self.task_index not in range(TASKS_PER_TRAJECTORY) or self.prompt_index != self.task_index:
             raise ValueError("sample prompt_index must equal its logical task_index")
         if any(
@@ -994,7 +1033,8 @@ class TemporalSampleRow:
             raise ValueError("sample history/source indices must be non-negative")
         if self.sample_kind != "transition_negative" and any(value < 0 for value in self.history_logical_ticks):
             raise ValueError("sample history/source indices must be non-negative")
-        if self.boundary_tick < 0 or self.logical_tick > self.boundary_tick:
+        is_terminal_positive = self.window_variant in ("terminal_one_hold_positive", "terminal_full_hold_positive")
+        if self.boundary_tick < 0 or (not is_terminal_positive and self.logical_tick > self.boundary_tick):
             raise ValueError("sample logical_tick must not occur after its non-negative boundary_tick")
         if self.label not in (0, 1):
             raise ValueError("sample label must be binary")
@@ -1009,20 +1049,85 @@ class TemporalSampleRow:
         if gaps != (TICK_STRIDE_FRAMES, TICK_STRIDE_FRAMES):
             raise ValueError(f"sample history gaps must be (15, 15), got {gaps}")
         is_transition = self.sample_kind == "transition_negative"
+        expected_kind_by_variant = {
+            "endpoint_positive": "positive",
+            "terminal_one_hold_positive": "positive",
+            "terminal_full_hold_positive": "positive",
+            "hard_negative": "hard_negative",
+            "ordinary_negative": "ordinary_negative",
+            "start_0_negative": "ordinary_negative",
+            "start_15_negative": "ordinary_negative",
+            "transition_negative": "transition_negative",
+        }
+        if self.window_variant != "base" and self.sample_kind != expected_kind_by_variant[self.window_variant]:
+            raise ValueError(
+                f"sample window_variant {self.window_variant!r} is inconsistent with sample_kind {self.sample_kind!r}"
+            )
+        if self.window_variant in ("terminal_one_hold_positive", "terminal_full_hold_positive"):
+            if self.sample_kind != "positive" or self.label != 1:
+                raise ValueError("terminal positive windows must have sample_kind='positive' and label 1")
+            if self.window_variant == "terminal_one_hold_positive":
+                expected_history = (
+                    self.boundary_tick - TICK_STRIDE_FRAMES,
+                    self.boundary_tick,
+                    self.boundary_tick + TICK_STRIDE_FRAMES,
+                )
+                expected_frames = (
+                    self.boundary_tick - TICK_STRIDE_FRAMES,
+                    self.boundary_tick,
+                    self.boundary_tick,
+                )
+                expected_flags = (False, False, True)
+            else:
+                expected_history = (
+                    self.boundary_tick,
+                    self.boundary_tick + TICK_STRIDE_FRAMES,
+                    self.boundary_tick + 2 * TICK_STRIDE_FRAMES,
+                )
+                expected_frames = (self.boundary_tick,) * TEMPORAL_HISTORY_STEPS
+                expected_flags = (False, True, True)
+            if self.logical_tick != expected_history[-1]:
+                raise ValueError("terminal positive logical_tick must be the final logical history tick")
+            if self.history_logical_ticks != expected_history:
+                raise ValueError(f"terminal positive history has the wrong logical ticks: {self.history_logical_ticks}")
+            if self.source_frame_indices != expected_frames or self.terminal_hold_flags != expected_flags:
+                raise ValueError("terminal positive source frames/hold flags do not match the fixed hold protocol")
+        elif self.window_variant == "start_0_negative":
+            expected_history = (0, TICK_STRIDE_FRAMES, 2 * TICK_STRIDE_FRAMES)
+            if self.boundary_tick < 4 * TICK_STRIDE_FRAMES or self.logical_tick != expected_history[-1]:
+                raise ValueError("start_0_negative requires E-30 >= 30 and logical ticks [0, 15, 30]")
+            if self.history_logical_ticks != expected_history or self.source_frame_indices != expected_history:
+                raise ValueError("start_0_negative must use source/history frames [0, 15, 30]")
+            if self.label != 0 or any(self.terminal_hold_flags):
+                raise ValueError("start_0_negative must be an unheld negative window")
+        elif self.window_variant == "start_15_negative":
+            expected_history = (TICK_STRIDE_FRAMES, 2 * TICK_STRIDE_FRAMES, 3 * TICK_STRIDE_FRAMES)
+            if self.boundary_tick < 5 * TICK_STRIDE_FRAMES or self.logical_tick != expected_history[-1]:
+                raise ValueError("start_15_negative requires E-45 >= 30 and logical ticks [15, 30, 45]")
+            if self.history_logical_ticks != expected_history or self.source_frame_indices != expected_history:
+                raise ValueError("start_15_negative must use source/history frames [15, 30, 45]")
+            if self.label != 0 or any(self.terminal_hold_flags):
+                raise ValueError("start_15_negative must be an unheld negative window")
         if not is_transition:
             if len(set(self.source_episode_ids)) != 1:
                 raise ValueError("all three temporal references must belong to one subtask episode")
             if any(frame > self.boundary_tick for frame in self.source_frame_indices):
                 raise ValueError("temporal source frame exceeds the subtask completion frame")
         distance = self.boundary_tick - self.logical_tick
-        if self.sample_kind == "positive":
+        if self.window_variant in ("terminal_one_hold_positive", "terminal_full_hold_positive"):
+            pass
+        elif self.sample_kind == "positive":
             if self.logical_tick != self.boundary_tick or self.label != 1:
                 raise ValueError("positive sample must be the inclusive endpoint and have label 1")
         elif self.sample_kind == "hard_negative":
             if distance != TICK_STRIDE_FRAMES or self.label != 0:
                 raise ValueError("hard negative must be exactly 15 frames before E and have label 0")
-        elif self.sample_kind == "ordinary_negative" and (
-            self.label != 0 or distance < 2 * TICK_STRIDE_FRAMES or distance % TICK_STRIDE_FRAMES
+        elif (
+            self.sample_kind == "ordinary_negative"
+            and self.window_variant not in ("start_0_negative", "start_15_negative")
+            and (
+                self.label != 0 or distance < 2 * TICK_STRIDE_FRAMES or distance % TICK_STRIDE_FRAMES
+            )
         ):
             raise ValueError("ordinary negative must be E-30, E-45, ... and have label 0")
         if is_transition:
@@ -1049,6 +1154,13 @@ class TemporalSampleRow:
                 raise ValueError(f"transition history must use fixed carry slots, got {self.history_logical_ticks}")
             if self.source_episode_ids != expected_ids or self.source_frame_indices != expected_frames:
                 raise ValueError("transition source episodes/frames do not match its step")
+        elif self.window_variant in (
+            "terminal_one_hold_positive",
+            "terminal_full_hold_positive",
+            "start_0_negative",
+            "start_15_negative",
+        ):
+            pass
         else:
             expected_history = (
                 self.logical_tick - 2 * TICK_STRIDE_FRAMES,
@@ -1059,7 +1171,9 @@ class TemporalSampleRow:
                 raise ValueError(f"history must be [t-30, t-15, t], got {self.history_logical_ticks}")
             if self.source_frame_indices != expected_history:
                 raise ValueError("source frame indices must equal the local subtask history frames")
-        if any(self.terminal_hold_flags):
+        if self.window_variant not in ("terminal_one_hold_positive", "terminal_full_hold_positive") and any(
+            self.terminal_hold_flags
+        ):
             raise ValueError("subtask temporal samples do not use terminal holds")
 
 
@@ -1132,6 +1246,144 @@ def build_temporal_sample_rows(
     return tuple(rows)
 
 
+def build_start_terminal_sample_rows(
+    group: SubtaskGroupRecord,
+    *,
+    trajectory_id: str,
+    full_episode_id: int,
+    split: SplitName,
+) -> tuple[TemporalSampleRow, ...]:
+    """Build the independent start/terminal raw-prefix candidate protocol.
+
+    The three positive variants are intentionally separate rows for the same
+    completion event: the endpoint window, one terminal hold, and a full
+    terminal hold.  Start negatives are fixed windows from the beginning of a
+    subtask and are removed from the ordinary reverse pool when the windows
+    would otherwise be identical.
+    """
+
+    if split not in SPLIT_NAMES:
+        raise ValueError(f"invalid split {split!r}")
+    rows: list[TemporalSampleRow] = []
+    for task_index in range(TASKS_PER_TRAJECTORY):
+        episode_id = group.source_episode_ids[task_index]
+        end_frame = group.lengths[task_index] - 1
+        if end_frame < 3 * TICK_STRIDE_FRAMES:
+            continue
+
+        def add_local_row(
+            current_frame: int,
+            sample_kind: SampleKind,
+            label: int,
+            window_variant: WindowVariant,
+            *,
+            _task_index: int = task_index,
+            _end_frame: int = end_frame,
+            _episode_id: int = episode_id,
+        ) -> None:
+            history_frames = (
+                current_frame - 2 * TICK_STRIDE_FRAMES,
+                current_frame - TICK_STRIDE_FRAMES,
+                current_frame,
+            )
+            rows.append(
+                TemporalSampleRow(
+                    trajectory_id=trajectory_id,
+                    full_episode_id=full_episode_id,
+                    task_index=_task_index,
+                    split=split,
+                    logical_tick=current_frame,
+                    label=label,
+                    sample_kind=sample_kind,
+                    boundary_tick=_end_frame,
+                    prompt_index=_task_index,
+                    history_logical_ticks=history_frames,
+                    source_episode_ids=(_episode_id, _episode_id, _episode_id),
+                    source_frame_indices=history_frames,
+                    terminal_hold_flags=(False, False, False),
+                    window_variant=window_variant,
+                )
+            )
+
+        # Endpoint positive and its same-event fixed hard negative.
+        add_local_row(end_frame, "positive", 1, "endpoint_positive")
+
+        # Terminal positives keep source frames at or before E while their
+        # logical clock advances into the terminal hold.
+        rows.append(
+            TemporalSampleRow(
+                trajectory_id=trajectory_id,
+                full_episode_id=full_episode_id,
+                task_index=task_index,
+                split=split,
+                logical_tick=end_frame + TICK_STRIDE_FRAMES,
+                label=1,
+                sample_kind="positive",
+                boundary_tick=end_frame,
+                prompt_index=task_index,
+                history_logical_ticks=(
+                    end_frame - TICK_STRIDE_FRAMES,
+                    end_frame,
+                    end_frame + TICK_STRIDE_FRAMES,
+                ),
+                source_episode_ids=(episode_id, episode_id, episode_id),
+                source_frame_indices=(end_frame - TICK_STRIDE_FRAMES, end_frame, end_frame),
+                terminal_hold_flags=(False, False, True),
+                window_variant="terminal_one_hold_positive",
+            )
+        )
+        rows.append(
+            TemporalSampleRow(
+                trajectory_id=trajectory_id,
+                full_episode_id=full_episode_id,
+                task_index=task_index,
+                split=split,
+                logical_tick=end_frame + 2 * TICK_STRIDE_FRAMES,
+                label=1,
+                sample_kind="positive",
+                boundary_tick=end_frame,
+                prompt_index=task_index,
+                history_logical_ticks=(
+                    end_frame,
+                    end_frame + TICK_STRIDE_FRAMES,
+                    end_frame + 2 * TICK_STRIDE_FRAMES,
+                ),
+                source_episode_ids=(episode_id, episode_id, episode_id),
+                source_frame_indices=(end_frame, end_frame, end_frame),
+                terminal_hold_flags=(False, True, True),
+                window_variant="terminal_full_hold_positive",
+            )
+        )
+
+        add_local_row(end_frame - TICK_STRIDE_FRAMES, "hard_negative", 0, "hard_negative")
+
+        start_windows: dict[tuple[int, int, int], WindowVariant] = {}
+        if end_frame - 2 * TICK_STRIDE_FRAMES >= 2 * TICK_STRIDE_FRAMES:
+            start_windows[(0, TICK_STRIDE_FRAMES, 2 * TICK_STRIDE_FRAMES)] = "start_0_negative"
+        if end_frame - 3 * TICK_STRIDE_FRAMES >= 2 * TICK_STRIDE_FRAMES:
+            start_windows[(TICK_STRIDE_FRAMES, 2 * TICK_STRIDE_FRAMES, 3 * TICK_STRIDE_FRAMES)] = (
+                "start_15_negative"
+            )
+
+        # Reverse ordinary negatives retain the old E-30, E-45, ... pool,
+        # except for exact start windows which belong only to their start pool.
+        current_frame = end_frame - 2 * TICK_STRIDE_FRAMES
+        while current_frame >= 2 * TICK_STRIDE_FRAMES:
+            history = (
+                current_frame - 2 * TICK_STRIDE_FRAMES,
+                current_frame - TICK_STRIDE_FRAMES,
+                current_frame,
+            )
+            if history not in start_windows:
+                add_local_row(current_frame, "ordinary_negative", 0, "ordinary_negative")
+            current_frame -= TICK_STRIDE_FRAMES
+
+        for history, window_variant in start_windows.items():
+            add_local_row(history[-1], "ordinary_negative", 0, window_variant)
+
+    return tuple(rows)
+
+
 def build_history_carry_transition_rows(
     group: SubtaskGroupRecord,
     *,
@@ -1201,7 +1453,7 @@ def build_manifest_sample_rows(
     validate_temporal_manifest(manifest)
     if split not in SPLIT_NAMES:
         raise ValueError(f"invalid split {split!r}")
-    if sampling_protocol not in ("subtask_local", "history_carry"):
+    if sampling_protocol not in ("subtask_local", "history_carry", "start_terminal"):
         raise ValueError(f"unsupported temporal sampling protocol {sampling_protocol!r}")
     rows: list[TemporalSampleRow] = []
     for record in manifest.trajectories:
@@ -1210,14 +1462,24 @@ def build_manifest_sample_rows(
         trajectory_numeric_id = record.full_episode_id if record.full_episode_id is not None else record.group_id
         assert trajectory_numeric_id is not None
         group = record.as_group()
-        rows.extend(
-            build_temporal_sample_rows(
-                group,
-                trajectory_id=record.trajectory_id,
-                full_episode_id=trajectory_numeric_id,
-                split=split,
+        if sampling_protocol == "start_terminal":
+            rows.extend(
+                build_start_terminal_sample_rows(
+                    group,
+                    trajectory_id=record.trajectory_id,
+                    full_episode_id=trajectory_numeric_id,
+                    split=split,
+                )
             )
-        )
+        else:
+            rows.extend(
+                build_temporal_sample_rows(
+                    group,
+                    trajectory_id=record.trajectory_id,
+                    full_episode_id=trajectory_numeric_id,
+                    split=split,
+                )
+            )
         if sampling_protocol == "history_carry":
             rows.extend(
                 build_history_carry_transition_rows(

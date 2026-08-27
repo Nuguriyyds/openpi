@@ -17,12 +17,12 @@ import openpi.models.model as _model
 import openpi.training.completion as _completion
 import openpi.training.completion_data as _completion_data
 import openpi.training.config as _config
-import openpi.training.raw_prefix_completion_features as _raw_prefix_features
-import openpi.training.temporal_raw_prefix_completion_features as _temporal_raw_prefix_features
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.raw_prefix_completion_features as _raw_prefix_features
 import openpi.training.temporal_completion_data as _temporal_data
 import openpi.training.temporal_completion_features as _temporal_features
 import openpi.training.temporal_completion_sampler as _temporal_sampler
+import openpi.training.temporal_raw_prefix_completion_features as _temporal_raw_prefix_features
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -770,6 +770,7 @@ def prepare_temporal_raw_prefix_completion_data(config: _config.TrainConfig) -> 
         expected_base_cache_path=base_cache_path,
         expected_checkpoint_path=config.completion.raw_prefix_source_checkpoint_path,
         expected_model_config_name=config.completion.raw_prefix_source_model_config_name,
+        expected_sampling_protocol=config.completion.temporal_raw_prefix_sampling_protocol,
     )
     logging.info(
         "Temporal raw-prefix history cache: manifest=%s rows=%d tokens=%d dim=%d extension=%d checkpoint=%s",
@@ -897,7 +898,7 @@ def create_temporal_raw_prefix_data_loader(
     sharding: jax.sharding.Sharding | None = None,
     num_batches: int | None = None,
 ) -> DataLoader[tuple[jax.Array, ...]]:
-    """Creates the fixed 32/16/16/0 three-frame raw-prefix loader."""
+    """Creates the natural eval loader or configured three-frame train sampler."""
 
     if not config.completion.uses_temporal_raw_prefix_completion:
         raise ValueError("temporal raw-prefix loader requires temporal_raw_prefix_sampling=True")
@@ -914,14 +915,31 @@ def create_temporal_raw_prefix_data_loader(
     if split == "train":
         if config.batch_size != 64:
             raise ValueError("temporal raw-prefix completion requires global batch_size=64")
-        batch_sampler = _temporal_sampler.TemporalCompletionBatchSampler(
-            dataset.samples,
-            seed=config.seed,
-            positive_per_batch=config.completion.raw_prefix_positive_per_batch,
-            hard_negative_per_batch=config.completion.raw_prefix_hard_negative_per_batch,
-            ordinary_negative_per_batch=config.completion.raw_prefix_ordinary_negative_per_batch,
-            transition_negative_per_batch=config.completion.raw_prefix_transition_negative_per_batch,
-        )
+        if config.completion.uses_temporal_raw_prefix_start_terminal:
+            batch_sampler = _temporal_sampler.StartTerminalTemporalCompletionBatchSampler(
+                dataset.samples,
+                seed=config.seed,
+                endpoint_positive_per_batch=config.completion.temporal_raw_prefix_endpoint_positive_per_batch,
+                terminal_one_hold_positive_per_batch=(
+                    config.completion.temporal_raw_prefix_terminal_one_hold_positive_per_batch
+                ),
+                terminal_full_hold_positive_per_batch=(
+                    config.completion.temporal_raw_prefix_terminal_full_hold_positive_per_batch
+                ),
+                hard_negative_per_batch=config.completion.temporal_raw_prefix_hard_negative_per_batch,
+                ordinary_negative_per_batch=config.completion.temporal_raw_prefix_ordinary_negative_per_batch,
+                start_0_negative_per_batch=config.completion.temporal_raw_prefix_start_0_negative_per_batch,
+                start_15_negative_per_batch=config.completion.temporal_raw_prefix_start_15_negative_per_batch,
+            )
+        else:
+            batch_sampler = _temporal_sampler.TemporalCompletionBatchSampler(
+                dataset.samples,
+                seed=config.seed,
+                positive_per_batch=config.completion.raw_prefix_positive_per_batch,
+                hard_negative_per_batch=config.completion.raw_prefix_hard_negative_per_batch,
+                ordinary_negative_per_batch=config.completion.raw_prefix_ordinary_negative_per_batch,
+                transition_negative_per_batch=config.completion.raw_prefix_transition_negative_per_batch,
+            )
         repeat = True
         drop_last = True
     else:

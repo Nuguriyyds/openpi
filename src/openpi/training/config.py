@@ -2167,6 +2167,34 @@ _CONFIGS.append(
     )
 )
 
+# Independent seven-pool start/terminal raw-prefix experiment.  Inherit the
+# locked temporal raw-prefix decoder, clean source checkpoint, optimizer, and
+# freeze filter; only the sidecar/protocol namespace and sampler quotas differ.
+_TEMPORAL_RAW_PREFIX_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_agilex_breakfast_temporal_raw_prefix_completion_head"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _TEMPORAL_RAW_PREFIX_CONFIG,
+        name="pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head",
+        completion=dataclasses.replace(
+            _TEMPORAL_RAW_PREFIX_CONFIG.completion,
+            temporal_raw_prefix_history_path=(
+                "/mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_start_terminal_v1"
+            ),
+            temporal_raw_prefix_sampling_protocol="start_terminal",
+            temporal_raw_prefix_endpoint_positive_per_batch=16,
+            temporal_raw_prefix_terminal_one_hold_positive_per_batch=8,
+            temporal_raw_prefix_terminal_full_hold_positive_per_batch=8,
+            temporal_raw_prefix_hard_negative_per_batch=16,
+            temporal_raw_prefix_ordinary_negative_per_batch=8,
+            temporal_raw_prefix_start_0_negative_per_batch=4,
+            temporal_raw_prefix_start_15_negative_per_batch=4,
+            raw_prefix_transition_negative_per_batch=0,
+        ),
+    )
+)
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

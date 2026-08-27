@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from openpi.training import raw_prefix_completion_features as raw_features
@@ -7,12 +9,12 @@ from openpi.training import temporal_completion_data as temporal_data
 from openpi.training import temporal_raw_prefix_completion_features as temporal_raw_features
 
 
-def _manifest(tmp_path):
+def _manifest(tmp_path, *, length: int = 60):
     episodes = tuple(
         temporal_data.SubtaskEpisodeRecord(
             episode_id=group_id * 4 + task_index,
             task_index=task_index,
-            length=60,
+            length=length,
         )
         for group_id in range(10)
         for task_index in range(4)
@@ -179,6 +181,81 @@ def test_temporal_raw_prefix_history_reuses_base_and_indexes_missing_extension(t
     assert batch_values.shape == (len(batch_indices), 3, 3, 4)
     assert batch_values.dtype == np.float16
     assert batch_masks.shape == (len(batch_indices), 3, 3)
+
+    legacy_metadata = json.loads((history_path / "metadata.json").read_text(encoding="utf-8"))
+    legacy_metadata.pop("sampling_protocol")
+    legacy_loaded_metadata = temporal_raw_features.TemporalRawPrefixHistoryCacheMetadata.from_json(
+        json.dumps(legacy_metadata)
+    )
+    assert legacy_loaded_metadata.sampling_protocol == "subtask_local"
+
+
+def test_start_terminal_history_sidecar_reuses_terminal_slots_and_seals_protocol(tmp_path):
+    manifest = _manifest(tmp_path, length=100)
+    base_rows = raw_features.manifest_rows(manifest)
+    prefix_out = np.arange(len(base_rows) * 3 * 4, dtype=np.float32).reshape(len(base_rows), 3, 4)
+    prefix_mask = np.ones((len(base_rows), 3), dtype=np.bool_)
+    base_path = tmp_path / "raw-cache"
+    raw_features.save_raw_prefix_cache(
+        base_path,
+        manifest=manifest,
+        prefix_out=prefix_out,
+        prefix_mask=prefix_mask,
+        prefix_segment_ids=np.asarray([0, 1, 3], dtype=np.int32),
+        prefix_position_ids=np.asarray([0, 0, 0], dtype=np.int32),
+        model_config_name="clean-config",
+        checkpoint_path="/clean/checkpoint",
+    )
+    base_cache = raw_features.load_raw_prefix_cache(base_path, manifest=manifest)
+    plan = temporal_raw_features.build_temporal_raw_prefix_history_plan(
+        manifest,
+        base_cache,
+        sampling_protocol="start_terminal",
+    )
+    expected_rows = temporal_raw_features.manifest_rows(manifest, "start_terminal")
+
+    assert plan.rows == expected_rows
+    assert len(plan.rows) > len(base_rows)
+    assert len(set(plan.missing_keys)) == plan.extension_count
+
+    extension_values = np.arange(plan.extension_count * 3 * 4, dtype=np.float32).reshape(plan.extension_count, 3, 4)
+    extension_masks = np.ones((plan.extension_count, 3), dtype=np.bool_)
+    history_path = tmp_path / "temporal-history-start-terminal"
+    metadata = temporal_raw_features.save_temporal_raw_prefix_history(
+        history_path,
+        manifest=manifest,
+        base_cache=base_cache,
+        plan=plan,
+        extension_prefix_out=extension_values,
+        extension_prefix_mask=extension_masks,
+        base_cache_path=base_path,
+        max_shard_bytes=27,
+        sampling_protocol="start_terminal",
+    )
+    loaded = temporal_raw_features.load_temporal_raw_prefix_history(
+        history_path,
+        manifest=manifest,
+        base_cache=base_cache,
+        expected_base_cache_path=base_path,
+        expected_sampling_protocol="start_terminal",
+    )
+
+    assert metadata.sampling_protocol == "start_terminal"
+    assert loaded.metadata.sampling_protocol == "start_terminal"
+    assert loaded.rows == expected_rows
+    one_hold_index = expected_rows.index(
+        next(row for row in expected_rows if row.window_variant == "terminal_one_hold_positive")
+    )
+    full_hold_index = expected_rows.index(
+        next(row for row in expected_rows if row.window_variant == "terminal_full_hold_positive")
+    )
+    one_hold_values, _ = loaded.features_for_row(one_hold_index)
+    full_hold_values, _ = loaded.features_for_row(full_hold_index)
+    np.testing.assert_array_equal(one_hold_values[1], one_hold_values[2])
+    np.testing.assert_array_equal(full_hold_values[0], full_hold_values[1])
+    np.testing.assert_array_equal(full_hold_values[1], full_hold_values[2])
+    assert any(row.window_variant == "start_0_negative" for row in loaded.rows)
+    assert any(row.window_variant == "start_15_negative" for row in loaded.rows)
 
 
 def test_temporal_raw_prefix_history_writer_streams_batches(tmp_path):

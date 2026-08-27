@@ -188,3 +188,133 @@ CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_completion_semiclosed.py
 ```
 
 本地没有执行上述远程 sidecar 提取、训练、val/test 推理或半闭环评测；这些步骤需要远程数据、checkpoint 和 GPU 1。
+
+## 8. 起始 negative + terminal positive 独立实验
+
+这条实验新增 `start_terminal` protocol，但不改变旧的三帧 raw-prefix 配置、基础 cache 或 history sidecar。它固定使用七个独立样本池：`endpoint_positive`、`terminal_one_hold_positive`、`terminal_full_hold_positive`、`hard_negative`、`ordinary_negative`、`start_0_negative` 和 `start_15_negative`，每个 batch 的数量为 `16/8/8/16/8/4/4`，四个 task 在每个子池内分别均衡；transition pool 为 0。
+
+### 8.1 生成新的 history sidecar
+
+以下命令只读取现有 `current_raw_prefix_tokens_v1`，输出新的 sidecar，不会覆盖旧 sidecar。较小的 shard 上限用于避免挂载盘上的超大临时文件或映射。
+
+```bash
+CUDA_VISIBLE_DEVICES=1 uv run scripts/extract_temporal_raw_prefix_history.py \
+  --config-name pi05_730_breakfast_subtasks \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_730_breakfast_subtasks/breakfast_subtasks_bs64_50k/49999 \
+  --dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json \
+  --base-cache /mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1 \
+  --sampling-protocol start_terminal \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_start_terminal_v1 \
+  --batch-size 16 \
+  --max-shard-bytes 268435456
+```
+
+### 8.2 启动独立 4000-step 训练
+
+```bash
+CUDA_VISIBLE_DEVICES=1 uv run scripts/train.py \
+  pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head \
+  --exp-name temporal_raw_prefix_start_terminal_seed42
+```
+
+预期 checkpoint 目录为：
+
+```text
+/mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head/temporal_raw_prefix_start_terminal_seed42/{200,400,...,4000}
+```
+
+### 8.3 自然 val/test 评测
+
+先逐个 checkpoint 跑自然 `val`，再根据 `metrics.macro_task_auprc` 选择最佳 step。报告中的 `metrics.variant_metrics` 会分别给出七个子池的 `count` 和 `score_mean`；`metrics.overall` 还包含 AUPRC、AUROC、BCE，以及只由 endpoint positive 与配对 hard negative 计算的 ordering/margin。不要在 shell 中写带尖括号的 `<BEST_STEP>`；选定后把它替换为纯数字，例如 `BEST_STEP=2000`。
+
+```bash
+REPORT_DIR=/mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports
+for step in $(seq 200 200 4000); do
+  CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_raw_prefix_completion.py \
+    --config-name pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head \
+    --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head/temporal_raw_prefix_start_terminal_seed42/${step} \
+    --base-cache /mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1 \
+    --history-cache /mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_start_terminal_v1 \
+    --split val \
+    --output ${REPORT_DIR}/temporal_raw_prefix_start_terminal_seed42_step${step}_val.json \
+    --predictions-output ${REPORT_DIR}/temporal_raw_prefix_start_terminal_seed42_step${step}_val_predictions.json \
+    --batch-size 64
+done
+
+BEST_STEP=$(
+  REPORT_DIR="$REPORT_DIR" python3 - <<'PY'
+import glob
+import json
+import math
+import os
+
+scores = []
+for path in glob.glob(os.path.join(os.environ["REPORT_DIR"], "temporal_raw_prefix_start_terminal_seed42_step*_val.json")):
+    with open(path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    score = report.get("metrics", {}).get("macro_task_auprc")
+    if score is not None:
+        score = float(score)
+    if score is not None and math.isfinite(score):
+        step = int(path.rsplit("_step", 1)[1].split("_val.json", 1)[0])
+        scores.append((score, step))
+
+if not scores:
+    raise SystemExit("no valid val reports")
+print(max(scores, key=lambda item: (item[0], -item[1]))[1])
+PY
+)
+echo "BEST_STEP=${BEST_STEP}"
+CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_raw_prefix_completion.py \
+  --config-name pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head/temporal_raw_prefix_start_terminal_seed42/${BEST_STEP} \
+  --base-cache /mnt/data/models/wyt/evaluations/current_raw_prefix_tokens_v1 \
+  --history-cache /mnt/data/models/wyt/evaluations/temporal_raw_prefix_history_start_terminal_v1 \
+  --split test \
+  --output ${REPORT_DIR}/temporal_raw_prefix_start_terminal_seed42_step${BEST_STEP}_test.json \
+  --predictions-output ${REPORT_DIR}/temporal_raw_prefix_start_terminal_seed42_step${BEST_STEP}_test_predictions.json \
+  --batch-size 64
+```
+
+### 8.4 半闭环评测（step 2000 和 step 4000）
+
+半闭环继续使用严格 2 Hz、三帧 history、prompt gating 和 2 秒 timeout。先把 `THRESHOLD` 设置为 val 选出的数值；下面两个输出文件名是新的，不会覆盖旧实验。
+
+```bash
+THRESHOLD=0.6
+
+CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_completion_semiclosed.py \
+  --mode raw_prefix_history \
+  --config-name pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head/temporal_raw_prefix_start_terminal_seed42/2000 \
+  --full-dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730 \
+  --subtask-dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json \
+  --threshold ${THRESHOLD} \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports/temporal_raw_prefix_start_terminal_seed42_step2000_semiclosed.json
+
+CUDA_VISIBLE_DEVICES=1 uv run scripts/evaluate_temporal_completion_semiclosed.py \
+  --mode raw_prefix_history \
+  --config-name pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head \
+  --checkpoint /mnt/data/models/wyt/checkpoints/pi05_agilex_breakfast_temporal_raw_prefix_start_terminal_completion_head/temporal_raw_prefix_start_terminal_seed42/4000 \
+  --full-dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730 \
+  --subtask-dataset-root /mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730 \
+  --manifest /mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json \
+  --threshold ${THRESHOLD} \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports/temporal_raw_prefix_start_terminal_seed42_step4000_semiclosed.json
+```
+
+### 8.5 生成半闭环 HTML 可视化
+
+```bash
+uv run scripts/visualize_temporal_completion_semiclosed.py \
+  --report /mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports/temporal_raw_prefix_start_terminal_seed42_step2000_semiclosed.json \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports/temporal_raw_prefix_start_terminal_seed42_step2000_semiclosed.html
+
+uv run scripts/visualize_temporal_completion_semiclosed.py \
+  --report /mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports/temporal_raw_prefix_start_terminal_seed42_step4000_semiclosed.json \
+  --output /mnt/data/models/wyt/evaluations/temporal_raw_prefix_start_terminal_reports/temporal_raw_prefix_start_terminal_seed42_step4000_semiclosed.html
+```
+
+以上远程 sidecar 提取、训练、自然 val/test 和半闭环命令均未在本地执行。

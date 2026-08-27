@@ -25,6 +25,25 @@ TEMPORAL_TASK_INDICES = (0, 1, 2, 3)
 DEFAULT_TICK_STRIDE_FRAMES = 15
 HARD_NEGATIVE_OFFSETS = (1,)
 _STATE_SCHEMA_VERSION = 1
+START_TERMINAL_WINDOW_VARIANTS = (
+    "endpoint_positive",
+    "terminal_one_hold_positive",
+    "terminal_full_hold_positive",
+    "hard_negative",
+    "ordinary_negative",
+    "start_0_negative",
+    "start_15_negative",
+)
+START_TERMINAL_BATCH_COUNTS = {
+    "endpoint_positive": 16,
+    "terminal_one_hold_positive": 8,
+    "terminal_full_hold_positive": 8,
+    "hard_negative": 16,
+    "ordinary_negative": 8,
+    "start_0_negative": 4,
+    "start_15_negative": 4,
+}
+_START_TERMINAL_STATE_SCHEMA_VERSION = 1
 
 
 class TemporalCompletionSampleMetadata(Protocol):
@@ -69,6 +88,28 @@ class TemporalBatchAudit:
 
 
 @dataclasses.dataclass(frozen=True)
+class StartTerminalBatchAudit:
+    """Composition of one fixed start/terminal training batch.
+
+    ``variant_counts`` and ``task_counts`` intentionally expose the seven
+    pools independently, so a sampler audit cannot hide a pool behind the
+    aggregate positive/negative totals used by the older protocol.
+    """
+
+    variant_counts: dict[str, int]
+    task_counts: dict[str, tuple[int, int, int, int]]
+    transition_negative_count: int = 0
+
+    @property
+    def pool_counts(self) -> dict[str, int]:
+        return dict(self.variant_counts)
+
+    @property
+    def per_task_counts(self) -> dict[str, tuple[int, int, int, int]]:
+        return dict(self.task_counts)
+
+
+@dataclasses.dataclass(frozen=True)
 class _SampleView:
     index: int
     trajectory_id: Hashable
@@ -78,6 +119,7 @@ class _SampleView:
     label: int
     sample_kind: TemporalSampleKind
     boundary_tick: int
+    window_variant: str = "base"
 
     @property
     def event_key(self) -> CompletionEventKey:
@@ -96,6 +138,12 @@ def _read_field(sample: TemporalSampleLike, name: str, *, index: int) -> object:
         raise ValueError(f"temporal sample {index} is missing required field {name!r}") from exc
 
 
+def _read_optional_field(sample: TemporalSampleLike, name: str, *, default: object) -> object:
+    if isinstance(sample, Mapping):
+        return sample.get(name, default)
+    return getattr(sample, name, default)
+
+
 def _normalise_sample_kind(value: object, *, index: int) -> TemporalSampleKind:
     if not isinstance(value, str):
         enum_value = getattr(value, "value", None)
@@ -103,6 +151,17 @@ def _normalise_sample_kind(value: object, *, index: int) -> TemporalSampleKind:
             value = enum_value
     if value not in ("positive", "hard_negative", "ordinary_negative", "transition_negative"):
         raise ValueError(f"temporal sample {index} has unsupported sample_kind {value!r}")
+    return value
+
+
+def _normalise_window_variant(value: object, *, index: int) -> str:
+    if not isinstance(value, str):
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, str):
+            value = enum_value
+    allowed = {"base", *START_TERMINAL_WINDOW_VARIANTS, "transition_negative"}
+    if value not in allowed:
+        raise ValueError(f"temporal sample {index} has unsupported window_variant {value!r}")
     return value
 
 
@@ -124,6 +183,10 @@ def _normalise_sample(sample: TemporalSampleLike, *, index: int) -> _SampleView:
     if raw_label not in (0.0, 1.0):
         raise ValueError(f"temporal sample {index} label must be exactly 0 or 1, got {raw_label!r}")
     sample_kind = _normalise_sample_kind(_read_field(sample, "sample_kind", index=index), index=index)
+    window_variant = _normalise_window_variant(
+        _read_optional_field(sample, "window_variant", default="base"),
+        index=index,
+    )
     split = _read_field(sample, "split", index=index)
     if split != "train":
         raise ValueError(f"temporal train sampler accepts only split='train', got {split!r} at sample {index}")
@@ -140,6 +203,147 @@ def _normalise_sample(sample: TemporalSampleLike, *, index: int) -> _SampleView:
         label=label,
         sample_kind=sample_kind,
         boundary_tick=boundary_tick,
+        window_variant=window_variant,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _StartTerminalSampleView:
+    view: _SampleView
+    source_episode_ids: tuple[int, int, int]
+    source_frame_indices: tuple[int, int, int]
+    prompt_index: int
+
+    @property
+    def event_key(self) -> CompletionEventKey:
+        return self.view.event_key
+
+
+def _normalise_triplet(value: object, *, name: str, index: int, cast: type = int) -> tuple[object, object, object]:
+    try:
+        values = tuple(cast(item) for item in value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"temporal sample {index} field {name!r} must be a three-value sequence") from exc
+    if len(values) != 3:
+        raise ValueError(f"temporal sample {index} field {name!r} must contain exactly three values")
+    return values  # type: ignore[return-value]
+
+
+def _normalise_start_terminal_sample(sample: TemporalSampleLike, *, index: int) -> _StartTerminalSampleView:
+    view = _normalise_sample(sample, index=index)
+    if view.window_variant not in START_TERMINAL_WINDOW_VARIANTS:
+        raise ValueError(
+            "start_terminal sampler accepts only the seven explicit window variants; "
+            f"sample {index} has {view.window_variant!r}"
+        )
+    expected_kind = {
+        "endpoint_positive": "positive",
+        "terminal_one_hold_positive": "positive",
+        "terminal_full_hold_positive": "positive",
+        "hard_negative": "hard_negative",
+        "ordinary_negative": "ordinary_negative",
+        "start_0_negative": "ordinary_negative",
+        "start_15_negative": "ordinary_negative",
+    }[view.window_variant]
+    if view.sample_kind != expected_kind:
+        raise ValueError(
+            f"start_terminal sample {index} variant {view.window_variant!r} has sample_kind {view.sample_kind!r}"
+        )
+    if view.boundary_tick < 0 or (
+        view.window_variant not in ("terminal_one_hold_positive", "terminal_full_hold_positive")
+        and view.logical_tick > view.boundary_tick
+    ):
+        raise ValueError(f"start_terminal sample {index} has an invalid logical/boundary tick")
+
+    try:
+        prompt_index = operator.index(_read_field(sample, "prompt_index", index=index))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"start_terminal sample {index} has a non-integral prompt_index") from exc
+    if prompt_index != view.task_index:
+        raise ValueError(f"start_terminal sample {index} prompt_index must equal task_index")
+    source_episode_ids = _normalise_triplet(
+        _read_field(sample, "source_episode_ids", index=index),
+        name="source_episode_ids",
+        index=index,
+    )
+    source_frame_indices = _normalise_triplet(
+        _read_field(sample, "source_frame_indices", index=index),
+        name="source_frame_indices",
+        index=index,
+    )
+    history = _normalise_triplet(
+        _read_field(sample, "history_logical_ticks", index=index),
+        name="history_logical_ticks",
+        index=index,
+    )
+    raw_flags = _normalise_triplet(
+        _read_field(sample, "terminal_hold_flags", index=index),
+        name="terminal_hold_flags",
+        index=index,
+        cast=bool,
+    )
+    source_episode_ids = tuple(int(value) for value in source_episode_ids)  # type: ignore[assignment]
+    source_frame_indices = tuple(int(value) for value in source_frame_indices)  # type: ignore[assignment]
+    history = tuple(int(value) for value in history)  # type: ignore[assignment]
+    raw_flags = tuple(bool(value) for value in raw_flags)  # type: ignore[assignment]
+    if any(value < 0 for value in (*source_episode_ids, *source_frame_indices, *history)):
+        raise ValueError(f"start_terminal sample {index} contains negative source/history coordinates")
+    if len(set(source_episode_ids)) != 1:
+        raise ValueError(f"start_terminal sample {index} must use one subtask episode")
+    if any(frame > view.boundary_tick for frame in source_frame_indices):
+        raise ValueError(f"start_terminal sample {index} source frame exceeds its boundary")
+
+    if view.window_variant == "terminal_one_hold_positive":
+        expected_history = (
+            view.boundary_tick - DEFAULT_TICK_STRIDE_FRAMES,
+            view.boundary_tick,
+            view.boundary_tick + DEFAULT_TICK_STRIDE_FRAMES,
+        )
+        expected_frames = (view.boundary_tick - DEFAULT_TICK_STRIDE_FRAMES, view.boundary_tick, view.boundary_tick)
+        expected_flags = (False, False, True)
+    elif view.window_variant == "terminal_full_hold_positive":
+        expected_history = (
+            view.boundary_tick,
+            view.boundary_tick + DEFAULT_TICK_STRIDE_FRAMES,
+            view.boundary_tick + 2 * DEFAULT_TICK_STRIDE_FRAMES,
+        )
+        expected_frames = (view.boundary_tick,) * 3
+        expected_flags = (False, True, True)
+    else:
+        expected_history = (
+            view.logical_tick - 2 * DEFAULT_TICK_STRIDE_FRAMES,
+            view.logical_tick - DEFAULT_TICK_STRIDE_FRAMES,
+            view.logical_tick,
+        )
+        expected_frames = expected_history
+        expected_flags = (False, False, False)
+    if history != expected_history or source_frame_indices != expected_frames or raw_flags != expected_flags:
+        raise ValueError(f"start_terminal sample {index} does not match its fixed window variant")
+    if history[-1] != view.logical_tick:
+        raise ValueError(f"start_terminal sample {index} history must end at logical_tick")
+    if view.window_variant == "start_0_negative" and (
+        view.boundary_tick < 4 * DEFAULT_TICK_STRIDE_FRAMES
+        or history != (0, DEFAULT_TICK_STRIDE_FRAMES, 2 * DEFAULT_TICK_STRIDE_FRAMES)
+    ):
+        raise ValueError("start_0_negative must be eligible at E>=60 and use [0, 15, 30]")
+    if view.window_variant == "start_15_negative" and (
+        view.boundary_tick < 5 * DEFAULT_TICK_STRIDE_FRAMES
+        or history != (DEFAULT_TICK_STRIDE_FRAMES, 2 * DEFAULT_TICK_STRIDE_FRAMES, 3 * DEFAULT_TICK_STRIDE_FRAMES)
+    ):
+        raise ValueError("start_15_negative must be eligible at E>=75 and use [15, 30, 45]")
+    if view.window_variant == "endpoint_positive" and view.logical_tick != view.boundary_tick:
+        raise ValueError("endpoint_positive must end at its completion boundary")
+    if view.window_variant == "hard_negative" and view.boundary_tick - view.logical_tick != DEFAULT_TICK_STRIDE_FRAMES:
+        raise ValueError("hard_negative must be exactly E-15")
+    if view.window_variant == "ordinary_negative":
+        distance = view.boundary_tick - view.logical_tick
+        if distance < 2 * DEFAULT_TICK_STRIDE_FRAMES or distance % DEFAULT_TICK_STRIDE_FRAMES:
+            raise ValueError("ordinary_negative must be E-30, E-45, ...")
+    return _StartTerminalSampleView(
+        view=view,
+        source_episode_ids=source_episode_ids,
+        source_frame_indices=source_frame_indices,
+        prompt_index=prompt_index,
     )
 
 
@@ -492,6 +696,319 @@ class TemporalCompletionBatchSampler:
             raise AssertionError(f"internal history-carry batch size error: {len(indices)}")
         rng.shuffle(indices)
         return [int(index) for index in indices]
+
+    def __iter__(self) -> Iterator[list[int]]:
+        epoch, skip = self._epoch, self._skip_batches
+        self._epoch += 1
+        self._skip_batches = 0
+        for batch_index in range(skip, self._batches_per_epoch):
+            yield self._make_batch(epoch=epoch, batch_index=batch_index)
+
+    def __len__(self) -> int:
+        return self._batches_per_epoch - self._skip_batches
+
+
+class StartTerminalTemporalCompletionBatchSampler:
+    """Task-balanced sampler for the independent start/terminal protocol.
+
+    Endpoint positives are paired only with their same-event hard negatives.
+    The two terminal-positive pools and the three negative pools are sampled
+    independently by task.  If a pool has fewer events than its per-batch
+    quota, deterministic replacement keeps the requested composition intact.
+    """
+
+    def __init__(
+        self,
+        samples: Sequence[TemporalSampleLike],
+        *,
+        seed: int,
+        batches_per_epoch: int | None = None,
+        batch_size: int = TEMPORAL_BATCH_SIZE,
+        tick_stride_frames: int = DEFAULT_TICK_STRIDE_FRAMES,
+        endpoint_positive_per_batch: int = START_TERMINAL_BATCH_COUNTS["endpoint_positive"],
+        terminal_one_hold_positive_per_batch: int = START_TERMINAL_BATCH_COUNTS["terminal_one_hold_positive"],
+        terminal_full_hold_positive_per_batch: int = START_TERMINAL_BATCH_COUNTS["terminal_full_hold_positive"],
+        hard_negative_per_batch: int = START_TERMINAL_BATCH_COUNTS["hard_negative"],
+        ordinary_negative_per_batch: int = START_TERMINAL_BATCH_COUNTS["ordinary_negative"],
+        start_0_negative_per_batch: int = START_TERMINAL_BATCH_COUNTS["start_0_negative"],
+        start_15_negative_per_batch: int = START_TERMINAL_BATCH_COUNTS["start_15_negative"],
+        num_replicas: int = 1,
+        rank: int = 0,
+    ) -> None:
+        if batch_size != TEMPORAL_BATCH_SIZE:
+            raise ValueError(f"start_terminal batch_size must be exactly {TEMPORAL_BATCH_SIZE}")
+        if seed < 0 or tick_stride_frames != DEFAULT_TICK_STRIDE_FRAMES:
+            raise ValueError("start_terminal sampler requires a non-negative seed and 15-frame stride")
+        if num_replicas != 1 or rank != 0:
+            raise ValueError("StartTerminalTemporalCompletionBatchSampler is single-process in this version")
+        if not samples:
+            raise ValueError("start_terminal sampling requires candidate rows")
+        counts = {
+            "endpoint_positive": int(endpoint_positive_per_batch),
+            "terminal_one_hold_positive": int(terminal_one_hold_positive_per_batch),
+            "terminal_full_hold_positive": int(terminal_full_hold_positive_per_batch),
+            "hard_negative": int(hard_negative_per_batch),
+            "ordinary_negative": int(ordinary_negative_per_batch),
+            "start_0_negative": int(start_0_negative_per_batch),
+            "start_15_negative": int(start_15_negative_per_batch),
+        }
+        if counts != START_TERMINAL_BATCH_COUNTS:
+            raise ValueError(f"start_terminal requires batch composition {START_TERMINAL_BATCH_COUNTS}, got {counts}")
+
+        views = tuple(_normalise_start_terminal_sample(sample, index=index) for index, sample in enumerate(samples))
+        self._validate_candidate_rows(views)
+        endpoint_by_event: dict[CompletionEventKey, int] = {}
+        hard_by_event: dict[CompletionEventKey, int] = {}
+        variant_event_rows: dict[str, dict[CompletionEventKey, list[int]]] = {
+            variant: {} for variant in START_TERMINAL_WINDOW_VARIANTS
+        }
+        row_keys: set[tuple[Hashable, int, str, int, int]] = set()
+        ordinary_source_keys: set[tuple[Hashable, int, tuple[int, int, int], tuple[int, int, int], int]] = set()
+        start_source_keys: set[tuple[Hashable, int, tuple[int, int, int], tuple[int, int, int], int]] = set()
+        for item in views:
+            view = item.view
+            row_key = (view.trajectory_id, view.task_index, view.window_variant, view.logical_tick, view.boundary_tick)
+            if row_key in row_keys:
+                raise ValueError(f"duplicate start_terminal candidate row for {row_key!r}")
+            row_keys.add(row_key)
+            event_rows = variant_event_rows[view.window_variant].setdefault(view.event_key, [])
+            event_rows.append(view.index)
+            if view.window_variant == "endpoint_positive":
+                if view.event_key in endpoint_by_event:
+                    raise ValueError(f"duplicate endpoint positive event {view.event_key!r}")
+                endpoint_by_event[view.event_key] = view.index
+            elif view.window_variant == "hard_negative":
+                if view.event_key in hard_by_event:
+                    raise ValueError(f"duplicate hard negative event {view.event_key!r}")
+                hard_by_event[view.event_key] = view.index
+            source_key = (
+                view.trajectory_id,
+                view.task_index,
+                item.source_episode_ids,
+                item.source_frame_indices,
+                item.prompt_index,
+            )
+            if view.window_variant == "ordinary_negative":
+                ordinary_source_keys.add(source_key)
+            elif view.window_variant in ("start_0_negative", "start_15_negative"):
+                start_source_keys.add(source_key)
+
+        overlap = ordinary_source_keys.intersection(start_source_keys)
+        if overlap:
+            raise ValueError("ordinary_negative and start negative pools contain an identical source window")
+        endpoint_events = set(endpoint_by_event)
+        missing_hard = endpoint_events - set(hard_by_event)
+        if missing_hard:
+            raise ValueError(f"every endpoint positive needs its exact hard negative: {sorted(missing_hard, key=repr)!r}")
+        orphan_hard = set(hard_by_event) - endpoint_events
+        if orphan_hard:
+            raise ValueError("every hard negative must have an endpoint positive from the same completion event")
+        for variant, by_event in variant_event_rows.items():
+            if variant in ("endpoint_positive", "hard_negative"):
+                continue
+            orphan = set(by_event) - endpoint_events
+            if orphan:
+                raise ValueError(f"{variant} contains rows without a matching endpoint completion event")
+
+        variant_by_task_event: dict[str, dict[int, tuple[CompletionEventKey, ...]]] = {}
+        for variant, by_event in variant_event_rows.items():
+            variant_by_task_event[variant] = {
+                task: tuple(event for event in by_event if event.task_index == task)
+                for task in TEMPORAL_TASK_INDICES
+            }
+            for task in TEMPORAL_TASK_INDICES:
+                if not variant_by_task_event[variant][task]:
+                    raise ValueError(f"start_terminal pool {variant} has no task {task} events")
+
+        if batches_per_epoch is None:
+            batches_per_epoch = math.ceil(len(endpoint_events) / START_TERMINAL_BATCH_COUNTS["endpoint_positive"])
+        if batches_per_epoch <= 0:
+            raise ValueError("batches_per_epoch must be positive")
+        self._views = tuple(item.view for item in views)
+        self._variant_event_rows = {
+            variant: {event: tuple(indices) for event, indices in by_event.items()}
+            for variant, by_event in variant_event_rows.items()
+        }
+        self._variant_by_task_event = variant_by_task_event
+        self._endpoint_by_event = endpoint_by_event
+        self._hard_by_event = hard_by_event
+        self._counts = dict(counts)
+        self._seed = int(seed)
+        self._batches_per_epoch = int(batches_per_epoch)
+        self._epoch = 0
+        self._skip_batches = 0
+
+    @staticmethod
+    def _validate_candidate_rows(views: Sequence[_StartTerminalSampleView]) -> None:
+        for item in views:
+            view = item.view
+            if view.task_index not in TEMPORAL_TASK_INDICES:
+                raise ValueError(f"invalid start_terminal task_index {view.task_index}")
+            if view.window_variant in ("endpoint_positive", "terminal_one_hold_positive", "terminal_full_hold_positive"):
+                if view.label != 1:
+                    raise ValueError(f"{view.window_variant} must have label 1")
+            elif view.label != 0:
+                raise ValueError(f"{view.window_variant} must have label 0")
+
+    @property
+    def steps_per_epoch(self) -> int:
+        return self._batches_per_epoch
+
+    @property
+    def batch_composition(self) -> dict[str, int]:
+        return dict(self._counts)
+
+    @property
+    def pool_sizes(self) -> dict[str, int]:
+        return {
+            variant: sum(len(indices) for indices in by_event.values())
+            for variant, by_event in self._variant_event_rows.items()
+        }
+
+    @property
+    def pool_event_sizes(self) -> dict[str, int]:
+        return {variant: len(by_event) for variant, by_event in self._variant_event_rows.items()}
+
+    @property
+    def events_without_local_hard(self) -> frozenset[CompletionEventKey]:
+        return frozenset()
+
+    def audit_batch(self, batch: Sequence[int]) -> StartTerminalBatchAudit:
+        indices = [operator.index(index) for index in batch]
+        if len(indices) != TEMPORAL_BATCH_SIZE or any(index < 0 or index >= len(self._views) for index in indices):
+            raise ValueError("start_terminal batch must contain exactly 64 valid candidate indices")
+        selected = [self._views[index] for index in indices]
+        variant_counts = {
+            variant: sum(view.window_variant == variant for view in selected)
+            for variant in START_TERMINAL_WINDOW_VARIANTS
+        }
+        if variant_counts != self._counts:
+            raise ValueError(f"start_terminal batch has composition {variant_counts}, expected {self._counts}")
+        task_counts = {
+            variant: tuple(
+                sum(view.window_variant == variant and view.task_index == task for view in selected)
+                for task in TEMPORAL_TASK_INDICES
+            )
+            for variant in START_TERMINAL_WINDOW_VARIANTS
+        }
+        expected_task_counts = {
+            variant: (count // len(TEMPORAL_TASK_INDICES),) * len(TEMPORAL_TASK_INDICES)
+            for variant, count in self._counts.items()
+        }
+        if task_counts != expected_task_counts:
+            raise ValueError(f"start_terminal batch is not task-balanced: {task_counts}")
+        if any(view.sample_kind == "transition_negative" for view in selected):
+            raise ValueError("start_terminal batches must not contain transition negatives")
+        return StartTerminalBatchAudit(
+            variant_counts=variant_counts,
+            task_counts=task_counts,
+            transition_negative_count=0,
+        )
+
+    @staticmethod
+    def _choose_positions(rng: np.random.Generator, size: int, count: int) -> np.ndarray:
+        if size <= 0:
+            raise ValueError("cannot sample from an empty start_terminal pool")
+        if size >= count:
+            return rng.permutation(size)[:count]
+        return rng.integers(0, size, size=count)
+
+    def _rng(self, *, epoch: int, batch_index: int) -> np.random.Generator:
+        return np.random.default_rng(np.random.SeedSequence([self._seed, epoch, batch_index]))
+
+    def _choose_events(
+        self,
+        rng: np.random.Generator,
+        *,
+        variant: str,
+        task: int,
+        count: int,
+    ) -> list[CompletionEventKey]:
+        events = self._variant_by_task_event[variant][task]
+        positions = self._choose_positions(rng, len(events), count)
+        return [events[int(position)] for position in positions]
+
+    def _choose_one_row_for_event(
+        self,
+        rng: np.random.Generator,
+        *,
+        variant: str,
+        event: CompletionEventKey,
+    ) -> int:
+        indices = self._variant_event_rows[variant][event]
+        return int(indices[int(rng.integers(0, len(indices)))])
+
+    def _make_batch(self, *, epoch: int, batch_index: int) -> list[int]:
+        rng = self._rng(epoch=epoch, batch_index=batch_index)
+        indices: list[int] = []
+        for task in TEMPORAL_TASK_INDICES:
+            endpoint_events = self._choose_events(
+                rng,
+                variant="endpoint_positive",
+                task=task,
+                count=self._counts["endpoint_positive"] // len(TEMPORAL_TASK_INDICES),
+            )
+            for event in endpoint_events:
+                indices.append(self._endpoint_by_event[event])
+                indices.append(self._hard_by_event[event])
+
+            for variant in ("terminal_one_hold_positive", "terminal_full_hold_positive"):
+                indices.extend(
+                    self._choose_one_row_for_event(rng, variant=variant, event=event)
+                    for event in self._choose_events(
+                        rng,
+                        variant=variant,
+                        task=task,
+                        count=self._counts[variant] // len(TEMPORAL_TASK_INDICES),
+                    )
+                )
+
+            for variant in ("ordinary_negative", "start_0_negative", "start_15_negative"):
+                indices.extend(
+                    self._choose_one_row_for_event(rng, variant=variant, event=event)
+                    for event in self._choose_events(
+                        rng,
+                        variant=variant,
+                        task=task,
+                        count=self._counts[variant] // len(TEMPORAL_TASK_INDICES),
+                    )
+                )
+
+        if len(indices) != TEMPORAL_BATCH_SIZE:
+            raise AssertionError(f"internal start_terminal batch size error: {len(indices)}")
+        rng.shuffle(indices)
+        return [int(index) for index in indices]
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self._epoch = int(epoch)
+        self._skip_batches = 0
+
+    def set_skip_batches(self, skip_batches: int) -> None:
+        if skip_batches < 0 or skip_batches > self._batches_per_epoch:
+            raise ValueError(f"skip_batches must be in [0, {self._batches_per_epoch}]")
+        self._skip_batches = int(skip_batches)
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "schema_version": _START_TERMINAL_STATE_SCHEMA_VERSION,
+            "seed": self._seed,
+            "batches_per_epoch": self._batches_per_epoch,
+            "epoch": self._epoch,
+            "skip_batches": self._skip_batches,
+        }
+
+    def load_state_dict(self, state: Mapping[str, int]) -> None:
+        if int(state.get("schema_version", -1)) != _START_TERMINAL_STATE_SCHEMA_VERSION:
+            raise ValueError("unsupported start_terminal sampler state schema_version")
+        if (
+            int(state.get("seed", -1)) != self._seed
+            or int(state.get("batches_per_epoch", -1)) != self._batches_per_epoch
+        ):
+            raise ValueError("start_terminal sampler state does not match this sampler")
+        self.set_epoch(int(state["epoch"]))
+        self.set_skip_batches(int(state["skip_batches"]))
 
     def __iter__(self) -> Iterator[list[int]]:
         epoch, skip = self._epoch, self._skip_batches

@@ -262,13 +262,7 @@ def train_step(
                 if config.completion.bce_pos_weight_override is not None
                 else 1.0
             )
-        elif uses_raw_prefix:
-            pos_weight = (
-                config.completion.bce_pos_weight_override
-                if config.completion.bce_pos_weight_override is not None
-                else 1.0
-            )
-        elif uses_temporal_raw_prefix:
+        elif uses_raw_prefix or uses_temporal_raw_prefix:
             pos_weight = (
                 config.completion.bce_pos_weight_override
                 if config.completion.bce_pos_weight_override is not None
@@ -869,6 +863,18 @@ def evaluate_temporal_completion_loader(
     return metrics, selection
 
 
+def _raw_prefix_window_variant(row: Any) -> str:
+    variant = getattr(row, "window_variant", "base")
+    if variant != "base":
+        return str(variant)
+    return {
+        "positive": "endpoint_positive",
+        "hard_negative": "hard_negative",
+        "ordinary_negative": "ordinary_negative",
+        "transition_negative": "transition_negative",
+    }[str(row.sample_kind)]
+
+
 def raw_prefix_completion_metrics(
     rows: list[Any] | tuple[Any, ...],
     logits: np.ndarray,
@@ -886,24 +892,25 @@ def raw_prefix_completion_metrics(
         group_scores = _temporal_metrics.stable_sigmoid(group_logits)
         ranking = _temporal_metrics.binary_ranking_metrics(labels, group_scores)
         positive_scores = group_scores[labels == 1]
-        hard_scores = group_scores[
-            np.asarray([row.sample_kind == "hard_negative" for row in group_rows], dtype=np.bool_)
-        ]
+        variants = [_raw_prefix_window_variant(row) for row in group_rows]
+        hard_scores = group_scores[np.asarray([variant == "hard_negative" for variant in variants], dtype=np.bool_)]
         ordinary_scores = group_scores[
-            np.asarray([row.sample_kind == "ordinary_negative" for row in group_rows], dtype=np.bool_)
+            np.asarray([variant == "ordinary_negative" for variant in variants], dtype=np.bool_)
         ]
-        paired: list[tuple[float, float]] = []
         events: dict[tuple[str, int, int], dict[str, float]] = {}
         for row, score in zip(group_rows, group_scores, strict=True):
             event = (str(row.trajectory_id), int(row.task_index), int(row.boundary_tick))
             event_values = events.setdefault(event, {})
-            if row.sample_kind == "positive":
+            variant = _raw_prefix_window_variant(row)
+            if variant == "endpoint_positive":
                 event_values["positive"] = float(score)
-            elif row.sample_kind == "hard_negative":
+            elif variant == "hard_negative":
                 event_values["hard"] = float(score)
-        for values in events.values():
-            if "positive" in values and "hard" in values:
-                paired.append((values["positive"], values["hard"]))
+        paired = [
+            (values["positive"], values["hard"])
+            for values in events.values()
+            if "positive" in values and "hard" in values
+        ]
         margins = np.asarray([positive - hard for positive, hard in paired], dtype=np.float64)
         return {
             "sample_count": float(ranking["sample_count"]),
@@ -922,6 +929,11 @@ def raw_prefix_completion_metrics(
             ),
             "positive_hard_margin_mean": float(np.mean(margins)) if margins.size else float("nan"),
             "positive_hard_margin_median": float(np.median(margins)) if margins.size else float("nan"),
+            "endpoint_hard_paired_ordering_accuracy": (
+                float(np.mean([positive > hard for positive, hard in paired])) if paired else float("nan")
+            ),
+            "endpoint_hard_margin_mean": float(np.mean(margins)) if margins.size else float("nan"),
+            "endpoint_hard_margin_median": float(np.median(margins)) if margins.size else float("nan"),
         }
 
     overall = one_group(rows, logits)

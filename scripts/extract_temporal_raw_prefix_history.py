@@ -63,9 +63,17 @@ def _extract_missing_history(
     # Reuse the clean-runtime and prompt/repack checks from the original
     # current-prefix extractor.  The base cache remains read-only.
     try:
-        from scripts.extract_current_raw_prefix_tokens import _resolve_prompts, _validate_clean_runtime, _evaluation_repack
+        from scripts.extract_current_raw_prefix_tokens import (  # noqa: I001, PLC0415
+            _evaluation_repack,
+            _resolve_prompts,
+            _validate_clean_runtime,
+        )
     except ModuleNotFoundError:
-        from extract_current_raw_prefix_tokens import _resolve_prompts, _validate_clean_runtime, _evaluation_repack
+        from extract_current_raw_prefix_tokens import (  # noqa: I001, PLC0415
+            _evaluation_repack,
+            _resolve_prompts,
+            _validate_clean_runtime,
+        )
 
     data_config = _validate_clean_runtime(config, checkpoint=checkpoint, manifest=manifest)
     dataset_root = args.dataset_root.resolve()
@@ -169,7 +177,11 @@ def extract_history(args: argparse.Namespace) -> Path:
         expected_checkpoint_path=str(args.checkpoint.resolve()),
         expected_model_config_name=args.config_name,
     )
-    plan = temporal_raw_features.build_temporal_raw_prefix_history_plan(manifest, base_cache)
+    plan = temporal_raw_features.build_temporal_raw_prefix_history_plan(
+        manifest,
+        base_cache,
+        sampling_protocol=args.sampling_protocol,
+    )
     base_reused_slots = int(np.sum(plan.history_location_kind == temporal_raw_features.BASE_LOCATION))
     print(f"row_count: {plan.row_count}")
     print(f"base_reused_slots: {base_reused_slots}")
@@ -182,6 +194,7 @@ def extract_history(args: argparse.Namespace) -> Path:
         plan=plan,
         base_cache_path=base_cache_path,
         max_shard_bytes=args.max_shard_bytes,
+        sampling_protocol=args.sampling_protocol,
     )
     try:
         _extract_missing_history(args, manifest=manifest, base_cache=base_cache, plan=plan, writer=writer)
@@ -204,6 +217,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hf-lerobot-home", type=Path, default=DEFAULT_HF_LEROBOT_HOME)
     parser.add_argument("--base-cache", type=Path, default=DEFAULT_BASE_CACHE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--sampling-protocol",
+        choices=("subtask_local", "start_terminal"),
+        default="subtask_local",
+        help="history row protocol to materialize (default: subtask_local)",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
         "--max-shard-bytes",
