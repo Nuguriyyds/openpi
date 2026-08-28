@@ -9,18 +9,15 @@
 | Config | `pi05_agilex_breakfast_token_query_completion_head_h768` |
 | Head | hidden dim 768、32 learned queries、12 attention heads、3 transformer layers |
 | 参数量 | 30,350,849（约0.030B） |
-| 训练 | 冻结VLA，只训练done head；batch size 48，2 epochs |
+| 训练 | 冻结VLA，只训练done head；batch size 48，2 epochs，确定性GPU算子 |
 | 推理 | 2Hz，sigmoid阈值0.5 |
 
 最终head-only参数：
 
 ```text
-/home/geek/share3/vla_done/v2/qwen_done_v2/
-qwen_style_done_head_v2_token_query_h768/step_1400_loadable/params
+/home/geek/share3/vla_done/v2/done_head_h768_deterministic_full_seed42_20260828/
+checkpoints/step_001400/params
 ```
-
-目录中的`qwen_done_v2`只是历史实验命名；当前代码和模型均不依赖Qwen模型、
-Qwen仓库或Qwen训练数据目录。
 
 ## 2. 模型结构
 
@@ -112,21 +109,22 @@ norm_stats.json
 ```
 
 Head训练使用BCE loss、AdamW、初始学习率`5e-5`、最终学习率`1e-6`、
-weight decay `0.01`、gradient clip `1.0`。单张A800训练1456步约14分43秒，
+weight decay `0.01`、gradient clip `1.0`。训练入口默认启用OpenXLA确定性GPU算子；
+同一软件和硬件环境下，相同seed可逐参数复现。单张A800训练1456步约15分钟，
 不包含token抽取时间。
 
 验证集开环结果：
 
 | Step | Val loss | Accuracy | Precision | Recall | F1 |
 |---:|---:|---:|---:|---:|---:|
-| 200 | 0.0611 | 0.9713 | 0.6226 | 0.8919 | 0.7333 |
-| 400 | 0.0868 | 0.9590 | 0.5187 | 1.0000 | 0.6831 |
-| 600 | 0.0277 | 0.9900 | 0.9479 | 0.8198 | 0.8792 |
-| 800 | 0.0331 | 0.9857 | 0.7622 | 0.9820 | 0.8583 |
-| 1000 | **0.0215** | **0.9912** | **0.9159** | 0.8829 | 0.8991 |
-| 1200 | 0.0238 | 0.9893 | 0.8134 | **0.9820** | 0.8898 |
-| 1400 | 0.0221 | 0.9904 | 0.8372 | 0.9730 | **0.9000** |
-| 1456 | 0.0235 | 0.9893 | 0.8134 | **0.9820** | 0.8898 |
+| 200 | 0.0822 | 0.9594 | **1.0000** | 0.0811 | 0.1500 |
+| 400 | 0.0423 | 0.9809 | 0.7006 | **0.9910** | 0.8209 |
+| 600 | 0.0311 | 0.9865 | 0.9529 | 0.7297 | 0.8265 |
+| 800 | 0.0361 | 0.9841 | 0.7415 | 0.9820 | 0.8450 |
+| 1000 | **0.0214** | **0.9920** | 0.9027 | 0.9189 | **0.9107** |
+| 1200 | 0.0249 | 0.9889 | 0.8074 | 0.9820 | 0.8862 |
+| 1400 | 0.0222 | 0.9908 | 0.8438 | 0.9730 | 0.9038 |
+| 1456 | 0.0238 | 0.9896 | 0.8244 | 0.9730 | 0.8926 |
 
 Step 1000的val loss最低，但最终按半闭环表现选择step 1400。
 
@@ -137,12 +135,12 @@ Step 1000的val loss最低，但最终按半闭环表现选择step 1400。
 
 | Checkpoint | 准时 | 提前 | 延迟 | 漏检 | 全准时episode |
 |---|---:|---:|---:|---:|---:|
-| step 1400 | **61/72** | 10/72 | 1/72 | 0/72 | **10/18** |
-| step 1456 | 58/72 | 14/72 | 0/72 | 0/72 | 6/18 |
+| step 1400 | **60/72** | 11/72 | 1/72 | 0/72 | **9/18** |
+| step 1456 | 59/72 | 12/72 | 1/72 | 0/72 | 8/18 |
 
 Step 1400的详细误差：
 
-- 10个提前全部只提前15帧，即0.5秒。
+- 11个提前全部只提前15帧，即0.5秒。
 - 唯一延迟只延迟一个2Hz tick，即0.5秒。
 - 72/72子任务均自主切换，18/18 episode完成。
 - prompt mismatch为0。
@@ -150,8 +148,8 @@ Step 1400的详细误差：
 最终报告：
 
 ```text
-/home/geek/share3/vla_done/v2/qwen_done_v2/
-qwen_done_semiclosed_v2_token_query_h768_step1400/report.json
+/home/geek/share3/vla_done/v2/done_head_h768_deterministic_full_seed42_20260828/
+semiclosed_step1400/report.json
 ```
 
 ## 7. 加载方式

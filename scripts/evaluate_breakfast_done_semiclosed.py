@@ -24,9 +24,13 @@ DEFAULT_ANNOTATION_ROOT = Path(
 DEFAULT_DATASET_ROOT = Path("/home/geek/share3/breakfest_data/agilex_make_breakfast_330-2")
 DEFAULT_CHECKPOINT = Path("/home/geek/share3/vla_done/v2/39999")
 DEFAULT_DONE_PARAMS = Path(
-    "/home/geek/share3/vla_done/v2/qwen_done_v2/qwen_style_done_head_v2_token_query_h768/step_1400_loadable/params"
+    "/home/geek/share3/vla_done/v2/done_head_h768_deterministic_full_seed42_20260828/"
+    "checkpoints/step_001400/params"
 )
-DEFAULT_OUTPUT = Path("/home/geek/share3/vla_done/v2/qwen_done_v2/qwen_done_semiclosed_v2_token_query_h768/report.json")
+DEFAULT_OUTPUT = Path(
+    "/home/geek/share3/vla_done/v2/done_head_h768_deterministic_full_seed42_20260828/"
+    "semiclosed_step1400/report.json"
+)
 DEFAULT_CONFIG_NAME = "pi05_agilex_breakfast_token_query_completion_head_h768"
 
 

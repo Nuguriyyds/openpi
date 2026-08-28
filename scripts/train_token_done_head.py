@@ -1,5 +1,7 @@
 """Train the 0.03B token-query done adapter from sharded prefix-token caches."""
 
+# ruff: noqa: E402, I001 -- deterministic XLA flags must be set before JAX imports.
+
 from __future__ import annotations
 
 import argparse
@@ -7,9 +9,30 @@ from collections.abc import Sequence
 import dataclasses
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 from typing import Any
+
+
+_DETERMINISTIC_XLA_FLAGS = (
+    "--xla_gpu_deterministic_ops=true",
+    "--xla_gpu_exclude_nondeterministic_ops=true",
+)
+
+
+def _with_default_deterministic_xla_flags(flags: str) -> str:
+    tokens = flags.split()
+    configured = {token.split("=", maxsplit=1)[0] for token in tokens if token.startswith("--")}
+    for flag in _DETERMINISTIC_XLA_FLAGS:
+        if flag.split("=", maxsplit=1)[0] not in configured:
+            tokens.append(flag)
+    return " ".join(tokens)
+
+
+# XLA reads these flags when JAX initializes, so configure them before importing
+# Flax/JAX. An explicitly supplied value still takes precedence.
+os.environ["XLA_FLAGS"] = _with_default_deterministic_xla_flags(os.environ.get("XLA_FLAGS", ""))
 
 import flax.nnx as nnx
 import jax
@@ -21,7 +44,7 @@ import orbax.checkpoint as ocp
 from openpi.models import completion as completion_model
 
 DEFAULT_TOKEN_CACHE = Path("/home/geek/share3/vla_done/v2/qwen_done_v2/qwen_style_done_tokens_v2_shards")
-DEFAULT_OUTPUT = Path("/home/geek/share3/vla_done/v2/qwen_done_v2/qwen_style_done_head_v2_token_query_h768")
+DEFAULT_OUTPUT = Path("/home/geek/share3/vla_done/v2/done_head_h768_deterministic_full_seed42_20260828")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -287,6 +310,7 @@ def train(args: TrainArgs) -> Path:
 
     serialized_args = dataclasses.asdict(args)
     serialized_args.update(token_cache=str(args.token_cache), output=str(output))
+    serialized_args["xla_flags"] = os.environ["XLA_FLAGS"]
     (output / "training_args.json").write_text(json.dumps(serialized_args, indent=2) + "\n", encoding="utf-8")
     return best_path
 

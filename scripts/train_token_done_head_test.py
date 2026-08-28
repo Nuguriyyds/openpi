@@ -5,6 +5,22 @@ import numpy as np
 from scripts import train_token_done_head
 
 
+def test_deterministic_xla_flags_are_enabled_by_default():
+    flags = train_token_done_head._with_default_deterministic_xla_flags("--existing_flag=true")  # noqa: SLF001
+
+    assert "--existing_flag=true" in flags
+    assert "--xla_gpu_deterministic_ops=true" in flags
+    assert "--xla_gpu_exclude_nondeterministic_ops=true" in flags
+
+
+def test_explicit_determinism_setting_is_preserved():
+    flags = train_token_done_head._with_default_deterministic_xla_flags(  # noqa: SLF001
+        "--xla_gpu_deterministic_ops=false --xla_gpu_exclude_nondeterministic_ops=false"
+    )
+
+    assert flags == "--xla_gpu_deterministic_ops=false --xla_gpu_exclude_nondeterministic_ops=false"
+
+
 def _write_shard(root, *, index, start, stop, tokens, masks, row_arrays=None):
     path = root / f"shard_{index}"
     path.mkdir(parents=True)
