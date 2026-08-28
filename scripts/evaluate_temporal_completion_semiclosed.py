@@ -26,15 +26,15 @@ from openpi.training.temporal_completion_semiclosed import reference_ticks
 DEFAULT_MANIFEST = Path("/mnt/data/models/wyt/split_manifests/agilex_make_breakfast_temporal_completion_v4.json")
 DEFAULT_FULL_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_730")
 DEFAULT_SUBTASK_DATASET_ROOT = Path("/mnt/data/dataset/ei/huggingface/modanqing/agilex_make_breakfast_subtask_730")
-REPORT_SCHEMA_VERSION = 1
-EVALUATION_PROTOCOL = "gated_terminal_hold_timeout_v1"
+REPORT_SCHEMA_VERSION = 2
+EVALUATION_PROTOCOL = "gated_terminal_hold_stall_v2"
 
 
-def validate_timeout_seconds(value: float) -> tuple[float, int]:
+def validate_max_terminal_hold_seconds(value: float) -> tuple[float, int]:
     seconds = float(value)
     units = seconds * 2.0
     if not np.isfinite(seconds) or seconds <= 0.0 or not np.isclose(units, round(units), rtol=0.0, atol=1.0e-8):
-        raise ValueError("--timeout-seconds must be positive and an integer multiple of 0.5 seconds")
+        raise ValueError("--max-terminal-hold-seconds must be positive and an integer multiple of 0.5 seconds")
     return seconds, round(units)
 
 
@@ -104,9 +104,9 @@ def _evaluation_repack() -> Any:
     # Reuse the extraction script's exact repack transform.  The import stays
     # local so pure controller/threshold tests do not initialize model stacks.
     try:
-        from scripts.extract_temporal_completion_features import _evaluation_repack  # noqa: PLC0415
+        from scripts.extract_temporal_completion_features import _evaluation_repack
     except ModuleNotFoundError:
-        from extract_temporal_completion_features import _evaluation_repack  # noqa: PLC0415
+        from extract_temporal_completion_features import _evaluation_repack
 
     return _evaluation_repack()
 
@@ -135,7 +135,7 @@ def _numeric_episode(
     key = (root.resolve(), int(episode_id))
     if key in episode_cache:
         return episode_cache[key]
-    import pyarrow.parquet as parquet  # noqa: PLC0415
+    import pyarrow.parquet as parquet
 
     root_key = root.resolve()
     if root_key not in layout_cache:
@@ -318,13 +318,13 @@ def _episode_specs(
 def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, Any]:
     """Loads the requested head and returns policy, dataset model, and JAX prefix fn."""
 
-    import flax.nnx as nnx  # noqa: PLC0415
-    import jax  # noqa: PLC0415
-    import jax.numpy as jnp  # noqa: PLC0415
+    import flax.nnx as nnx
+    import jax
+    import jax.numpy as jnp
 
-    import openpi.models.model as model_api  # noqa: PLC0415
-    from openpi.policies import policy_config  # noqa: PLC0415
-    from openpi.training import config as training_config  # noqa: PLC0415
+    import openpi.models.model as model_api
+    from openpi.policies import policy_config
+    from openpi.training import config as training_config
 
     config = training_config.get_config(args.config_name)
     if not bool(getattr(config.completion, "uses_temporal_completion", False)):
@@ -348,19 +348,23 @@ def _prepare_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any, A
     policy = policy_config.create_trained_policy(
         config,
         checkpoint,
+        completion_head_params=getattr(args, "done_params", None),
         repack_transforms=_evaluation_repack(),
         sample_kwargs={},
     )
     if bool(getattr(policy, "_is_pytorch_model", False)):
         raise ValueError("semi-closed evaluator requires a JAX Pi0.5 checkpoint")
     model = policy._model  # noqa: SLF001
-    if not hasattr(model, "compute_prefix_feature"):
-        raise ValueError("loaded model lacks compute_prefix_feature")
+    token_mode = getattr(model, "completion_head_variant", None) == "token_query_attention"
+    method_name = "compute_prefix_tokens" if token_mode else "compute_prefix_feature"
+    if not hasattr(model, method_name):
+        raise ValueError(f"loaded model lacks {method_name}")
     graphdef, state = nnx.split(model)
 
     def compute_prefix(state_value: Any, observation: Any) -> Any:
         module = nnx.merge(graphdef, state_value)
-        return module.compute_prefix_feature(jax.random.key(0), observation, train=False)
+        method = getattr(module, method_name)
+        return method(jax.random.key(0), observation, train=False)
 
     compute_fn = jax.jit(compute_prefix)
     return policy, model_api, jax, jnp, compute_fn, state
@@ -391,7 +395,19 @@ def _prefix_feature(
     transformed = policy._input_transform(sample)  # noqa: SLF001
     batched = jax.tree.map(lambda value: jnp.asarray(value)[None, ...], transformed)
     observation = model_api.Observation.from_dict(batched)
-    feature = np.asarray(jax.block_until_ready(compute_fn(state, observation)), dtype=np.float32)
+    computed = jax.block_until_ready(compute_fn(state, observation))
+    if isinstance(computed, tuple):
+        tokens, mask = computed
+        tokens = np.asarray(tokens, dtype=np.float32)
+        mask = np.asarray(mask, dtype=np.bool_)
+        if tokens.ndim != 3 or tokens.shape[0] != 1 or tokens.shape[-1] != int(policy._model.prefix_feature_dim):  # noqa: SLF001
+            raise ValueError(f"compute_prefix_tokens returned unexpected shape {tokens.shape}")
+        if mask.shape != tokens.shape[:2]:
+            raise ValueError(f"compute_prefix_tokens returned unexpected mask shape {mask.shape}")
+        if not np.isfinite(tokens).all():
+            raise ValueError("compute_prefix_tokens returned non-finite values")
+        return np.concatenate((tokens[0], mask[0, :, None].astype(np.float32)), axis=-1)
+    feature = np.asarray(computed, dtype=np.float32)
     if feature.ndim != 2 or feature.shape[0] != 1 or feature.shape[1] != int(policy._model.prefix_feature_dim):  # noqa: SLF001
         raise ValueError(f"compute_prefix_feature returned unexpected shape {feature.shape}")
     if not np.isfinite(feature).all():
@@ -421,11 +437,11 @@ def _evaluate_episode(
         gt_end_frames=ends,
         threshold=threshold,
         mode=args.mode,
-        timeout_seconds=args.timeout_seconds,
+        max_terminal_hold_seconds=args.max_terminal_hold_seconds,
     )
     ticks: list[dict[str, Any]] = []
     rollout_tick = 0
-    while not controller.done:
+    while not controller.terminated:
         source_frame = controller.current_source_frame
         prompt = controller.current_prompt
         feature = _prefix_feature(
@@ -453,9 +469,13 @@ def _evaluate_episode(
         rollout_tick += 1
 
     task_results = list(controller.task_results)
-    if len(task_results) != 4:
-        raise RuntimeError(f"gated replay ended with {len(task_results)} task results instead of four")
-    predicted = [result.trigger_source_frame for result in task_results]
+    if controller.done and len(task_results) != 4:
+        raise RuntimeError(f"completed gated replay has {len(task_results)} task results instead of four")
+    if controller.stalled and (not task_results or task_results[-1].classification != "missed"):
+        raise RuntimeError("stalled gated replay must end with a missed task result")
+    predicted: list[int | None] = [None] * 4
+    for result in task_results:
+        predicted[result.task_index] = result.trigger_source_frame
     boundaries = [
         classify_boundary(task, refs[task], predicted[task], full_length=spec.full_length) for task in range(4)
     ]
@@ -466,7 +486,8 @@ def _evaluate_episode(
     early_count = classifications.count("early")
     on_time_count = classifications.count("on_time")
     late_count = classifications.count("late_trigger")
-    timeout_count = classifications.count("timeout_forced")
+    missed_count = classifications.count("missed")
+    not_reached_count = 4 - len(task_results)
     mismatch_count = sum(int(bool(tick["prompt_mismatch"])) for tick in ticks)
     warmup_count = sum(int(not bool(tick["history_ready"])) for tick in ticks)
     return {
@@ -485,23 +506,24 @@ def _evaluate_episode(
         "task_results": task_dicts,
         "all_correct": all(result.classification in ("correct", "unavailable") for result in boundaries),
         "all_on_time": on_time_count == 4,
-        "fully_autonomous": timeout_count == 0,
+        "fully_autonomous": controller.done,
         "first_failure_task": first_non_on_time,
         "first_non_on_time_task": first_non_on_time,
         "early_count": early_count,
         "on_time_count": on_time_count,
         "late_trigger_count": late_count,
-        "timeout_forced_count": timeout_count,
+        "missed_count": missed_count,
+        "not_reached_count": not_reached_count,
         "late_count": late_count,
-        "missed_count": timeout_count,
         "done": controller.done,
         "done_frame": ticks[-1]["source_frame_index"] if ticks else None,
         "done_rollout_tick": controller.done_rollout_tick,
         "has_early_switch": early_count > 0,
         "has_late_trigger": late_count > 0,
-        "has_timeout_forced": timeout_count > 0,
-        "timeout_seconds": args.timeout_seconds,
-        "timeout_ticks": controller.timeout_ticks,
+        "has_missed": missed_count > 0,
+        "stalled": controller.stalled,
+        "max_terminal_hold_seconds": args.max_terminal_hold_seconds,
+        "max_terminal_hold_ticks": controller.max_terminal_hold_ticks,
         "prompt_mismatch_count": mismatch_count,
         "prompt_mismatch_rate": mismatch_count / len(ticks) if ticks else None,
         "wrong_prompt_tick_count": mismatch_count,
@@ -528,11 +550,15 @@ def _distribution(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    counts = dict.fromkeys(("early", "on_time", "late_trigger", "timeout_forced"), 0)
+def _gated_summary(results: list[dict[str, Any]], *, planned_count: int | None = None) -> dict[str, Any]:
+    counts = dict.fromkeys(("early", "on_time", "late_trigger", "missed"), 0)
     for result in results:
         counts[str(result["classification"])] += 1
-    task_count = len(results)
+    evaluated_count = len(results)
+    task_count = evaluated_count if planned_count is None else planned_count
+    if task_count < evaluated_count:
+        raise ValueError("planned task count cannot be smaller than evaluated task count")
+    not_reached_count = task_count - evaluated_count
     autonomous = counts["early"] + counts["on_time"] + counts["late_trigger"]
     early_remaining = [
         float(result["remaining_source_frames"])
@@ -551,11 +577,14 @@ def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "early_count": counts["early"],
         "on_time_count": counts["on_time"],
         "late_trigger_count": counts["late_trigger"],
-        "timeout_forced_count": counts["timeout_forced"],
+        "missed_count": counts["missed"],
+        "not_reached_count": not_reached_count,
+        "evaluated_task_count": evaluated_count,
         "early_rate": counts["early"] / task_count if task_count else None,
         "on_time_rate": counts["on_time"] / task_count if task_count else None,
         "late_trigger_rate": counts["late_trigger"] / task_count if task_count else None,
-        "timeout_forced_rate": counts["timeout_forced"] / task_count if task_count else None,
+        "missed_rate": counts["missed"] / task_count if task_count else None,
+        "not_reached_rate": not_reached_count / task_count if task_count else None,
         "autonomous_switch_count": autonomous,
         "autonomous_switch_rate": autonomous / task_count if task_count else None,
         "remaining_source_frames": remaining_stats,
@@ -573,8 +602,12 @@ def _gated_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     task_results = [result for episode in episodes for result in episode["task_results"]]
+    episode_count = len(episodes)
     per_task = {
-        str(task): _gated_summary([result for result in task_results if int(result["task_index"]) == task])
+        str(task): _gated_summary(
+            [result for result in task_results if int(result["task_index"]) == task],
+            planned_count=episode_count,
+        )
         for task in range(4)
     }
     all_ticks = sum(len(item["ticks"]) for item in episodes)
@@ -583,12 +616,11 @@ def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     all_on_time_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["all_on_time"])
     early_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_early_switch"])
     late_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_late_trigger"])
-    timeout_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["has_timeout_forced"])
+    stalled_ids = sorted(int(item["full_episode_id"]) for item in episodes if item["stalled"])
     not_autonomous_ids = sorted(int(item["full_episode_id"]) for item in episodes if not item["fully_autonomous"])
-    episode_count = len(episodes)
     fully_autonomous_count = sum(bool(item["fully_autonomous"]) for item in episodes)
     all_on_time_count = len(all_on_time_ids)
-    overall = _gated_summary(task_results)
+    overall = _gated_summary(task_results, planned_count=episode_count * 4)
     return {
         "episode_count": episode_count,
         "fully_autonomous_episode_count": fully_autonomous_count,
@@ -597,8 +629,7 @@ def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "all_on_time_episode_rate": all_on_time_count / episode_count if episode_count else None,
         "episode_with_early_count": len(early_ids),
         "episode_with_late_trigger_count": len(late_ids),
-        "episode_with_timeout_count": len(timeout_ids),
-        "total_timeout_forced_switches": sum(int(item["timeout_forced_count"]) for item in episodes),
+        "stalled_episode_count": len(stalled_ids),
         "done_count": sum(bool(item["done"]) for item in episodes),
         "done_rate": sum(bool(item["done"]) for item in episodes) / episode_count if episode_count else None,
         "prompt_mismatch_count": mismatches,
@@ -610,11 +641,14 @@ def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "early_count": overall["early_count"],
         "on_time_count": overall["on_time_count"],
         "late_trigger_count": overall["late_trigger_count"],
-        "timeout_forced_count": overall["timeout_forced_count"],
+        "missed_count": overall["missed_count"],
+        "not_reached_count": overall["not_reached_count"],
+        "evaluated_task_count": overall["evaluated_task_count"],
         "early_rate": overall["early_rate"],
         "on_time_rate": overall["on_time_rate"],
         "late_trigger_rate": overall["late_trigger_rate"],
-        "timeout_forced_rate": overall["timeout_forced_rate"],
+        "missed_rate": overall["missed_rate"],
+        "not_reached_rate": overall["not_reached_rate"],
         "autonomous_switch_count": overall["autonomous_switch_count"],
         "autonomous_switch_rate": overall["autonomous_switch_rate"],
         "remaining_source_frames_mean": overall["remaining_source_frames_mean"],
@@ -630,18 +664,20 @@ def _summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "all_on_time_episode_ids": all_on_time_ids,
         "early_episode_ids": early_ids,
         "late_trigger_episode_ids": late_ids,
-        "timeout_forced_episode_ids": timeout_ids,
+        "stalled_episode_ids": stalled_ids,
         "not_fully_autonomous_episode_ids": not_autonomous_ids,
         # Compatibility aliases retained for old report consumers; the new
         # classification fields above are the primary metrics.
         "incorrect_episode_ids": not_autonomous_ids,
         "late_episode_ids": late_ids,
-        "missed_episode_ids": timeout_ids,
+        "missed_episode_ids": stalled_ids,
     }
 
 
 def evaluate(args: argparse.Namespace) -> Path:
-    args.timeout_seconds, timeout_ticks = validate_timeout_seconds(args.timeout_seconds)
+    args.max_terminal_hold_seconds, max_terminal_hold_ticks = validate_max_terminal_hold_seconds(
+        args.max_terminal_hold_seconds
+    )
     threshold, threshold_source, validation_path = load_threshold(
         validation_report=args.validation_report,
         explicit_threshold=args.threshold,
@@ -656,7 +692,7 @@ def evaluate(args: argparse.Namespace) -> Path:
         raise ValueError("--subtask-dataset-root does not match manifest source_subtask_root")
 
     os.environ.setdefault("HF_LEROBOT_HOME", str(args.full_dataset_root.resolve().parents[1]))
-    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset  # noqa: PLC0415
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 
     subtask_dataset = lerobot_dataset.LeRobotDataset(manifest.source_subtask_repo_id, root=args.subtask_dataset_root)
     full_repo_id = manifest.source_full_repo_id or "modanqing/agilex_make_breakfast_730"
@@ -693,8 +729,8 @@ def evaluate(args: argparse.Namespace) -> Path:
         "schema_version": REPORT_SCHEMA_VERSION,
         "mode": args.mode,
         "evaluation_protocol": EVALUATION_PROTOCOL,
-        "timeout_seconds": args.timeout_seconds,
-        "timeout_ticks": timeout_ticks,
+        "max_terminal_hold_seconds": args.max_terminal_hold_seconds,
+        "max_terminal_hold_ticks": max_terminal_hold_ticks,
         "scheduler_hz": 2,
         "fps": 30,
         "prompt_mismatch_note": "prompt mismatch is prevented by the gated replay protocol",
@@ -722,12 +758,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("history", "current_only", "transition"), required=True)
     parser.add_argument("--config-name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--done-params", type=Path)
     parser.add_argument("--full-dataset-root", type=Path, default=DEFAULT_FULL_DATASET_ROOT)
     parser.add_argument("--subtask-dataset-root", type=Path, default=DEFAULT_SUBTASK_DATASET_ROOT)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--split", choices=("test",), default="test")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--timeout-seconds", type=float, default=2.0)
+    parser.add_argument("--max-terminal-hold-seconds", type=float, default=2.0)
     threshold_group = parser.add_mutually_exclusive_group(required=True)
     threshold_group.add_argument("--validation-report", type=Path)
     threshold_group.add_argument("--threshold", type=float)

@@ -34,7 +34,7 @@ def _jax_checkpoint_restore_dtype(train_config: _config.TrainConfig):
 
 
 def _audit_temporal_head_fp32(model: Any) -> None:
-    import flax.nnx as nnx  # noqa: PLC0415
+    import flax.nnx as nnx
 
     if not hasattr(model, "completion_head"):
         raise ValueError("temporal policy checkpoint has no completion_head")
@@ -52,6 +52,7 @@ def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
     *,
+    completion_head_params: pathlib.Path | str | None = None,
     repack_transforms: transforms.Group | None = None,
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
@@ -63,6 +64,7 @@ def create_trained_policy(
     Args:
         train_config: The training config to use to create the model.
         checkpoint_dir: The directory to load the model from.
+        completion_head_params: Optional head-only params checkpoint to apply before policy JIT setup.
         repack_transforms: Optional transforms that will be applied before any other transforms.
         sample_kwargs: The kwargs to pass to the `sample_actions` method. If not provided, the default
             kwargs will be used.
@@ -89,12 +91,19 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(
-            _model.restore_params(
-                checkpoint_dir / "params",
-                dtype=_jax_checkpoint_restore_dtype(train_config),
-            )
+        params = _model.restore_params(
+            checkpoint_dir / "params",
+            dtype=_jax_checkpoint_restore_dtype(train_config),
         )
+        if completion_head_params is not None:
+            head_params = _model.restore_params(
+                download.maybe_download(str(completion_head_params)),
+                dtype=jnp.float32,
+            )
+            if set(head_params) != {"completion_head"}:
+                raise ValueError("completion-head checkpoint must contain only completion_head")
+            params = {**params, "completion_head": head_params["completion_head"]}
+        model = train_config.model.load(params)
         if train_config.completion.uses_temporal_completion:
             _audit_temporal_head_fp32(model)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
@@ -108,7 +117,7 @@ def create_trained_policy(
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:
-            import torch  # noqa: PLC0415
+            import torch
 
             pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:

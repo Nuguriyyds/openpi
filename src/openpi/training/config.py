@@ -628,8 +628,11 @@ class TrainConfig:
         if self.completion.uses_temporal_completion:
             if self.training_time_rtc.enabled:
                 raise ValueError("subtask temporal completion must use the clean non-TTRTC checkpoint")
-            if getattr(completion_head, "variant", None) != "temporal_mlp":
-                raise ValueError("temporal completion requires completion_head.variant='temporal_mlp'")
+            if getattr(completion_head, "variant", None) not in (
+                "temporal_mlp",
+                "token_query_attention",
+            ):
+                raise ValueError("temporal completion requires a temporal completion-head variant")
             if getattr(completion_head, "resolved_pooling", None) != "masked_mean":
                 raise ValueError("temporal completion requires masked-mean prefix pooling")
             if self.batch_size != (
@@ -1894,6 +1897,31 @@ _CONFIGS = [
 # namespace differ, so checkpoints and validation artifacts cannot collide.
 _TEMPORAL_HISTORY_CONFIG = next(
     config for config in _CONFIGS if config.name == "pi05_agilex_breakfast_temporal_completion_head"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _TEMPORAL_HISTORY_CONFIG,
+        name="pi05_agilex_breakfast_token_query_completion_head_h768",
+        data=dataclasses.replace(
+            _TEMPORAL_HISTORY_CONFIG.data,
+            assets=dataclasses.replace(
+                _TEMPORAL_HISTORY_CONFIG.data.assets,
+                asset_id=(
+                    "modanqing/"
+                    "agilex_make_breakfast_generalize_720_subtasks_pickbread600_water400_button300_putbread200"
+                ),
+            ),
+        ),
+        model=dataclasses.replace(
+            _TEMPORAL_HISTORY_CONFIG.model,
+            completion_head=dataclasses.replace(
+                _TEMPORAL_HISTORY_CONFIG.model.completion_head,
+                variant="token_query_attention",
+                hidden_dim=768,
+                dropout_rate=0.1,
+            ),
+        ),
+    )
 )
 _CONFIGS.append(
     dataclasses.replace(

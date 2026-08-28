@@ -57,7 +57,7 @@ class Policy(BasePolicy):
         if self._is_pytorch_model:
             # Keep JAX-only policy import/testing independent of platform-
             # specific torch shared libraries.
-            import torch  # noqa: PLC0415
+            import torch
 
             self._torch = torch
             self._model = self._model.to(pytorch_device)
@@ -180,15 +180,28 @@ class Policy(BasePolicy):
         if self._temporal_completion_logits is None:
             raise ValueError("the loaded JAX model does not provide a temporal completion head")
         history = np.asarray(prefix_history, dtype=np.float32)
-        if history.ndim != 2 or history.shape[0] != 3:
-            raise ValueError(f"prefix_history must have shape [3, D], got {history.shape}")
-        # Do not pass ``train=False`` through module_jit: a non-static Python
-        # boolean would become a tracer inside the head's dropout branch.  The
-        # method default is already the required deterministic eval mode.
-        logits = self._temporal_completion_logits(
-            self._temporal_completion_rng,
-            jnp.asarray(history)[None, ...],
-        )
+        token_mode = getattr(self._model, "completion_head_variant", None) == "token_query_attention"
+        if token_mode:
+            input_dim = int(self._model.prefix_feature_dim)
+            if history.ndim != 3 or history.shape[0] != 3 or history.shape[-1] != input_dim + 1:
+                raise ValueError(f"token prefix_history must have shape [3, N, {input_dim + 1}], got {history.shape}")
+            tokens = history[..., :input_dim]
+            masks = history[..., input_dim] > 0.5
+            logits = self._temporal_completion_logits(
+                self._temporal_completion_rng,
+                jnp.asarray(tokens)[None, ...],
+                jnp.asarray(masks)[None, ...],
+            )
+        else:
+            if history.ndim != 2 or history.shape[0] != 3:
+                raise ValueError(f"prefix_history must have shape [3, D], got {history.shape}")
+            # Do not pass ``train=False`` through module_jit: a non-static Python
+            # boolean would become a tracer inside the head's dropout branch.  The
+            # method default is already the required deterministic eval mode.
+            logits = self._temporal_completion_logits(
+                self._temporal_completion_rng,
+                jnp.asarray(history)[None, ...],
+            )
         logit = float(np.asarray(logits)[0])
         if return_logit:
             return logit

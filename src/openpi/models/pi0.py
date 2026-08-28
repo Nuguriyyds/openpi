@@ -11,6 +11,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models.completion import CompletionHead
 from openpi.models.completion import TemporalCompletionHead
+from openpi.models.completion import TokenQueryCompletionHead
 from openpi.models.completion import masked_mean_pool
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
@@ -113,6 +114,12 @@ class Pi0(_model.BaseModel):
                 self.completion_head = CompletionHead(paligemma_config.width, config.completion_head, rngs=rngs)
             elif config.completion_head.variant == "temporal_mlp":
                 self.completion_head = TemporalCompletionHead(
+                    paligemma_config.width,
+                    config.completion_head,
+                    rngs=rngs,
+                )
+            elif config.completion_head.variant == "token_query_attention":
+                self.completion_head = TokenQueryCompletionHead(
                     paligemma_config.width,
                     config.completion_head,
                     rngs=rngs,
@@ -285,10 +292,25 @@ class Pi0(_model.BaseModel):
             raise ValueError(f"prefix feature must have shape [batch, {self.prefix_feature_dim}], got {feature.shape}")
         return feature
 
+    def compute_prefix_tokens(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        train: bool = False,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Returns stop-gradient VLM prefix tokens and their validity mask."""
+
+        preprocess_rng = jax.random.fold_in(rng, 0xC0A4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        prefix_out, prefix_mask = self._compute_prefix_outputs(observation)
+        return jax.lax.stop_gradient(prefix_out), prefix_mask
+
     def compute_temporal_completion_logits(
         self,
         rng: at.KeyArrayLike,
         prefix_history: jax.Array,
+        prefix_mask_history: jax.Array | None = None,
         *,
         train: bool = False,
     ) -> jax.Array:
@@ -296,9 +318,18 @@ class Pi0(_model.BaseModel):
 
         if not hasattr(self, "completion_head"):
             raise ValueError("completion head is disabled in Pi0Config")
-        if self.completion_head_variant != "temporal_mlp":
-            raise ValueError("compute_temporal_completion_logits requires completion_head.variant='temporal_mlp'")
+        if self.completion_head_variant not in ("temporal_mlp", "token_query_attention"):
+            raise ValueError("compute_temporal_completion_logits requires a temporal completion head")
         head_rng = jax.random.fold_in(rng, 0xC0A5)
+        if self.completion_head_variant == "token_query_attention":
+            if prefix_mask_history is None:
+                raise ValueError("token-query completion requires prefix masks")
+            return self.completion_head(
+                prefix_history,
+                prefix_mask_history,
+                rng=head_rng,
+                train=train,
+            )
         return self.completion_head(prefix_history, rng=head_rng, train=train)
 
     def _compute_action_loss_and_prefix(

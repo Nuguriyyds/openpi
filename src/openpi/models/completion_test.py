@@ -174,6 +174,68 @@ def test_temporal_completion_head_stops_gradient_to_history():
     np.testing.assert_array_equal(gradient, jnp.zeros_like(history))
 
 
+def test_token_query_head_output_mask_and_gradient_contract():
+    head = completion.TokenQueryCompletionHead(
+        8,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="token_query_attention",
+            hidden_dim=12,
+            dropout_rate=0.0,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+    history = jax.random.normal(jax.random.key(1), (2, 3, 5, 8), dtype=jnp.float16)
+    mask = jnp.asarray([[[1, 1, 1, 0, 0]] * 3, [[1, 1, 1, 1, 0]] * 3], dtype=jnp.bool_)
+
+    logits = head(history, mask, train=False)
+    gradient = jax.grad(lambda value: jnp.sum(head(value, mask, train=False)))(history)
+
+    assert logits.shape == (2,)
+    assert logits.dtype == jnp.float32
+    assert np.all(np.isfinite(logits))
+    np.testing.assert_array_equal(gradient, jnp.zeros_like(history))
+
+
+def test_token_query_head_parameter_count_matches_qwen_scale():
+    head = completion.TokenQueryCompletionHead(
+        2048,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="token_query_attention",
+            hidden_dim=768,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+    parameter_count = sum(
+        int(np.prod(variable.value.shape)) for variable in nnx.state(head, nnx.Param).flat_state().values()
+    )
+
+    assert 30_000_000 <= parameter_count <= 33_000_000
+
+
+def test_token_query_head_supports_fewer_queries_and_layers():
+    head = completion.TokenQueryCompletionHead(
+        2048,
+        completion.CompletionHeadConfig(
+            enabled=True,
+            variant="token_query_attention",
+            hidden_dim=512,
+            query_count=8,
+            attention_heads=8,
+            temporal_layers=2,
+        ),
+        rngs=nnx.Rngs(0),
+    )
+    parameter_count = sum(
+        int(np.prod(variable.value.shape)) for variable in nnx.state(head, nnx.Param).flat_state().values()
+    )
+
+    assert head.learned_queries.value.shape == (8, 512)
+    assert tuple(head.temporal_blocks) == ("layer_0", "layer_1")
+    assert parameter_count == 11_041_281
+
+
 def test_temporal_completion_dropout_requires_rng_only_during_training():
     head = completion.TemporalCompletionHead(
         4,
@@ -272,7 +334,7 @@ def test_action_loss_has_zero_completion_head_gradient():
 
 
 def test_agilex_action_output_dimension_stays_fourteen():
-    from openpi.policies import agilex_policy  # noqa: PLC0415
+    from openpi.policies import agilex_policy
 
     actions = np.zeros((3, 32), dtype=np.float32)
 

@@ -53,6 +53,21 @@ class _FakeTemporalModel(nnx.Module):
         return jnp.sum(prefix_history, axis=(1, 2))
 
 
+class _FakeTokenTemporalModel(nnx.Module):
+    completion_head_variant = "token_query_attention"
+    prefix_feature_dim = 2
+
+    def sample_actions(self, rng, observation):
+        del rng, observation
+        return jnp.zeros((1, 1, 1), dtype=jnp.float32)
+
+    def compute_temporal_completion_logits(self, rng, prefix_history, prefix_mask_history, *, train=False):
+        del rng
+        if train:
+            raise AssertionError("completion policy scoring must use eval mode")
+        return jnp.sum(prefix_history * prefix_mask_history[..., None], axis=(1, 2, 3))
+
+
 def test_temporal_scoring_is_jittable_and_does_not_advance_action_rng():
     action_rng = jax.random.key(123)
     policy = policy_module.Policy(_FakeTemporalModel(), rng=action_rng)
@@ -65,3 +80,12 @@ def test_temporal_scoring_is_jittable_and_does_not_advance_action_rng():
     assert logit == 12.0
     np.testing.assert_array_equal(after, before)
     assert policy.score_temporal_completion(history) == float(jax.nn.sigmoid(jnp.float32(12.0)))
+
+
+def test_token_temporal_scoring_unpacks_prefix_mask():
+    policy = policy_module.Policy(_FakeTokenTemporalModel())
+    history = np.zeros((3, 2, 3), dtype=np.float32)
+    history[..., :2] = 1.0
+    history[:, 0, 2] = 1.0
+
+    assert policy.score_temporal_completion(history, return_logit=True) == 6.0

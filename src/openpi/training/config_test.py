@@ -57,9 +57,7 @@ def test_temporal_completion_config_uses_clean_backbone_and_locked_scheme():
 
 def test_temporal_history_carry_config_uses_balanced_transition_batch():
     carry = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_head")
-    carry_posweight2 = config.get_config(
-        "pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head"
-    )
+    carry_posweight2 = config.get_config("pi05_agilex_breakfast_temporal_completion_history_carry_posweight2_head")
 
     assert carry.completion.temporal_sampling_protocol == "history_carry"
     assert (
@@ -116,6 +114,18 @@ def test_temporal_current_only_config_changes_only_name_and_input_mode():
         )
         == history
     )
+
+
+def test_token_query_config_changes_only_head_architecture():
+    baseline = config.get_config("pi05_agilex_breakfast_temporal_completion_head")
+    token_query = config.get_config("pi05_agilex_breakfast_token_query_completion_head_h768")
+
+    assert token_query.model.completion_head.variant == "token_query_attention"
+    assert token_query.model.completion_head.hidden_dim == 768
+    assert token_query.data.assets.asset_id == (
+        "modanqing/agilex_make_breakfast_generalize_720_subtasks_pickbread600_water400_button300_putbread200"
+    )
+    assert dataclasses.replace(token_query, name=baseline.name, model=baseline.model, data=baseline.data) == baseline
 
 
 def test_temporal_input_mode_is_locked_and_current_only_requires_temporal_sampling():
