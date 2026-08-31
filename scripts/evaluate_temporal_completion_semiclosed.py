@@ -415,6 +415,14 @@ def _prefix_feature(
     return feature[0]
 
 
+def _query_history_frames(query_frame: int) -> tuple[int, int, int]:
+    return max(0, query_frame - 30), max(0, query_frame - 15), query_frame
+
+
+def _query_feature_input(features: list[np.ndarray], *, prebuild_history: bool) -> np.ndarray:
+    return np.stack(features) if prebuild_history else features[0]
+
+
 def _evaluate_episode(
     spec: _EpisodeSpec,
     *,
@@ -427,10 +435,12 @@ def _evaluate_episode(
     state: Any,
     full_dataset: Any,
     threshold: float,
+    playback_start_frames: tuple[int, int, int, int] | None = None,
+    use_query_history: bool = False,
 ) -> dict[str, Any]:
     ends = spec.gt_end_frames
     refs = reference_ticks(ends)
-    playback_starts = (0, *spec.subtask_start_frames[1:])
+    playback_starts = (0, *spec.subtask_start_frames[1:]) if playback_start_frames is None else playback_start_frames
     controller = GatedCompletionController(
         spec.prompts,
         playback_start_frames=playback_starts,
@@ -440,23 +450,38 @@ def _evaluate_episode(
         max_terminal_hold_seconds=args.max_terminal_hold_seconds,
     )
     ticks: list[dict[str, Any]] = []
+    feature_cache: dict[tuple[str, int], np.ndarray] = {}
     rollout_tick = 0
     while not controller.terminated:
         source_frame = controller.current_source_frame
         prompt = controller.current_prompt
-        feature = _prefix_feature(
-            policy=policy,
-            model_api=model_api,
-            jax=jax,
-            jnp=jnp,
-            compute_fn=compute_fn,
-            state=state,
-            dataset=full_dataset,
-            episode_id=spec.full_episode_id,
-            frame_index=source_frame,
-            prompt=prompt,
+        prebuild_history = use_query_history and controller.history_size == 0
+        query_frames = _query_history_frames(source_frame) if prebuild_history else (source_frame,)
+        features = []
+        for frame in query_frames:
+            key = (prompt, frame)
+            if key not in feature_cache:
+                feature_cache[key] = _prefix_feature(
+                    policy=policy,
+                    model_api=model_api,
+                    jax=jax,
+                    jnp=jnp,
+                    compute_fn=compute_fn,
+                    state=state,
+                    dataset=full_dataset,
+                    episode_id=spec.full_episode_id,
+                    frame_index=frame,
+                    prompt=prompt,
+                )
+            features.append(feature_cache[key])
+        feature_cache = {(prompt, frame): feature for frame, feature in zip(query_frames, features, strict=True)}
+        feature = _query_feature_input(features, prebuild_history=prebuild_history)
+        decision = controller.step(
+            rollout_tick,
+            feature,
+            policy.score_temporal_completion,
+            prebuilt_history=prebuild_history,
         )
-        decision = controller.step(rollout_tick, feature, policy.score_temporal_completion)
         if decision.active_task_index != decision.source_task_index:
             raise RuntimeError(
                 "gated replay invariant violated: active_task_index and source_task_index differ "

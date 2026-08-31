@@ -1,13 +1,34 @@
 """Run gated semi-closed replay from breakfast boundary annotations."""
 
+# ruff: noqa: E402, I001 -- configure XLA before importing JAX-backed model modules.
+
 from __future__ import annotations
+
+import os
+
+
+_DETERMINISTIC_XLA_FLAGS = (
+    "--xla_gpu_deterministic_ops=true",
+    "--xla_gpu_exclude_nondeterministic_ops=true",
+)
+
+
+def _with_default_deterministic_xla_flags(flags: str) -> str:
+    tokens = flags.split()
+    configured = {token.split("=", maxsplit=1)[0] for token in tokens if token.startswith("--")}
+    for flag in _DETERMINISTIC_XLA_FLAGS:
+        if flag.split("=", maxsplit=1)[0] not in configured:
+            tokens.append(flag)
+    return " ".join(tokens)
+
+
+os.environ["XLA_FLAGS"] = _with_default_deterministic_xla_flags(os.environ.get("XLA_FLAGS", ""))
 
 import argparse
 from collections import defaultdict
 from collections.abc import Sequence
 import itertools
 import json
-import os
 from pathlib import Path
 
 from openpi.training import breakfast_done_data

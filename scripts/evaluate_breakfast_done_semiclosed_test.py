@@ -13,6 +13,16 @@ class _Dataset:
     }
 
 
+def test_deterministic_xla_flags_are_enabled_by_default():
+    flags = evaluate_breakfast_done_semiclosed._with_default_deterministic_xla_flags(  # noqa: SLF001
+        "--existing_flag=true"
+    )
+
+    assert "--existing_flag=true" in flags
+    assert "--xla_gpu_deterministic_ops=true" in flags
+    assert "--xla_gpu_exclude_nondeterministic_ops=true" in flags
+
+
 def _sample(episode: int, task: str, frame: int, sample_type: str) -> DoneSample:
     return DoneSample(
         sample_id=f"{episode}-{task}",

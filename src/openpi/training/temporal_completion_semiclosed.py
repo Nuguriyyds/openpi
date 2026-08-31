@@ -486,7 +486,14 @@ class GatedCompletionController:
         if self.mode == "history":
             self._history.clear()
 
-    def step(self, rollout_tick: int, feature: np.ndarray, score_fn: ScoreFunction) -> GatedTickDecision:
+    def step(
+        self,
+        rollout_tick: int,
+        feature: np.ndarray,
+        score_fn: ScoreFunction,
+        *,
+        prebuilt_history: bool = False,
+    ) -> GatedTickDecision:
         tick = _integer(rollout_tick, name="rollout_tick")
         if tick < 0 or (self._last_rollout_tick is not None and tick != self._last_rollout_tick + 1):
             expected = 0 if self._last_rollout_tick is None else self._last_rollout_tick + 1
@@ -510,9 +517,19 @@ class GatedCompletionController:
                 raise ValueError("non-terminal source frame observed after terminal hold began")
             terminal_hold_tick = None
         values = np.asarray(feature, dtype=np.float32)
-        if values.ndim not in (1, 2) or values.size == 0 or not np.isfinite(values).all():
-            raise ValueError(f"prefix feature must be a finite non-empty [D] or [N, D] array, got {values.shape}")
-        head_input, history_ready = self._head_input(values)
+        valid_ndims = (2, 3) if prebuilt_history else (1, 2)
+        if values.ndim not in valid_ndims or values.size == 0 or not np.isfinite(values).all():
+            expected = "[3, D] or [3, N, D]" if prebuilt_history else "[D] or [N, D]"
+            raise ValueError(f"prefix input must be a finite non-empty {expected} array, got {values.shape}")
+        if prebuilt_history:
+            if self.mode != "history":
+                raise ValueError("prebuilt history requires history mode")
+            if values.shape[0] != 3:
+                raise ValueError(f"prebuilt history must contain exactly three prefixes, got {values.shape}")
+            self._history = [np.array(value, copy=True) for value in values]
+            head_input, history_ready = values, True
+        else:
+            head_input, history_ready = self._head_input(values)
         score: float | None = None
         if head_input is not None:
             raw_score = np.asarray(score_fn(head_input))

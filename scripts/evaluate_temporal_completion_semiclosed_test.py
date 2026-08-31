@@ -32,6 +32,20 @@ def test_global_ends_and_reference_ticks_use_inclusive_endpoints() -> None:
     assert reference_tick(91) == 105
 
 
+def test_query_history_frames_match_training_history() -> None:
+    assert evaluator._query_history_frames(45) == (15, 30, 45)  # noqa: SLF001
+    assert evaluator._query_history_frames(15) == (0, 0, 15)  # noqa: SLF001
+
+
+def test_query_feature_input_stacks_only_the_seed_history() -> None:
+    frames = [np.full((2, 3), value) for value in (15.0, 30.0, 45.0)]
+    history = evaluator._query_feature_input(frames, prebuild_history=True)  # noqa: SLF001
+    current = evaluator._query_feature_input([frames[-1]], prebuild_history=False)  # noqa: SLF001
+
+    assert history.shape == (3, 2, 3)
+    assert current.shape == (2, 3)
+
+
 def test_history_warmup_switch_and_prompt_local_reset() -> None:
     seen: list[np.ndarray] = []
 
@@ -227,6 +241,28 @@ def test_gated_history_clears_after_switch_and_current_only_scores_first_tick() 
     first = current_only.step(0, np.asarray([0.0]), lambda _: 0.0)
     assert first.history_ready
     assert first.score == 0.0
+
+
+def test_gated_prebuilt_history_scores_the_query_immediately() -> None:
+    controller = _gated_controller(mode="history")
+    inputs: list[np.ndarray] = []
+    history = np.asarray([[15.0], [30.0], [45.0]], dtype=np.float32)
+
+    decision = controller.step(
+        0,
+        history,
+        lambda values: inputs.append(np.array(values, copy=True)) or 0.0,
+        prebuilt_history=True,
+    )
+
+    assert decision.source_frame_index == 0
+    assert decision.history_ready
+    assert decision.score == 0.0
+    np.testing.assert_array_equal(inputs[0], history)
+    assert controller.history_size == 3
+
+    controller.step(1, np.asarray([60.0]), lambda values: inputs.append(np.array(values, copy=True)) or 0.0)
+    np.testing.assert_array_equal(inputs[1], np.asarray([[30.0], [45.0], [60.0]], dtype=np.float32))
 
 
 def test_gated_transition_keeps_history_and_scores_first_new_task_tick() -> None:
