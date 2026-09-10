@@ -67,9 +67,13 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             sample_with_prefix = getattr(model, "sample_actions_with_prefix_feature", None)
+            sample_with_raw_prefix = getattr(model, "sample_actions_with_raw_prefix", None)
             temporal_logits = getattr(model, "compute_temporal_completion_logits", None)
             self._sample_actions_with_prefix_feature = (
                 None if sample_with_prefix is None else nnx_utils.module_jit(sample_with_prefix)
+            )
+            self._sample_actions_with_raw_prefix = (
+                None if sample_with_raw_prefix is None else nnx_utils.module_jit(sample_with_raw_prefix)
             )
             self._temporal_completion_logits = (
                 None if temporal_logits is None else nnx_utils.module_jit(temporal_logits)
@@ -170,6 +174,83 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        return outputs
+
+    def infer_with_raw_prefix(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        action_prefix: np.ndarray | None = None,
+        delay: int | np.ndarray | None = None,
+        num_steps: int | None = None,
+        return_model_actions: bool = False,
+    ) -> dict:
+        """Run the normal action path and expose its same-forward raw prefix.
+
+        This optional deployment path is installed by the Training-Paper RTC
+        server. The raw prefix and mask stay as JAX device arrays so the
+        completion head can consume them without a host/network copy.
+        """
+
+        if self._is_pytorch_model or self._sample_actions_with_raw_prefix is None:
+            raise ValueError("raw-prefix action inference requires a JAX model with sample_actions_with_raw_prefix")
+
+        obs = dict(obs)
+        action_prefix = action_prefix if action_prefix is not None else obs.pop("action_prefix", None)
+        action_prefix = action_prefix if action_prefix is not None else obs.pop("action_prefix_model", None)
+        delay = delay if delay is not None else obs.pop("delay", None)
+        delay = delay if delay is not None else obs.pop("delay_steps", None)
+        delay_seconds = obs.pop("delay_seconds", None)
+        delay_seconds = delay_seconds if delay_seconds is not None else obs.pop("inference_delay_seconds", None)
+        control_hz = obs.pop("control_hz", None)
+        if delay is None and delay_seconds is not None and control_hz is not None:
+            delay = np.floor(np.asarray(delay_seconds, dtype=np.float32) * float(control_hz)).astype(np.int32)
+        num_steps = num_steps if num_steps is not None else obs.pop("num_steps", None)
+        num_steps = num_steps if num_steps is not None else obs.pop("num_denoising_steps", None)
+        return_model_actions = bool(obs.pop("return_model_actions", return_model_actions))
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        self._rng, sample_rng = jax.random.split(self._rng)
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if num_steps is not None:
+            sample_kwargs["num_steps"] = num_steps
+        if noise is not None:
+            noise = jnp.asarray(noise)
+            if noise.ndim == 2:
+                noise = noise[None, ...]
+            sample_kwargs["noise"] = noise
+        if action_prefix is not None:
+            action_prefix = jnp.asarray(action_prefix)
+            if action_prefix.ndim == 2:
+                action_prefix = action_prefix[None, ...]
+            sample_kwargs["action_prefix"] = action_prefix
+            sample_kwargs["delay"] = 0 if delay is None else delay
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        actions_model, raw_prefix_out, raw_prefix_mask = self._sample_actions_with_raw_prefix(
+            sample_rng,
+            observation,
+            **sample_kwargs,
+        )
+        outputs = {
+            "state": inputs["state"],
+            "actions": actions_model,
+        }
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        model_time = time.monotonic() - start_time
+
+        actions_model_np = np.asarray(outputs["actions"]).copy()
+        outputs = self._output_transform(outputs)
+        if return_model_actions:
+            outputs["actions_model"] = actions_model_np
+        outputs["raw_prefix_out"] = raw_prefix_out[0]
+        outputs["raw_prefix_mask"] = raw_prefix_mask[0]
+        outputs["policy_timing"] = {"infer_ms": model_time * 1000}
         return outputs
 
     def score_temporal_completion(self, prefix_history: np.ndarray, *, return_logit: bool = False) -> float:

@@ -1,0 +1,23 @@
+integrated_completion_online_inference:
+  # The four task prompts are read from the completion-head metadata returned
+  # by the server. The client starts with task 0 only.
+  prompt_source: server_completion_head_metadata
+  host: 127.0.0.1
+  port: 8001
+  control_hz: 30.0
+  max_joint_delta_rad: 0.20
+  obs_send_hz: 3.75
+  client_chunk_execution: true
+  client_chunk_execute_horizon: 0
+  client_chunk_fixed_delay_steps: 6
+  client_chunk_delay_mode: realtime_ceil
+  client_chunk_max_delay_steps: 6
+  max_steps: 0
+  robot_endpoint: tcp://127.0.0.1:9901
+  robot_service_recv_timeout_ms: 30000
+  startup_init_hold_min_s: 0.0
+  startup_init_hold_log_interval_s: 1.0
+  completion_threshold: 0.6
+  completion_head_metadata: /home/geekplus/develop/ra_ttrtc/openpi/checkpoints/done_head_h768/metadata.json
+  log_root: logs/integrated_completion_deploy
+  record_top_video: false
